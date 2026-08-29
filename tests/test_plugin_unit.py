@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import logging
 import os
+import re
+import signal
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -144,6 +148,47 @@ class TestParseNpubTarget:
             )
 
 
+class TestTruncateNpub:
+    def test_long_npub_matches_session_16_prefix(self):
+        out = vector_adapter._truncate_npub(NPUB)
+        assert out == f"{NPUB[:16]}..."
+        assert len(out) < len(NPUB)
+        assert NPUB not in out
+
+    def test_short_or_empty(self):
+        assert vector_adapter._truncate_npub("npub1short") == "npub1short"
+        assert vector_adapter._truncate_npub("") == ""
+        assert vector_adapter._truncate_npub("   ") == ""
+        assert vector_adapter._truncate_npub(None) == ""  # type: ignore[arg-type]
+
+
+class TestRuntimeRecord:
+    def test_write_is_0600_payload_and_delete_unlinks(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        token = "tok" + "ab" * 30
+        vector_adapter._write_runtime_record(8096, token, 1234, NPUB)
+        path = tmp_path / "runtime" / "vector-sidecar.json"
+        assert path.is_file()
+        if os.name == "posix":
+            assert (path.stat().st_mode & 0o777) == 0o600
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data == {"port": 8096, "token": token, "pid": 1234, "npub": NPUB}
+        vector_adapter._delete_runtime_record()
+        assert not path.exists()
+        vector_adapter._delete_runtime_record()  # missing_ok
+
+    def test_replace_of_world_readable_file_is_still_0600(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        path = tmp_path / "runtime" / "vector-sidecar.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("stale", encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(path, 0o644)
+        vector_adapter._write_runtime_record(8096, "t" * 64, 1, NPUB)
+        if os.name == "posix":
+            assert (path.stat().st_mode & 0o777) == 0o600
+
+
 class TestEnvEnablement:
     def test_none_without_npub(self, monkeypatch):
         monkeypatch.delenv("VECTOR_NPUB", raising=False)
@@ -217,6 +262,9 @@ class TestRegister:
         ctx.register_redaction_patterns.assert_called_once()
         patterns = ctx.register_redaction_patterns.call_args.args[0]
         assert any("nsec1" in p for p in patterns)
+        nsec_pat = next(p for p in patterns if "nsec1" in p)
+        assert re.search(nsec_pat, "nsec1abcdefghijklmnopqrstuvwxyzabcdefghijk")
+        assert re.search(nsec_pat, "nsec1" + "a" * 20)
         ctx.register_platform.assert_called_once()
         kwargs = ctx.register_platform.call_args.kwargs
         assert kwargs["name"] == "vector"
@@ -244,7 +292,6 @@ class TestRegister:
 # ---------------------------------------------------------------------------
 
 import asyncio
-import json
 import subprocess
 import threading
 import time
@@ -781,16 +828,21 @@ class TestMockedSidecarHttp:
         assert result.error == "Not connected"
         adapter._http_client.post.assert_not_called()
 
-    def test_connect_polls_health_and_sends_token(self, monkeypatch, tmp_path):
+    def test_connect_polls_health_and_sends_token(self, monkeypatch, tmp_path, caplog):
         token = "b" * 64
+        nsec_secret = "nsec1shouldneverappearinthelogsxxxxxxxx"
         sidecar = MockSidecar(token=token, npub=NPUB)
         port = sidecar.start()
         try:
             adapter = _make_adapter(
                 monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
             )
+            monkeypatch.setenv("VECTOR_NSEC", nsec_secret)
             monkeypatch.setattr(
                 vector_adapter.secrets, "token_hex", lambda n: token
+            )
+            caplog.set_level(
+                logging.INFO, logger="hermes_plugins.vector_platform.adapter"
             )
 
             async def idle_sse(self):
@@ -826,6 +878,13 @@ class TestMockedSidecarHttp:
                 assert record["token"] == token
                 assert record["port"] == port
                 assert record["npub"] == NPUB
+                if os.name == "posix":
+                    assert (record_path.stat().st_mode & 0o777) == 0o600
+                truncated = vector_adapter._truncate_npub(NPUB)
+                assert truncated in caplog.text
+                assert "bot npub" in caplog.text
+                assert NPUB not in caplog.text
+                assert nsec_secret not in caplog.text
                 await adapter.disconnect()
                 assert not record_path.exists()
 
@@ -948,6 +1007,51 @@ class TestOrphanReap:
         monkeypatch.setattr(vector_adapter.os, "kill", lambda pid, sig: killed.append((pid, sig)))
         asyncio.run(adapter._reap_orphan_sidecar())
         assert killed == []
+
+    def test_reap_kills_vector_bridge_and_deletes_record(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        rec = tmp_path / "runtime" / "vector-sidecar.json"
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(
+            vector_adapter, "_find_listener_pids", lambda _port: [4242]
+        )
+        monkeypatch.setattr(
+            vector_adapter, "_pid_is_vector_bridge", lambda _pid: True
+        )
+        monkeypatch.setattr(vector_adapter, "_pid_alive", lambda _pid: False)
+        killed = []
+        monkeypatch.setattr(
+            vector_adapter.os, "kill", lambda pid, sig: killed.append((pid, sig))
+        )
+        asyncio.run(adapter._reap_orphan_sidecar())
+        assert killed == [(4242, signal.SIGTERM)]
+        assert not rec.exists()
+
+    def test_connect_reaps_when_port_listening(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        listening = {"busy": True}
+        reaped = []
+
+        def fake_listening(*_a, **_k):
+            return listening["busy"]
+
+        async def fake_reap(self):
+            reaped.append(True)
+            listening["busy"] = False
+
+        def boom(*_a, **_k):
+            raise OSError("stop after reap")
+
+        monkeypatch.setattr(vector_adapter, "bridge_port_is_listening", fake_listening)
+        monkeypatch.setattr(
+            vector_adapter.VectorAdapter, "_reap_orphan_sidecar", fake_reap
+        )
+        monkeypatch.setattr(vector_adapter.subprocess, "Popen", boom)
+        ok = asyncio.run(adapter.connect())
+        assert reaped == [True]
+        assert ok is False
+        assert adapter.fatal_error_code == "vector_bridge_spawn_failed"
 
 
 # ---------------------------------------------------------------------------

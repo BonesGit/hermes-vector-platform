@@ -178,10 +178,30 @@ If inbound is silent: check `~/.hermes/logs/vector-bridge.log`, that `/health` i
 
 - Sidecar binds **127.0.0.1** by default; every route except `/live` requires `X-Hermes-Sidecar-Token`
 - nsec lives at `<VECTOR_DATA_DIR>/identity.nsec` (`0600`), never in `.env` at runtime
-- `nsec1…` is registered as a Hermes redaction pattern
+- `nsec1…` is registered as a Hermes redaction pattern; adapter logs truncate npub (`npub1abcd…`)
+- Runtime record `~/.hermes/runtime/vector-sidecar.json` is `0600` and deleted on disconnect
 - Keep `VECTOR_ALLOWED_USERS` tight on personal bots
 - Back up `sdk/identity.nsec` offline; replacing it **is** a new bot
+
+## Troubleshooting
+
+Operator checks — use this table and `hermes gateway status`. There is **no** `hermes doctor` coverage for this plugin.
+
+| Symptom | Check |
+|---------|--------|
+| Plugin not listed | `hermes plugins enable vector-platform` then `hermes plugins list` |
+| Invalid npub / allowlist ignored | hex, `npub1…`, or `nostr:npub1`. Bech32 charset is `qpzry9x8gf2tvdw0s3jn54khce6mua7l` — no `1`, `b`, `i`, `o` in the payload. `normalize_npub()` is the source of truth (not a loose regex). |
+| `vector-bridge` binary not found | `VECTOR_BRIDGE_BIN` or `bridge/target/release/vector-bridge`. Run `hermes gateway setup` (`cd bridge && cargo build --release`). `hermes gateway start` does **not** compile Rust. |
+| Identity missing / “will not mint” | `VECTOR_DATA_DIR` (default `~/.hermes/plugin-data/vector-platform/sdk`). `identity.nsec` must already exist from setup. Start never mints. |
+| Port 8096 in use | `ss -ltnp \| rg 8096` or set `VECTOR_BRIDGE_PORT`. A leftover `vector-bridge` is reaped on connect; a foreign process is a retryable fatal. |
+| Lost the bot / contacts don't recognize it | Back up `sdk/identity.nsec` offline. Replacing that file **is** a new bot (new npub, lost DMs). |
+| Sidecar is a stub / no live DMs | `VECTOR_STUB` must **not** be set in the gateway. Production `connect()` strips it. Only HTTP unit tests set it (binds without `VectorBot::build`). |
+| Missed DMs while the sidecar was down | v1 does **not** catch up. `sync_dms` ingests SQLite only and does not dispatch to Hermes. The peer retries. History catch-up is v1.1. |
+| Cron `deliver=vector` fails | Gateway must be running. Cron reads `~/.hermes/runtime/vector-sidecar.json` (`0600`, port + token). |
+| Gateway / sidecar status | `hermes gateway status`; `~/.hermes/logs/vector-bridge.log`. Logger is `hermes_plugins.vector_platform.adapter`. |
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+See also [CHANGELOG.md](CHANGELOG.md) for release history.

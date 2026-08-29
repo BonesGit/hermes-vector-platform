@@ -138,6 +138,10 @@ def _write_runtime_record(port: int, token: str, pid: int, npub: Optional[str] =
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh)
             os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -1145,6 +1149,8 @@ class VectorAdapter(BasePlatformAdapter):
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
+        # Give the OS a beat to release the listening socket (Photon).
+        await asyncio.sleep(0.2)
         _delete_runtime_record()
 
     def _close_bridge_log(self) -> None:

@@ -1382,6 +1382,37 @@ def _discard_identity_backup(bak: Optional[Path]) -> None:
         pass
 
 
+def _identity_nsec_locally_unreadable(data_dir: Path) -> bool:
+    """True when identity.nsec exists but cannot be read (or is empty)."""
+    path = Path(data_dir) / "identity.nsec"
+    try:
+        if not path.is_file():
+            return False
+        if path.stat().st_size == 0:
+            return True
+        path.read_bytes()
+        return False
+    except OSError:
+        return True
+
+
+def _adopt_stale_identity_backup(data_dir: Path, io) -> None:
+    """If a previous setup left only ``identity.nsec.bak``, put it back."""
+    src = Path(data_dir) / "identity.nsec"
+    bak = Path(data_dir) / "identity.nsec.bak"
+    try:
+        src_ok = src.is_file() and src.stat().st_size > 0
+    except OSError:
+        src_ok = False
+    if src_ok or not bak.is_file():
+        return
+    io.print_warning(
+        "Found identity.nsec.bak but no identity.nsec "
+        "(previous setup may have been interrupted). Restoring the backup."
+    )
+    _restore_identity_nsec(data_dir, bak)
+
+
 def _normalize_identity_choice(raw: str) -> Optional[str]:
     value = (raw or "").strip().lower()
     if value in ("c", "create", "new"):
@@ -1847,6 +1878,7 @@ def _run_interactive_setup(io) -> None:
 
     data_dir = Path(io.get_env_value("VECTOR_DATA_DIR") or resolve_data_dir())
     io.print_info(f"Data dir: {data_dir}")
+    _adopt_stale_identity_backup(data_dir, io)
 
     check_data, check_code, check_err = _run_bridge_cli(
         bin_path, data_dir, ["--check"], timeout=BRIDGE_CHECK_TIMEOUT
@@ -1881,8 +1913,11 @@ def _run_interactive_setup(io) -> None:
         io.print_error(
             f"vector-bridge --check failed (exit {check_code}): {check_err or 'no output'}"
         )
-        nsec_present = _identity_nsec_present(data_dir)
-        if nsec_present or check_code_name == "invalid_nsec":
+        # Only offer replace for a corrupt nsec. Timeout/crash/wrong-arch
+        # must not be described as an unreadable identity.
+        if check_code_name == "invalid_nsec" or _identity_nsec_locally_unreadable(
+            data_dir
+        ):
             io.print_warning(
                 "identity.nsec is unreadable (corrupt or invalid nsec). "
                 "Replacing it creates a NEW bot."
@@ -1965,6 +2000,7 @@ def _run_interactive_setup(io) -> None:
     extra_args: List[str] = []
     temp_secret: Optional[Path] = None
     bak: Optional[Path] = None
+    setup_ok = False
     setup_data: Optional[Dict[str, Any]] = None
     setup_code = 1
     setup_err = ""
@@ -1988,19 +2024,22 @@ def _run_interactive_setup(io) -> None:
             timeout=BRIDGE_SETUP_TIMEOUT,
         )
         bot_npub = ((setup_data or {}).get("npub") or "").strip()
-        if not setup_data or setup_code != 0 or not bot_npub:
-            _restore_identity_nsec(data_dir, bak)
-            bak = None
+        if setup_data and setup_code == 0 and bot_npub:
+            setup_ok = True
+        else:
             io.print_error(
                 f"vector-bridge --setup failed (exit {setup_code}): "
                 f"{setup_err or 'could not parse output'}"
             )
             return
-        _discard_identity_backup(bak)
-        bak = None
     finally:
         if temp_secret is not None:
             _shred_unlink(temp_secret)
+        # Ctrl+C / errors after the rename must put identity.nsec back.
+        if setup_ok:
+            _discard_identity_backup(bak)
+        else:
+            _restore_identity_nsec(data_dir, bak)
 
     bot_npub = ((setup_data or {}).get("npub") or "").strip()
     status = (setup_data or {}).get("status") or ""

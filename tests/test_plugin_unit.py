@@ -1670,3 +1670,114 @@ class TestInteractiveSetup:
         assert cli_calls[0] == ["--check"]
         assert cli_calls[1] == ["--setup"]
         assert not (data_dir / "identity.nsec.bak").exists()
+
+    def test_check_timeout_does_not_offer_replace(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        data_dir = tmp_path / "sdk"
+        data_dir.mkdir()
+        nsec = data_dir / "identity.nsec"
+        nsec.write_text("nsec1original\n")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        cli_calls = []
+
+        def fake_cli(_bin, _data, args, timeout=60):
+            cli_calls.append(list(args))
+            if "--check" in args:
+                return None, 124, "timed out after 30s"
+            return {"status": "created", "npub": NPUB}, 0, ""
+
+        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        io = _fake_setup_io(
+            yes_no={"Replace the unreadable identity.nsec?": True},
+        )
+        vector_adapter._run_interactive_setup(io)
+        assert cli_calls == [["--check"]]
+        assert io.saved == {}
+        assert nsec.read_text() == "nsec1original\n"
+        assert not any("unreadable" in m.lower() for m in io.logs["warn"])
+
+    def test_interrupt_during_setup_restores_identity(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        data_dir = tmp_path / "sdk"
+        data_dir.mkdir()
+        nsec = data_dir / "identity.nsec"
+        nsec.write_text("nsec1original\n")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+
+        def fake_cli(_bin, _data, args, timeout=60):
+            if "--check" in args:
+                return {"status": "existing", "npub": NPUB}, 0, ""
+            if "--setup" in args:
+                raise KeyboardInterrupt()
+            return None, 1, "unexpected"
+
+        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        io = _fake_setup_io(
+            prompts={
+                "Identity [create / nsec / mnemonic]": "create",
+                "Bot display name": "Hermes",
+                "Your Vector npub": PEER_NPUB,
+            },
+            yes_no={
+                "Reconfigure identity anyway?": True,
+                "Enable pairing codes": True,
+            },
+        )
+        raised = False
+        try:
+            vector_adapter._run_interactive_setup(io)
+        except KeyboardInterrupt:
+            raised = True
+        assert raised
+        assert nsec.read_text() == "nsec1original\n"
+        assert not (data_dir / "identity.nsec.bak").exists()
+        assert io.saved == {}
+
+    def test_stale_bak_restored_before_check(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        data_dir = tmp_path / "sdk"
+        data_dir.mkdir()
+        bak = data_dir / "identity.nsec.bak"
+        bak.write_text("nsec1original\n")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        seen_nsec = []
+
+        def fake_cli(_bin, data, args, timeout=60):
+            if "--check" in args:
+                nsec = Path(data) / "identity.nsec"
+                seen_nsec.append(nsec.read_text() if nsec.is_file() else None)
+                return {"status": "existing", "npub": NPUB}, 0, ""
+            if "--setup" in args:
+                return {"status": "existing", "npub": NPUB}, 0, ""
+            return None, 1, "unexpected"
+
+        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        io = _fake_setup_io(
+            prompts={
+                "Bot display name": "Hermes",
+                "Your Vector npub": PEER_NPUB,
+            },
+            yes_no={
+                "Reconfigure identity anyway?": False,
+                "Enable pairing codes": True,
+            },
+        )
+        vector_adapter._run_interactive_setup(io)
+        assert seen_nsec == ["nsec1original\n"]
+        assert (data_dir / "identity.nsec").read_text() == "nsec1original\n"
+        assert not bak.exists()
+        assert io.saved["VECTOR_NPUB"] == NPUB

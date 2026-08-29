@@ -237,3 +237,590 @@ class TestRegister:
         sample = kwargs["parse_target_ref_fn"](HEX_PUBKEY)
         assert sample == (NPUB, None)
         assert not isinstance(sample, str)
+
+
+# ---------------------------------------------------------------------------
+# Adapter lifecycle + DM path (mocked HTTP sidecar — no live Vector network)
+# ---------------------------------------------------------------------------
+
+import asyncio
+import json
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import httpx
+
+
+PEER_HEX = "32e1827635450cd0e04c1e6cebee8ba3c9d9da2a59088d32a7c0bb77c9c66570"
+PEER_NPUB = vector_adapter.hex_to_npub(PEER_HEX)
+assert PEER_NPUB
+
+
+class FakeBridgeProc:
+    """Stand-in for vector-bridge so tests never spawn Rust."""
+
+    def __init__(self, pid: int = 424242):
+        self.pid = pid
+        self.returncode = None
+        self.stdin = MagicMock()
+        self._alive = True
+
+    def poll(self):
+        return None if self._alive else self.returncode
+
+    def terminate(self):
+        self._alive = False
+        self.returncode = 0
+
+    def kill(self):
+        self._alive = False
+        self.returncode = -9
+
+
+class MockSidecar:
+    """Loopback HTTP sidecar: token auth, /health, /send, /typing, /events."""
+
+    def __init__(self, token: str, npub: str = NPUB, ready: bool = True):
+        self.token = token
+        self.npub = npub
+        self.ready = ready
+        self.sends: list = []
+        self.typing: list = []
+        self.health_headers: list = []
+        self.send_headers: list = []
+        self.typing_headers: list = []
+        self.events_headers: list = []
+        self.inject_queue: list = []
+        self.port: int | None = None
+        self._httpd = None
+
+    def start(self) -> int:
+        sidecar = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def _auth(self) -> bool:
+                got = self.headers.get(vector_adapter.SIDECAR_TOKEN_HEADER)
+                if got != sidecar.token:
+                    return self._json(
+                        401, {"error": "unauthorized", "code": "unauthorized"}
+                    ) or False
+                return True
+
+            def _json(self, status: int, obj: dict):
+                body = json.dumps(obj).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/live":
+                    return self._json(200, {"ok": True})
+                if not self._auth():
+                    return
+                if path == "/health":
+                    sidecar.health_headers.append(dict(self.headers))
+                    if sidecar.ready:
+                        return self._json(
+                            200, {"status": "ready", "npub": sidecar.npub}
+                        )
+                    return self._json(200, {"status": "starting"})
+                if path == "/events":
+                    sidecar.events_headers.append(dict(self.headers))
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        for evt in list(sidecar.inject_queue):
+                            payload = json.dumps(evt).encode()
+                            self.wfile.write(b"data: " + payload + b"\n\n")
+                            self.wfile.flush()
+                        while True:
+                            time.sleep(0.2)
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                        return
+                    return
+                return self._json(404, {"error": "not found", "code": "not_found"})
+
+            def do_POST(self):
+                if not self._auth():
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n else b"{}"
+                data = json.loads(raw.decode() or "{}")
+                path = self.path.split("?", 1)[0]
+                if path == "/send":
+                    sidecar.sends.append(data)
+                    sidecar.send_headers.append(dict(self.headers))
+                    return self._json(200, {"id": "evt-outbound-1"})
+                if path == "/typing":
+                    sidecar.typing.append(data)
+                    sidecar.typing_headers.append(dict(self.headers))
+                    return self._json(200, {"ok": True})
+                return self._json(404, {"error": "not found", "code": "not_found"})
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = httpd.server_address[1]
+        self._httpd = httpd
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return self.port
+
+    def stop(self) -> None:
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
+
+
+def _patch_platform(monkeypatch) -> MagicMock:
+    """Avoid Platform('vector') hitting the registry (_missing_ rejects unknown)."""
+    mock_plat = MagicMock()
+    mock_plat.value = "vector"
+    monkeypatch.setattr(vector_adapter, "Platform", lambda *_a, **_k: mock_plat)
+    return mock_plat
+
+
+def _make_adapter(monkeypatch, tmp_path, **extra):
+    _patch_platform(monkeypatch)
+    monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        vector_adapter.BasePlatformAdapter,
+        "_acquire_platform_lock",
+        lambda self, **_k: True,
+    )
+    monkeypatch.setattr(
+        vector_adapter.BasePlatformAdapter,
+        "_release_platform_lock",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        vector_adapter.BasePlatformAdapter,
+        "_write_runtime_status_safe",
+        lambda self, *_a, **_k: None,
+    )
+    monkeypatch.setattr(vector_adapter, "BRIDGE_TERM_WAIT", 0)
+
+    fake_bin = tmp_path / "vector-bridge"
+    if not fake_bin.exists():
+        fake_bin.write_text("")
+    monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: fake_bin)
+    monkeypatch.setattr(
+        vector_adapter, "bridge_port_is_listening", lambda *_a, **_k: False
+    )
+
+    cfg = MagicMock()
+    cfg.extra = {
+        "npub": extra.get("npub", NPUB),
+        "bridge_port": extra.get("bridge_port", 18096),
+        "bridge_host": extra.get("bridge_host", "127.0.0.1"),
+        "bot_name": extra.get("bot_name", "Hermes"),
+        "startup_timeout": extra.get("startup_timeout", 5),
+        "data_dir": str(extra.get("data_dir") or (tmp_path / "sdk")),
+    }
+    return vector_adapter.VectorAdapter(cfg)
+
+
+def _message_event(peer: str, text: str, *, msg_id: str = "id1", **overrides) -> dict:
+    data = {
+        "id": msg_id,
+        "chat_id": peer,
+        "npub": peer,
+        "is_group": False,
+        "is_mine": False,
+        "is_file": False,
+        "text": text,
+        "reply_to": "",
+        "reply_to_text": None,
+        "at_ms": 1,
+    }
+    data.update(overrides)
+    return {"type": "message", "data": data}
+
+
+class TestPortHelper:
+    def test_unused_high_port_not_listening(self):
+        assert vector_adapter.bridge_port_is_listening(61999) is False
+
+    def test_listening_true_for_bound_port(self):
+        sidecar = MockSidecar(token="x")
+        port = sidecar.start()
+        try:
+            assert vector_adapter.bridge_port_is_listening(port, host="127.0.0.1") is True
+        finally:
+            sidecar.stop()
+
+
+class TestGetChatInfo:
+    def test_truncated_npub_dm(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        info = asyncio.run(adapter.get_chat_info(NPUB))
+        assert info["type"] == "dm"
+        assert info["chat_id"] == NPUB
+        assert info["name"] == f"{NPUB[:16]}..."
+        assert len(info["name"]) < len(NPUB)
+
+
+class TestInboundMapping:
+    def test_chat_id_user_id_are_peer_npub(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(adapter._handle_message_event(_message_event(PEER_NPUB, "hi", msg_id="m1")))
+        assert len(captured) == 1
+        src = captured[0].source
+        assert src.chat_id == PEER_NPUB
+        assert src.user_id == PEER_NPUB
+        assert src.chat_type == "dm"
+        assert captured[0].text == "hi"
+        assert captured[0].message_id == "m1"
+
+    def test_hex_peer_normalized_to_npub(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(adapter._handle_message_event(_message_event(PEER_HEX, "yo", msg_id="m2")))
+        assert captured[0].source.chat_id == PEER_NPUB
+        assert captured[0].source.user_id == PEER_NPUB
+
+    def test_skip_is_mine(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "echo", msg_id="mine1", is_mine=True)
+            )
+        )
+        assert captured == []
+
+    def test_skip_is_group(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "group", msg_id="g1", is_group=True)
+            )
+        )
+        assert captured == []
+
+    def test_skip_own_npub(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(adapter._handle_message_event(_message_event(NPUB, "self", msg_id="self1")))
+        assert captured == []
+
+
+class TestInboundDedup:
+    def test_same_id_dispatched_once(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        evt = _message_event(PEER_NPUB, "once", msg_id="dup-1")
+        asyncio.run(adapter._handle_message_event(evt))
+        asyncio.run(adapter._handle_message_event(evt))
+        assert len(captured) == 1
+
+    def test_lru_evicts_oldest(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        monkeypatch.setattr(vector_adapter, "INBOUND_DEDUP_MAX", 2)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+
+        async def run():
+            await adapter._handle_message_event(
+                _message_event(PEER_NPUB, "a", msg_id="a")
+            )
+            await adapter._handle_message_event(
+                _message_event(PEER_NPUB, "b", msg_id="b")
+            )
+            await adapter._handle_message_event(
+                _message_event(PEER_NPUB, "c", msg_id="c")
+            )
+            # "a" should have been evicted
+            await adapter._handle_message_event(
+                _message_event(PEER_NPUB, "a-again", msg_id="a")
+            )
+
+        asyncio.run(run())
+        assert [e.message_id for e in captured] == ["a", "b", "c", "a"]
+
+
+class TestSpawnEnv:
+    def test_spawn_sets_token_stdin_pipe_and_strips_secrets(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._sidecar_token = "tok" + "ab" * 30
+        monkeypatch.setenv("VECTOR_NSEC", "nsec1shouldneverleak")
+        monkeypatch.setenv("VECTOR_MNEMONIC", "abandon abandon")
+        monkeypatch.setenv("VECTOR_STUB", "1")
+        captured: dict = {}
+
+        def fake_popen(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return FakeBridgeProc()
+
+        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        proc = adapter._spawn_bridge()
+        assert proc.pid == 424242
+        kwargs = captured["kwargs"]
+        assert kwargs["stdin"] == subprocess.PIPE
+        assert kwargs["stdout"] is not subprocess.PIPE
+        assert kwargs["stderr"] is not subprocess.PIPE
+        env = kwargs["env"]
+        assert env["VECTOR_SIDECAR_TOKEN"] == adapter._sidecar_token
+        assert env["VECTOR_SIDECAR_WATCH_STDIN"] == "1"
+        assert env["VECTOR_BRIDGE_PORT"] == str(adapter.bridge_port)
+        assert env["VECTOR_BOT_NAME"] == "Hermes"
+        assert "VECTOR_NSEC" not in env
+        assert "VECTOR_MNEMONIC" not in env
+        assert "VECTOR_STUB" not in env
+        if sys.platform != "win32":
+            assert kwargs.get("preexec_fn") is os.setsid
+        adapter._close_bridge_log()
+
+
+class TestConnectMissingBinary:
+    def test_missing_binary_is_fatal_not_retryable(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        missing = tmp_path / "no-such-vector-bridge"
+        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: missing)
+        spawned = []
+        monkeypatch.setattr(
+            vector_adapter.VectorAdapter,
+            "_spawn_bridge",
+            lambda self: spawned.append(True) or FakeBridgeProc(),
+        )
+        ok = asyncio.run(adapter.connect())
+        assert ok is False
+        assert spawned == []
+        assert adapter.has_fatal_error
+        assert adapter.fatal_error_retryable is False
+        assert adapter.fatal_error_code == "vector_bridge_missing"
+
+
+class TestMockedSidecarHttp:
+    def test_send_and_typing_include_token_header(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    result = await adapter.send(PEER_NPUB, "hello", reply_to="parent-id")
+                    assert result.success
+                    assert result.message_id == "evt-outbound-1"
+                    await adapter.send_typing(PEER_NPUB)
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.sends == [
+                {"to": PEER_NPUB, "body": "hello", "reply_to": "parent-id"}
+            ]
+            assert sidecar.send_headers[0].get("X-Hermes-Sidecar-Token") == token
+            assert sidecar.typing == [{"to": PEER_NPUB}]
+            assert sidecar.typing_headers[0].get("X-Hermes-Sidecar-Token") == token
+        finally:
+            sidecar.stop()
+
+    def test_send_rejects_wrong_token(self, monkeypatch, tmp_path):
+        sidecar = MockSidecar(token="correct-token")
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = "wrong-token"
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    result = await adapter.send(PEER_NPUB, "nope")
+                    assert result.success is False
+                    assert "401" in (result.error or "")
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.sends == []
+        finally:
+            sidecar.stop()
+
+    def test_connect_polls_health_and_sends_token(self, monkeypatch, tmp_path):
+        token = "b" * 64
+        sidecar = MockSidecar(token=token, npub=NPUB)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(
+                monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
+            )
+            monkeypatch.setattr(
+                vector_adapter.secrets, "token_hex", lambda n: token
+            )
+
+            async def idle_sse(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise
+
+            async def idle_health(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise
+
+            monkeypatch.setattr(vector_adapter.VectorAdapter, "_sse_listener", idle_sse)
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter, "_health_monitor", idle_health
+            )
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter,
+                "_spawn_bridge",
+                lambda self: FakeBridgeProc(),
+            )
+
+            async def go():
+                ok = await adapter.connect()
+                assert ok is True
+                assert adapter.is_connected
+                result = await adapter.send(PEER_NPUB, "after-connect")
+                assert result.success
+                record_path = tmp_path / "runtime" / "vector-sidecar.json"
+                record = json.loads(record_path.read_text())
+                assert record["token"] == token
+                assert record["port"] == port
+                assert record["npub"] == NPUB
+                await adapter.disconnect()
+                assert not record_path.exists()
+
+            asyncio.run(go())
+            assert sidecar.health_headers
+            assert sidecar.health_headers[0].get("X-Hermes-Sidecar-Token") == token
+            assert sidecar.sends == [{"to": PEER_NPUB, "body": "after-connect"}]
+        finally:
+            sidecar.stop()
+
+    def test_sse_inbound_reaches_handle_message(self, monkeypatch, tmp_path):
+        token = "c" * 64
+        sidecar = MockSidecar(token=token, npub=NPUB)
+        sidecar.inject_queue.append(_message_event(PEER_NPUB, "from-sse", msg_id="sse-1"))
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(
+                monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
+            )
+            monkeypatch.setattr(
+                vector_adapter.secrets, "token_hex", lambda n: token
+            )
+            captured = []
+
+            async def capture(event):
+                captured.append(event)
+
+            adapter.handle_message = capture  # type: ignore[method-assign]
+
+            async def idle_health(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise
+
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter, "_health_monitor", idle_health
+            )
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter,
+                "_spawn_bridge",
+                lambda self: FakeBridgeProc(),
+            )
+
+            async def go():
+                ok = await adapter.connect()
+                assert ok is True
+                for _ in range(50):
+                    if captured:
+                        break
+                    await asyncio.sleep(0.05)
+                await adapter.disconnect()
+
+            asyncio.run(go())
+            assert sidecar.events_headers
+            assert sidecar.events_headers[0].get("X-Hermes-Sidecar-Token") == token
+            assert len(captured) == 1
+            assert captured[0].text == "from-sse"
+            assert captured[0].source.chat_id == PEER_NPUB
+            assert captured[0].source.user_id == PEER_NPUB
+            assert captured[0].source.chat_type == "dm"
+        finally:
+            sidecar.stop()
+
+    def test_connect_does_not_set_vector_stub(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._sidecar_token = "t" * 64
+        captured: dict = {}
+
+        def fake_popen(*args, **kwargs):
+            captured["env"] = kwargs["env"]
+            return FakeBridgeProc()
+
+        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        monkeypatch.setenv("VECTOR_STUB", "1")
+        adapter._spawn_bridge()
+        assert "VECTOR_STUB" not in captured["env"]
+        adapter._close_bridge_log()
+
+
+class TestFatalBridgeExit:
+    def test_handle_bridge_exit_is_retryable(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._bridge_process = FakeBridgeProc()
+        adapter._bridge_process.terminate()
+        asyncio.run(adapter._handle_bridge_exit())
+        assert adapter.has_fatal_error
+        assert adapter.fatal_error_retryable is True
+        assert adapter.fatal_error_code == "vector_bridge_exited"

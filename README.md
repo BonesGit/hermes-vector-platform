@@ -22,7 +22,7 @@ Confirm discovery:
 hermes plugins list
 ```
 
-`hermes gateway setup` for Vector (identity create/import + sidecar build) lands in a later PR. Until then the plugin registers the `vector` platform so pairing allowlists (`VECTOR_ALLOWED_USERS`) and npub helpers are already in place.
+`hermes gateway setup` for Vector (identity create/import + sidecar build) lands in a later PR. `connect()` already spawns `vector-bridge` once the binary exists (`VECTOR_BRIDGE_BIN` or `bridge/target/release/vector-bridge`). Build it with `cd bridge && cargo build --release` until setup is wired.
 
 ### Option B — pip entry point
 
@@ -77,7 +77,7 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
                          Hermes gateway / AIAgent
 ```
 
-The sidecar is **not shipped in this skeleton**. `connect()` does not spawn a process yet.
+`VectorAdapter.connect()` generates a spawn-time `X-Hermes-Sidecar-Token`, starts `vector-bridge` with `stdin=PIPE` + `VECTOR_SIDECAR_WATCH_STDIN=1` (parent-death), polls authenticated `GET /health` until `status=ready`, then subscribes to `GET /events` (SSE). DMs map as `chat_id = user_id = peer npub`.
 
 ## Environment variables
 
@@ -128,7 +128,18 @@ cd bridge && cargo test --locked
 
 Tests load `adapter.py` as a free module and do **not** construct `Platform("vector")` — `_missing_()` only succeeds once the registry has the plugin.
 
-HTTP sidecar tests set `VECTOR_STUB=1` so they bind localhost HTTP **without** `VectorBot::build` (no live relays). Production serve requires `VECTOR_DATA_DIR` with an existing `identity.nsec` (`--setup` already wrote it) and runs `VectorBot` with `InvitePolicy::Manual`. Do not set `VECTOR_STUB` in the gateway.
+HTTP sidecar tests set `VECTOR_STUB=1` so they bind localhost HTTP **without** `VectorBot::build` (no live relays). Adapter unit tests mock that HTTP sidecar (no live Vector network). Production `connect()` does **not** set `VECTOR_STUB`. Production serve requires `VECTOR_DATA_DIR` with an existing `identity.nsec` (`--setup` already wrote it) and runs `VectorBot` with `InvitePolicy::Manual`. Do not set `VECTOR_STUB` in the gateway.
+
+## Live DM test (manual)
+
+CI does not talk to Vector relays. After the sidecar is built, identity exists, and the gateway is running:
+
+1. Put **your** Vector npub in `VECTOR_ALLOWED_USERS` (and `VECTOR_HOME_CHANNEL`). Unknown npubs are default-denied; with pairing on they get a Hermes pairing code instead of a turn.
+2. Share the bot npub (`VECTOR_NPUB`) with that allowlisted peer.
+3. From the Vector app, DM the bot. Hermes session key is `agent:main:vector:dm:<peer-npub>`.
+4. The bot reply is `POST /send` `{to: <peer-npub>, body}` with `X-Hermes-Sidecar-Token`.
+
+If inbound is silent: check `~/.hermes/logs/vector-bridge.log`, that `/health` is `ready`, and that the peer npub is allowlisted (not the bot's own npub).
 
 ## Security notes
 

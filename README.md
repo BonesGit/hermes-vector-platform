@@ -120,7 +120,7 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
 
 ## Display / tool progress
 
-Vector can edit messages, but v1 has no `/edit` route. Setup writes:
+Vector can edit messages, but v1 has no `/edit` route. Setup merges only the `display.platforms.vector` mapping (comment-preserving when `ruamel.yaml` is available; otherwise a full dump of `config.yaml`):
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -129,9 +129,11 @@ display:
     vector:
       tool_progress: off
       interim_assistant_messages: false
+      long_running_notifications: false
+      busy_ack_detail: false
 ```
 
-There is no `display.platform_tool_progress` key. Without the YAML override the plugin inherits Hermes' global `tool_progress: all` and would post a new Vector DM per tool event. Markdown **is** rendered — opposite of Session.
+There is no `display.platform_tool_progress` key. Without the YAML override the plugin inherits Hermes' global `tool_progress: all` and would post a new Vector DM per tool event. Markdown **is** rendered — opposite of Session. Setup still writes this block when you decline “Reconfigure Vector?” so a pre-existing `VECTOR_NPUB` gets the D12 override.
 
 ## Default-deny inbox
 

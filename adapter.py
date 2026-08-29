@@ -1244,17 +1244,19 @@ def _probe_rustc() -> Optional[tuple]:
     return _parse_rustc_version(result.stdout or result.stderr or "")
 
 
-def _parse_bridge_json(stdout: str) -> Optional[Dict[str, Any]]:
-    """First JSON object on stdout that carries a ``status`` field."""
-    for line in (stdout or "").splitlines():
+def _parse_bridge_json(text: str) -> Optional[Dict[str, Any]]:
+    """First JSON object that carries ``status``, ``code``, or ``error``."""
+    for line in (text or "").splitlines():
         line = line.strip()
-        if not (line.startswith("{") and "status" in line):
+        if not line.startswith("{"):
             continue
         try:
             data = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(data, dict) and "status" in data:
+        if isinstance(data, dict) and (
+            "status" in data or "code" in data or "error" in data
+        ):
             return data
     return None
 
@@ -1294,12 +1296,22 @@ def _run_bridge_cli(
         return None, 127, str(e)
     data = _parse_bridge_json(result.stdout or "")
     err = (result.stderr or "").strip()
+    if data is None and err:
+        data = _parse_bridge_json(err)
     return data, result.returncode, err
 
 
-def _write_temp_secret(contents: str) -> Path:
-    """Write a one-shot 0600 file for --nsec-file / --mnemonic-file."""
-    fd, name = tempfile.mkstemp(prefix=".vector-import.", suffix=".tmp")
+def _write_temp_secret(contents: str, directory: Optional[Path] = None) -> Path:
+    """Write a one-shot 0600 file for --nsec-file / --mnemonic-file.
+
+    Prefer ``VECTOR_DATA_DIR`` so a SIGKILL leftover sits next to identity
+    material, not in ``/tmp``.
+    """
+    parent = Path(directory) if directory else Path(tempfile.gettempdir())
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        dir=str(parent), prefix=".vector-import.", suffix=".tmp"
+    )
     try:
         try:
             os.chmod(name, 0o600)
@@ -1314,6 +1326,60 @@ def _write_temp_secret(contents: str) -> Path:
             pass
         raise
     return Path(name)
+
+
+def _shred_unlink(path: Path) -> None:
+    """Overwrite then unlink a one-shot secret file."""
+    try:
+        if path.is_file():
+            size = max(path.stat().st_size, 1)
+            with open(path, "r+b") as fh:
+                fh.write(b"\0" * size)
+                fh.flush()
+                os.fsync(fh.fileno())
+        path.unlink(missing_ok=True)
+    except OSError:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _backup_identity_nsec(data_dir: Path) -> Optional[Path]:
+    """Rename ``identity.nsec`` → ``identity.nsec.bak``. None if missing."""
+    src = Path(data_dir) / "identity.nsec"
+    if not src.is_file():
+        return None
+    bak = Path(data_dir) / "identity.nsec.bak"
+    if bak.exists():
+        bak.unlink()
+    src.replace(bak)
+    return bak
+
+
+def _restore_identity_nsec(data_dir: Path, bak: Optional[Path]) -> None:
+    """Put the backup back if ``--setup`` failed after the rename."""
+    if bak is None or not bak.is_file():
+        return
+    src = Path(data_dir) / "identity.nsec"
+    try:
+        if src.exists():
+            src.unlink()
+    except OSError:
+        pass
+    try:
+        bak.replace(src)
+    except OSError as e:
+        logger.warning("Vector: failed to restore identity.nsec from backup: %s", e)
+
+
+def _discard_identity_backup(bak: Optional[Path]) -> None:
+    if bak is None:
+        return
+    try:
+        bak.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _normalize_identity_choice(raw: str) -> Optional[str]:
@@ -1335,9 +1401,163 @@ def _config_yaml_path() -> Path:
     return Path(home) / "config.yaml"
 
 
+# D12 + Signal/Photon _TIER_LOW extras until /edit exists.
+_VECTOR_DISPLAY_SETTINGS = {
+    "tool_progress": "off",
+    "interim_assistant_messages": False,
+    "long_running_notifications": False,
+    "busy_ack_detail": False,
+}
+_YAML11_AMBIGUOUS = {
+    "y",
+    "n",
+    "yes",
+    "no",
+    "true",
+    "false",
+    "on",
+    "off",
+    "null",
+    "~",
+}
+
+
+def _quote_yaml11_str(value: Any) -> Any:
+    """Quote YAML 1.1 bool-like strings so ``off`` does not load as False."""
+    if not (isinstance(value, str) and value.lower() in _YAML11_AMBIGUOUS):
+        return value
+    try:
+        from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+
+        return DoubleQuotedScalarString(value)
+    except ImportError:
+        return value
+
+
 def _merge_vector_display_config(config_path: Optional[Path] = None) -> bool:
-    """D12: merge display.platforms.vector without clobbering other keys."""
+    """D12: merge display.platforms.vector without clobbering other keys.
+
+    Prefers ruamel round-trip so comments, key order, and quoting survive.
+    Falls back to PyYAML (full dump) if ruamel is unavailable. Unparseable
+    or non-mapping roots are refused rather than overwritten.
+    """
     path = Path(config_path) if config_path else _config_yaml_path()
+    if not _display_config_is_writable(path):
+        return False
+    if _merge_display_ruamel(path):
+        return True
+    return _merge_display_pyyaml(path)
+
+
+def _display_config_is_writable(path: Path) -> bool:
+    """False when an existing config.yaml must not be replaced."""
+    if not path.exists():
+        return True
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("Vector: failed to read %s: %s", path, e)
+        return False
+    if not raw.strip():
+        return True
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(raw)
+    except Exception as e:
+        logger.warning(
+            "Vector: %s is unparseable (%s); refusing to overwrite", path, e
+        )
+        return False
+    if loaded is not None and not isinstance(loaded, dict):
+        logger.warning(
+            "Vector: %s root is not a mapping; skipping display merge", path
+        )
+        return False
+    return True
+
+
+def _ensure_mapping(parent: dict, key: str) -> dict:
+    current = parent.get(key)
+    if not isinstance(current, dict):
+        current = {}
+        parent[key] = current
+    return current
+
+
+def _apply_vector_display_settings(root: dict) -> None:
+    display = _ensure_mapping(root, "display")
+    platforms = _ensure_mapping(display, "platforms")
+    vector = _ensure_mapping(platforms, "vector")
+    for key, value in _VECTOR_DISPLAY_SETTINGS.items():
+        vector[key] = value
+
+
+def _atomic_write_text(path: Path, writer) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".vector-config.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            writer(fh)
+            fh.flush()
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _merge_display_ruamel(path: Path) -> bool:
+    try:
+        from ruamel.yaml import YAML
+        from ruamel.yaml.comments import CommentedMap
+    except ImportError:
+        return False
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    try:
+        data: Any = CommentedMap()
+        if path.exists():
+            raw = path.read_text(encoding="utf-8")
+            if raw.strip():
+                with path.open("r", encoding="utf-8") as fh:
+                    loaded = yaml_rt.load(fh)
+                if loaded is None:
+                    data = CommentedMap()
+                elif not isinstance(loaded, dict):
+                    return False
+                else:
+                    data = loaded
+        if not isinstance(data, CommentedMap):
+            data = CommentedMap(data)
+
+        def _cm(parent, key):
+            cur = parent.get(key)
+            if isinstance(cur, CommentedMap):
+                return cur
+            nxt = CommentedMap(cur) if isinstance(cur, dict) else CommentedMap()
+            parent[key] = nxt
+            return nxt
+
+        vector = _cm(_cm(_cm(data, "display"), "platforms"), "vector")
+        for key, value in _VECTOR_DISPLAY_SETTINGS.items():
+            vector[key] = _quote_yaml11_str(value)
+
+        _atomic_write_text(path, lambda fh: yaml_rt.dump(data, fh))
+        return True
+    except Exception as e:
+        logger.warning("Vector: ruamel display merge failed (%s); trying PyYAML", e)
+        return False
+
+
+def _merge_display_pyyaml(path: Path) -> bool:
     try:
         import yaml
     except ImportError:
@@ -1352,56 +1572,41 @@ def _merge_vector_display_config(config_path: Optional[Path] = None) -> bool:
             logger.warning("Vector: failed to read %s: %s", path, e)
             return False
         if raw.strip():
-            try:
-                loaded = yaml.safe_load(raw)
-            except Exception as e:
-                logger.warning(
-                    "Vector: %s is unparseable (%s); refusing to overwrite", path, e
-                )
-                return False
+            loaded = yaml.safe_load(raw)
             if loaded is None:
                 data = {}
             elif not isinstance(loaded, dict):
-                logger.warning(
-                    "Vector: %s root is not a mapping; skipping display merge", path
-                )
                 return False
             else:
                 data = loaded
 
-    display = data.get("display")
-    if not isinstance(display, dict):
-        display = {}
-        data["display"] = display
-    platforms = display.get("platforms")
-    if not isinstance(platforms, dict):
-        platforms = {}
-        display["platforms"] = platforms
-    vector = platforms.get("vector")
-    if not isinstance(vector, dict):
-        vector = {}
-        platforms["vector"] = vector
-    vector["tool_progress"] = "off"
-    vector["interim_assistant_messages"] = False
+    _apply_vector_display_settings(data)
+
+    class _Dumper(yaml.SafeDumper):
+        pass
+
+    def _represent_str(dumper, value):
+        style = (
+            '"'
+            if isinstance(value, str) and value.lower() in _YAML11_AMBIGUOUS
+            else None
+        )
+        return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+    _Dumper.add_representer(str, _represent_str)
 
     try:
-        text = yaml.safe_dump(
-            data, default_flow_style=False, sort_keys=False, allow_unicode=True
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(path.parent), prefix=".vector-config.", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        def _write(fh):
+            yaml.dump(
+                data,
+                fh,
+                Dumper=_Dumper,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+
+        _atomic_write_text(path, _write)
     except Exception as e:
         logger.warning("Vector: failed to write display YAML to %s: %s", path, e)
         return False
@@ -1448,23 +1653,20 @@ def _ensure_bridge_binary(io) -> Optional[Path]:
         return None
 
     io.print_info(
-        "Building vector-bridge (cargo build --release; may take several minutes)..."
+        "Building vector-bridge (cargo build --release --locked; "
+        "may take several minutes)..."
     )
     try:
         result = subprocess.run(
-            [cargo, "build", "--release"],
+            [cargo, "build", "--release", "--locked"],
             cwd=str(_BRIDGE_DIR),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=CARGO_BUILD_TIMEOUT,
             check=False,
         )
     except subprocess.TimeoutExpired:
         io.print_error(
             f"cargo build timed out after {CARGO_BUILD_TIMEOUT}s. Retry or build "
-            "manually: cd bridge && cargo build --release"
+            "manually: cd bridge && cargo build --release --locked"
         )
         return None
     except OSError as e:
@@ -1472,8 +1674,9 @@ def _ensure_bridge_binary(io) -> Optional[Path]:
         return None
 
     if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip()
-        io.print_error(f"cargo build --release failed:\n{err[-4000:]}")
+        io.print_error(
+            "cargo build --release --locked failed (see compiler output above)."
+        )
         return None
 
     built = _DEFAULT_BRIDGE_BIN
@@ -1573,27 +1776,57 @@ async def _standalone_send(
 
     url = f"http://{host}:{port}/send"
     headers = {SIDECAR_TOKEN_HEADER: token}
+    text = message or ""
+    has_media = bool(media_files)
+    if not str(text).strip():
+        if has_media:
+            return {"error": "Vector media is not implemented in v1"}
+        return {"error": "Vector send requires a message body"}
     try:
         async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-            text = message or ""
-            if not str(text).strip() and not (media_files or []):
-                return {"error": "Vector send requires a message body"}
-            if str(text).strip():
-                resp = await client.post(
-                    url,
-                    json={"to": chat_id, "body": text},
-                    headers=headers,
+            resp = await client.post(
+                url,
+                json={"to": chat_id, "body": text},
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                err = (resp.text or "")[:200]
+                return {
+                    "error": f"Vector /send returned {resp.status_code}: {err}"
+                }
+            result: Dict[str, Any] = {
+                "success": True,
+                "platform": "vector",
+                "chat_id": chat_id,
+            }
+            if has_media:
+                result["warning"] = (
+                    "Vector media is not implemented in v1; attachments were ignored"
                 )
-                if resp.status_code != 200:
-                    err = (resp.text or "")[:200]
-                    return {
-                        "error": f"Vector /send returned {resp.status_code}: {err}"
-                    }
-            if media_files:
-                logger.debug("Vector standalone send: media is not implemented in v1")
-            return {"success": True, "platform": "vector", "chat_id": chat_id}
+            return result
     except Exception as e:
         return {"error": f"Vector send failed: {e}"}
+
+
+def _maybe_merge_display(io) -> None:
+    if _merge_vector_display_config():
+        io.print_info(
+            "Wrote display.platforms.vector.tool_progress: off to config.yaml"
+        )
+    else:
+        io.print_warning(
+            "Could not merge display.platforms.vector into config.yaml. "
+            "Add tool_progress: off under display.platforms.vector yourself "
+            "or Hermes will post a new Vector DM per tool event."
+        )
+
+
+def _confirm_import_as_bot(io) -> bool:
+    io.print_warning(
+        "This identity will be tagged as a bot and will receive agent replies. "
+        "Do not import your personal daily-driver nsec unless you intend that."
+    )
+    return io.prompt_yes_no("Import this identity as the Hermes bot?", False)
 
 
 def _run_interactive_setup(io) -> None:
@@ -1605,6 +1838,7 @@ def _run_interactive_setup(io) -> None:
             f"Vector: already configured (npub: {_truncate_npub(existing_npub)})"
         )
         if not io.prompt_yes_no("Reconfigure Vector?", False):
+            _maybe_merge_display(io)
             return
 
     bin_path = _ensure_bridge_binary(io)
@@ -1617,17 +1851,12 @@ def _run_interactive_setup(io) -> None:
     check_data, check_code, check_err = _run_bridge_cli(
         bin_path, data_dir, ["--check"], timeout=BRIDGE_CHECK_TIMEOUT
     )
-    if check_code not in (0, None) and check_data is None:
-        io.print_error(
-            f"vector-bridge --check failed (exit {check_code}): {check_err or 'no output'}"
-        )
-        return
 
     existing_identity_npub = None
     if check_data and check_data.get("status") == "existing":
         existing_identity_npub = (check_data.get("npub") or "").strip() or None
 
-    identity_choice = "create"
+    identity_choice: Optional[str] = "create"
     import_secret = None
     import_kind = None  # "nsec" | "mnemonic"
     wipe_identity = False
@@ -1645,6 +1874,25 @@ def _run_interactive_setup(io) -> None:
             wipe_identity = True
         else:
             identity_choice = None
+    elif check_code not in (0, None):
+        check_code_name = (
+            (check_data or {}).get("code") if isinstance(check_data, dict) else None
+        )
+        io.print_error(
+            f"vector-bridge --check failed (exit {check_code}): {check_err or 'no output'}"
+        )
+        nsec_present = _identity_nsec_present(data_dir)
+        if nsec_present or check_code_name == "invalid_nsec":
+            io.print_warning(
+                "identity.nsec is unreadable (corrupt or invalid nsec). "
+                "Replacing it creates a NEW bot."
+            )
+            if not io.prompt_yes_no("Replace the unreadable identity.nsec?", False):
+                return
+            wipe_identity = True
+        else:
+            return
+
     if identity_choice is not None:
         default_mode = "create"
         if env_nsec:
@@ -1668,6 +1916,10 @@ def _run_interactive_setup(io) -> None:
         if identity_choice is None:
             io.print_error("Choose create, nsec, or mnemonic.")
             return
+        if identity_choice in ("nsec", "mnemonic"):
+            if not _confirm_import_as_bot(io):
+                io.print_info("Import cancelled.")
+                return
         if identity_choice == "nsec":
             import_secret = env_nsec or io.prompt("nsec (nsec1…; input hidden)", password=True)
             if not (import_secret or "").strip():
@@ -1710,19 +1962,21 @@ def _run_interactive_setup(io) -> None:
         "Enable pairing codes for unknown npubs?", True
     )
 
-    if wipe_identity:
-        nsec_path = Path(data_dir) / "identity.nsec"
-        try:
-            nsec_path.unlink(missing_ok=True)
-        except OSError as e:
-            io.print_error(f"Could not replace {nsec_path}: {e}")
-            return
-
     extra_args: List[str] = []
     temp_secret: Optional[Path] = None
+    bak: Optional[Path] = None
+    setup_data: Optional[Dict[str, Any]] = None
+    setup_code = 1
+    setup_err = ""
     try:
+        if wipe_identity:
+            try:
+                bak = _backup_identity_nsec(data_dir)
+            except OSError as e:
+                io.print_error(f"Could not replace identity.nsec: {e}")
+                return
         if import_kind and import_secret:
-            temp_secret = _write_temp_secret(import_secret)
+            temp_secret = _write_temp_secret(import_secret, data_dir)
             flag = "--nsec-file" if import_kind == "nsec" else "--mnemonic-file"
             extra_args = [flag, str(temp_secret)]
 
@@ -1733,22 +1987,23 @@ def _run_interactive_setup(io) -> None:
             ["--setup", *extra_args],
             timeout=BRIDGE_SETUP_TIMEOUT,
         )
+        bot_npub = ((setup_data or {}).get("npub") or "").strip()
+        if not setup_data or setup_code != 0 or not bot_npub:
+            _restore_identity_nsec(data_dir, bak)
+            bak = None
+            io.print_error(
+                f"vector-bridge --setup failed (exit {setup_code}): "
+                f"{setup_err or 'could not parse output'}"
+            )
+            return
+        _discard_identity_backup(bak)
+        bak = None
     finally:
         if temp_secret is not None:
-            try:
-                temp_secret.unlink(missing_ok=True)
-            except OSError:
-                pass
+            _shred_unlink(temp_secret)
 
-    if not setup_data or setup_code != 0:
-        io.print_error(
-            f"vector-bridge --setup failed (exit {setup_code}): "
-            f"{setup_err or 'could not parse output'}"
-        )
-        return
-
-    bot_npub = (setup_data.get("npub") or "").strip()
-    status = setup_data.get("status") or ""
+    bot_npub = ((setup_data or {}).get("npub") or "").strip()
+    status = (setup_data or {}).get("status") or ""
     if not bot_npub:
         io.print_error("Bridge returned incomplete data (no npub).")
         return
@@ -1772,16 +2027,7 @@ def _run_interactive_setup(io) -> None:
             "VECTOR_MNEMONIC is still in .env. Delete it after you have a backup."
         )
 
-    if _merge_vector_display_config():
-        io.print_info(
-            "Wrote display.platforms.vector.tool_progress: off to config.yaml"
-        )
-    else:
-        io.print_warning(
-            "Could not merge display.platforms.vector into config.yaml. "
-            "Add tool_progress: off under display.platforms.vector yourself "
-            "or Hermes will post a new Vector DM per tool event."
-        )
+    _maybe_merge_display(io)
 
     if status == "created":
         io.print_success(f"Account created! Bot npub: {bot_npub}")

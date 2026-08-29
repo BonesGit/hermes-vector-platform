@@ -1,4 +1,4 @@
-//! HTTP types, auth, errors, and JSON routes for the sidecar stub.
+//! HTTP types, auth, errors, and JSON routes for the sidecar.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use vector_sdk::nostr::{PublicKey, ToBech32};
+use vector_sdk::VectorBot;
 
 use crate::events::{self, EventHub, SseItem};
 
@@ -32,6 +33,7 @@ struct Inner {
     events: EventHub,
     ping_interval: Duration,
     send_seq: AtomicU64,
+    bot: RwLock<Option<VectorBot>>,
 }
 
 struct Health {
@@ -50,7 +52,16 @@ impl AppState {
             events: EventHub::new(),
             ping_interval,
             send_seq: AtomicU64::new(1),
+            bot: RwLock::new(None),
         }))
+    }
+
+    pub async fn set_bot(&self, bot: VectorBot) {
+        *self.0.bot.write().await = Some(bot);
+    }
+
+    pub async fn bot(&self) -> Option<VectorBot> {
+        self.0.bot.read().await.clone()
     }
 
     pub fn token(&self) -> &str {
@@ -229,6 +240,14 @@ impl ApiError {
             error: "not implemented",
         }
     }
+
+    pub fn internal() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal",
+            error: "internal error",
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -297,11 +316,22 @@ async fn send(
     _auth: Auth,
     JsonBody(req): JsonBody<SendRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = parse_npub(&req.to)?;
-    let _ = req.body;
-    let _ = req.reply_to;
+    let npub = parse_npub(&req.to)?;
     state.require_ready().await?;
-    Ok(Json(json!({ "id": state.next_event_id() })))
+    if let Some(bot) = state.bot().await {
+        let channel = bot.dm(&npub);
+        let result = match req.reply_to.as_deref() {
+            Some(id) if !id.is_empty() => channel.reply(id, &req.body).await,
+            _ => channel.send(&req.body).await,
+        };
+        let id = result.map_err(|err| {
+            eprintln!("[vector-bridge] send failed: {err}");
+            ApiError::internal()
+        })?;
+        Ok(Json(json!({ "id": id })))
+    } else {
+        Ok(Json(json!({ "id": state.next_event_id() })))
+    }
 }
 
 #[derive(Deserialize)]
@@ -314,8 +344,14 @@ async fn typing(
     _auth: Auth,
     JsonBody(req): JsonBody<TypingRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = parse_npub(&req.to)?;
+    let npub = parse_npub(&req.to)?;
     state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        bot.dm(&npub).typing().await.map_err(|err| {
+            eprintln!("[vector-bridge] typing failed: {err}");
+            ApiError::internal()
+        })?;
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -330,8 +366,13 @@ async fn profile(
     _auth: Auth,
     JsonBody(req): JsonBody<ProfileRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = (req.name, req.about);
     state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        if !bot.update_profile(&req.name, "", "", &req.about).await {
+            eprintln!("[vector-bridge] update_profile failed");
+            return Err(ApiError::internal());
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 

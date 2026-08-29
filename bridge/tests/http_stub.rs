@@ -66,6 +66,8 @@ fn spawn_server_stdin(extra: &[(&str, &str)], stdin: Stdio) -> Server {
     cmd.env("VECTOR_SIDECAR_TOKEN", TOKEN)
         .env("VECTOR_BRIDGE_HOST", "127.0.0.1")
         .env("VECTOR_BRIDGE_PORT", port.to_string())
+        .env("VECTOR_STUB", "1")
+        .env_remove("VECTOR_DATA_DIR")
         .env_remove("VECTOR_SIDECAR_WATCH_STDIN")
         .env_remove("VECTOR_STUB_READY_AFTER_MS")
         .env_remove("VECTOR_SSE_PING_MS")
@@ -447,6 +449,62 @@ fn stdin_eof_shuts_down() {
         }
         thread::sleep(Duration::from_millis(30));
     }
+}
+
+#[test]
+fn serve_without_stub_requires_data_dir() {
+    let port = free_port();
+    let mut cmd = bin();
+    cmd.env("VECTOR_SIDECAR_TOKEN", TOKEN)
+        .env("VECTOR_BRIDGE_HOST", "127.0.0.1")
+        .env("VECTOR_BRIDGE_PORT", port.to_string())
+        .env_remove("VECTOR_STUB")
+        .env_remove("VECTOR_DATA_DIR")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("VECTOR_DATA_DIR"), "stderr={stderr}");
+    assert!(
+        ureq::get(&format!("http://127.0.0.1:{port}/live"))
+            .timeout(Duration::from_millis(200))
+            .call()
+            .is_err(),
+        "must not bind without VECTOR_DATA_DIR"
+    );
+}
+
+#[test]
+fn serve_missing_identity_does_not_mint() {
+    let dir = TempDir::new().unwrap();
+    let port = free_port();
+    let mut cmd = bin();
+    cmd.env("VECTOR_SIDECAR_TOKEN", TOKEN)
+        .env("VECTOR_BRIDGE_HOST", "127.0.0.1")
+        .env("VECTOR_BRIDGE_PORT", port.to_string())
+        .env("VECTOR_DATA_DIR", dir.path())
+        .env_remove("VECTOR_STUB")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("identity.nsec") || stderr.contains("will not mint"),
+        "stderr={stderr}"
+    );
+    assert!(!dir.path().join("identity.nsec").exists());
 }
 
 #[test]

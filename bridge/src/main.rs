@@ -1,7 +1,8 @@
-//! Hermes Vector sidecar: identity CLI plus the localhost HTTP stub.
+//! Hermes Vector sidecar: identity CLI plus localhost HTTP wrapping VectorBot.
 //!
 //! `--check` / `--setup` read and write `<VECTOR_DATA_DIR>/identity.nsec` offline.
-//! With no flags, bind HTTP first (no VectorBot listen in this stub).
+//! Runtime binds HTTP first, then `VectorBot::build` + `on_event` in the background.
+//! `VECTOR_STUB=1` keeps the HTTP stub (no live relays) for tests.
 
 mod api;
 mod events;
@@ -15,8 +16,9 @@ use std::time::Duration;
 
 use nostr::nips::nip06::FromMnemonic;
 use serde_json::json;
+use tokio::sync::watch;
 use vector_sdk::nostr::{FromBech32, Keys, SecretKey, ToBech32};
-use vector_sdk::VectorBot;
+use vector_sdk::{InvitePolicy, VectorBot};
 
 use crate::api::{router, stub_npub, AppState};
 
@@ -141,8 +143,11 @@ fn print_usage() {
     eprintln!(
         "Usage: vector-bridge [--check | --setup [--nsec-file PATH | --mnemonic-file PATH]]\n\
          \n\
-         No flags: bind VECTOR_BRIDGE_HOST:VECTOR_BRIDGE_PORT (default 127.0.0.1:8096).\n\
+         No flags: bind VECTOR_BRIDGE_HOST:VECTOR_BRIDGE_PORT (default 127.0.0.1:8096),\n\
+         then VectorBot::build from VECTOR_DATA_DIR/identity.nsec.\n\
          VECTOR_SIDECAR_TOKEN is required for the HTTP server; empty token exits 1.\n\
+         VECTOR_DATA_DIR is required at runtime (identity.nsec must already exist).\n\
+         VECTOR_STUB=1 skips VectorBot for HTTP tests (no live relays).\n\
          Identity CLI: <VECTOR_DATA_DIR>/identity.nsec (VECTOR_DATA_DIR required).\n\
          --check never creates an identity. --setup writes the file if missing."
     );
@@ -293,11 +298,110 @@ fn print_json(value: serde_json::Value) {
     println!("{value}");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    Running,
+    Graceful,
+    ListenEnded,
+    LoginFailed,
+}
+
+fn stub_mode() -> bool {
+    std::env::var("VECTOR_STUB")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Runtime identity: require an existing nsec so `build()` cannot mint (D2).
+fn require_runtime_data_dir() -> Result<PathBuf, CliError> {
+    let data_dir = require_data_dir()?;
+    let path = identity_path(&data_dir);
+    match read_nsec(&path)? {
+        None => Err(CliError::Other(format!(
+            "missing {}; run --setup first (runtime will not mint)",
+            path.display()
+        ))),
+        Some(nsec) => {
+            let _ = npub_from_nsec(&nsec)?;
+            Ok(data_dir)
+        }
+    }
+}
+
+fn request_stop(tx: &watch::Sender<Stop>, why: Stop) {
+    let _ = tx.send_if_modified(|cur| {
+        if *cur == Stop::Running {
+            *cur = why;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+async fn wait_stop(mut rx: watch::Receiver<Stop>) -> Stop {
+    loop {
+        let current = *rx.borrow_and_update();
+        if current != Stop::Running {
+            return current;
+        }
+        if rx.changed().await.is_err() {
+            return Stop::Graceful;
+        }
+    }
+}
+
+fn spawn_vector_bot(state: AppState, data_dir: PathBuf, stop_tx: watch::Sender<Stop>) {
+    tokio::spawn(async move {
+        match VectorBot::builder()
+            .data_dir(&data_dir)
+            .invite_policy(InvitePolicy::Manual)
+            .build()
+            .await
+        {
+            Ok(bot) => {
+                state.set_bot(bot.clone()).await;
+                let bot_name = env_or("VECTOR_BOT_NAME", "Hermes");
+                let listen_state = state.clone();
+                let handler_state = listen_state.clone();
+                tokio::spawn(async move {
+                    let result = bot
+                        .on_event(move |b, event| {
+                            let state = handler_state.clone();
+                            let bot_name = bot_name.clone();
+                            async move {
+                                events::handle_bot_event(&state, &b, event, &bot_name).await;
+                            }
+                        })
+                        .await;
+                    match result {
+                        Ok(()) => eprintln!("[vector-bridge] listen ended"),
+                        Err(err) => eprintln!("[vector-bridge] listen ended: {err}"),
+                    }
+                    listen_state.events().disconnect_all();
+                    request_stop(&stop_tx, Stop::ListenEnded);
+                });
+            }
+            Err(err) => {
+                eprintln!("[vector-bridge] login failed: {err}");
+                request_stop(&stop_tx, Stop::LoginFailed);
+            }
+        }
+    });
+}
+
 async fn serve() -> Result<ExitCode, CliError> {
     let token = std::env::var("VECTOR_SIDECAR_TOKEN").unwrap_or_default();
     if token.trim().is_empty() {
         return Err(CliError::EmptyToken);
     }
+
+    let stub = stub_mode();
+    let data_dir = if stub {
+        None
+    } else {
+        Some(require_runtime_data_dir()?)
+    };
 
     let host = env_or("VECTOR_BRIDGE_HOST", DEFAULT_HOST);
     if !is_loopback(&host) {
@@ -322,38 +426,55 @@ async fn serve() -> Result<ExitCode, CliError> {
         .map_err(|e| CliError::Other(e.to_string()))?;
     eprintln!("[vector-bridge] listening on {bound}");
 
-    if let Some(delay) = parse_ms_env("VECTOR_STUB_READY_AFTER_MS") {
-        let ready_state = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            ready_state.mark_ready(stub_npub()).await;
-        });
+    let (stop_tx, stop_rx) = watch::channel(Stop::Running);
+
+    match data_dir {
+        Some(data_dir) => spawn_vector_bot(state.clone(), data_dir, stop_tx.clone()),
+        None => {
+            if let Some(delay) = parse_ms_env("VECTOR_STUB_READY_AFTER_MS") {
+                let ready_state = state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    ready_state.mark_ready(stub_npub()).await;
+                });
+            }
+        }
     }
 
     let watch_stdin = std::env::var("VECTOR_SIDECAR_WATCH_STDIN")
         .map(|v| v == "1")
         .unwrap_or(false);
 
-    let shutting_down = std::sync::Arc::new(tokio::sync::Notify::new());
-    let notify = shutting_down.clone();
-    let shutdown_state = state.clone();
-    let shutdown = async move {
+    let signal_tx = stop_tx.clone();
+    tokio::spawn(async move {
         wait_shutdown(watch_stdin).await;
+        request_stop(&signal_tx, Stop::Graceful);
+    });
+
+    let shutdown_state = state.clone();
+    let shutdown_rx = stop_rx.clone();
+    let shutdown = async move {
+        let _ = wait_stop(shutdown_rx).await;
         shutdown_state.events().disconnect_all();
-        notify.notify_waiters();
     };
 
+    let force_rx = stop_rx.clone();
     let server = axum::serve(listener, router(state)).with_graceful_shutdown(shutdown);
     tokio::select! {
         result = server => {
             result.map_err(|e| CliError::Other(e.to_string()))?;
         }
         _ = async {
-            shutting_down.notified().await;
+            let _ = wait_stop(force_rx).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
         } => {}
     }
-    Ok(ExitCode::SUCCESS)
+
+    let why = *stop_rx.borrow();
+    match why {
+        Stop::LoginFailed | Stop::ListenEnded => Ok(ExitCode::from(1)),
+        _ => Ok(ExitCode::SUCCESS),
+    }
 }
 
 async fn wait_shutdown(watch_stdin: bool) {

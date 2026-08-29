@@ -3,7 +3,7 @@ name = "vector-bridge"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Hermes Vector platform sidecar (HTTP stub + identity CLI)"
+description = "Hermes Vector platform sidecar (HTTP + VectorBot)"
 license = "MIT"
 publish = false
 

@@ -1,4 +1,4 @@
-//! Single-client last-writer-wins SSE (`GET /events`) plus test inject.
+//! Single-client last-writer-wins SSE (`GET /events`) from `BotEvent`.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
+use vector_sdk::{BotEvent, IncomingMessage, VectorBot};
 
 use crate::api::{ready_item, ApiError, AppState, Auth, JsonBody};
 
@@ -105,7 +106,7 @@ fn ping_interval(period: Duration) -> Interval {
     ping
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessageEventData {
     pub id: String,
     pub chat_id: String,
@@ -126,6 +127,76 @@ pub struct MessageEventData {
     pub at_ms: i64,
 }
 
+impl MessageEventData {
+    fn sse_item(&self) -> SseItem {
+        SseItem {
+            id: Some(self.id.clone()),
+            payload: json!({ "type": "message", "data": self }).to_string(),
+        }
+    }
+}
+
+/// Map an inbound Vector message to SSE payload. Drops `is_mine`, `is_group`,
+/// and empty-body events (including empty file messages).
+pub(crate) fn map_incoming(incoming: &IncomingMessage) -> Option<MessageEventData> {
+    if incoming.is_mine() {
+        eprintln!("[vector-bridge] skip is_mine id={}", incoming.message.id);
+        return None;
+    }
+    if incoming.is_group {
+        eprintln!("[vector-bridge] skip is_group id={}", incoming.message.id);
+        return None;
+    }
+    if incoming.text().is_empty() {
+        eprintln!(
+            "[vector-bridge] skip empty id={} is_file={}",
+            incoming.message.id, incoming.is_file
+        );
+        return None;
+    }
+    Some(MessageEventData {
+        id: incoming.message.id.clone(),
+        chat_id: incoming.chat_id.clone(),
+        npub: incoming
+            .message
+            .npub
+            .clone()
+            .unwrap_or_else(|| incoming.chat_id.clone()),
+        is_group: incoming.is_group,
+        is_mine: incoming.is_mine(),
+        is_file: incoming.is_file,
+        text: incoming.text().to_string(),
+        reply_to: incoming.message.replied_to.clone(),
+        reply_to_text: incoming.message.replied_to_content.clone(),
+        at_ms: incoming.message.at as i64,
+    })
+}
+
+pub(crate) async fn handle_bot_event(
+    state: &AppState,
+    bot: &VectorBot,
+    event: BotEvent,
+    bot_name: &str,
+) {
+    match event {
+        BotEvent::Ready { .. } => {
+            state.mark_ready(bot.npub()).await;
+            if !bot.update_profile(bot_name, "", "", "").await {
+                eprintln!("[vector-bridge] sidecar-boot update_profile failed");
+            }
+        }
+        BotEvent::Message(msg) => {
+            if let Some(data) = map_incoming(&msg) {
+                state.events().publish(data.sse_item());
+            }
+        }
+        BotEvent::Invite { community_id } => {
+            eprintln!("[vector-bridge] invite parked community_id={community_id}");
+        }
+        _ => {}
+    }
+}
+
 pub async fn inject(
     State(state): State<AppState>,
     _auth: Auth,
@@ -135,11 +206,104 @@ pub async fn inject(
         eprintln!("[vector-bridge] dropping inject id={}", data.id);
         return Ok(Json(json!({ "ok": true })));
     }
-    let id = data.id.clone();
-    let payload = json!({ "type": "message", "data": data }).to_string();
-    state.events().publish(SseItem {
-        id: Some(id),
-        payload,
-    });
+    state.events().publish(data.sse_item());
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vector_sdk::Message;
+
+    fn incoming(
+        id: &str,
+        chat_id: &str,
+        npub: Option<&str>,
+        text: &str,
+        mine: bool,
+        group: bool,
+        file: bool,
+    ) -> IncomingMessage {
+        IncomingMessage {
+            chat_id: chat_id.to_string(),
+            is_group: group,
+            is_file: file,
+            message: Message {
+                id: id.to_string(),
+                content: text.to_string(),
+                mine,
+                npub: npub.map(str::to_string),
+                replied_to: "parent-id".to_string(),
+                replied_to_content: Some("quoted".to_string()),
+                at: 1_785_979_414_499,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn maps_dm_fields_from_incoming_message() {
+        let msg = incoming(
+            "deadbeef",
+            "npub1peer",
+            Some("npub1from"),
+            "hello",
+            false,
+            false,
+            false,
+        );
+        let data = map_incoming(&msg).expect("mapped");
+        assert_eq!(
+            data,
+            MessageEventData {
+                id: "deadbeef".into(),
+                chat_id: "npub1peer".into(),
+                npub: "npub1from".into(),
+                is_group: false,
+                is_mine: false,
+                is_file: false,
+                text: "hello".into(),
+                reply_to: "parent-id".into(),
+                reply_to_text: Some("quoted".into()),
+                at_ms: 1_785_979_414_499,
+            }
+        );
+        let payload: Value = serde_json::from_str(&data.sse_item().payload).unwrap();
+        assert_eq!(payload["type"], "message");
+        assert_eq!(payload["data"]["id"], "deadbeef");
+        assert_eq!(payload["data"]["chat_id"], "npub1peer");
+        assert_eq!(payload["data"]["npub"], "npub1from");
+        assert_eq!(payload["data"]["text"], "hello");
+        assert_eq!(payload["data"]["reply_to"], "parent-id");
+        assert_eq!(payload["data"]["reply_to_text"], "quoted");
+        assert_eq!(payload["data"]["at_ms"], 1_785_979_414_499u64);
+    }
+
+    #[test]
+    fn npub_falls_back_to_chat_id() {
+        let msg = incoming("id1", "npub1peer", None, "hi", false, false, false);
+        let data = map_incoming(&msg).expect("mapped");
+        assert_eq!(data.npub, "npub1peer");
+        assert_eq!(data.chat_id, "npub1peer");
+    }
+
+    #[test]
+    fn skips_mine() {
+        let msg = incoming("id1", "npub1peer", None, "hi", true, false, false);
+        assert!(map_incoming(&msg).is_none());
+    }
+
+    #[test]
+    fn skips_group() {
+        let msg = incoming("id1", "channel-id", None, "hi", false, true, false);
+        assert!(map_incoming(&msg).is_none());
+    }
+
+    #[test]
+    fn skips_empty_text_and_empty_file() {
+        let empty = incoming("id1", "npub1peer", None, "", false, false, false);
+        assert!(map_incoming(&empty).is_none());
+        let file = incoming("id2", "npub1peer", None, "", false, false, true);
+        assert!(map_incoming(&file).is_none());
+    }
 }

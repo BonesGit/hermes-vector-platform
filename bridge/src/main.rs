@@ -312,7 +312,7 @@ fn stub_mode() -> bool {
         .unwrap_or(false)
 }
 
-/// Runtime identity: require an existing nsec so `build()` cannot mint (D2).
+/// Runtime identity: require an existing nsec so `build()` cannot mint.
 fn require_runtime_data_dir() -> Result<PathBuf, CliError> {
     let data_dir = require_data_dir()?;
     let path = identity_path(&data_dir);

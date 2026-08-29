@@ -10,6 +10,7 @@ Required env vars / config.extra keys:
     VECTOR_NPUB           Bot public key (npub1…)
     VECTOR_ALLOWED_USERS  Comma-separated allowlisted npubs
     VECTOR_HOME_CHANNEL   Operator npub for cron delivery
+    VECTOR_PAIRING        on (default) = pairing codes; off = drop unauthorized
     VECTOR_BRIDGE_PORT    HTTP port (default 8096)
     VECTOR_BRIDGE_HOST    Bind address (default 127.0.0.1)
 """
@@ -23,6 +24,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,6 +32,7 @@ import tempfile
 import time
 from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -50,7 +53,8 @@ logger = logging.getLogger("hermes_plugins.vector_platform.adapter")
 # ---------------------------------------------------------------------------
 PLUGIN_VERSION = "0.1.0"
 _PLUGIN_ROOT = Path(__file__).resolve().parent
-_DEFAULT_BRIDGE_BIN = _PLUGIN_ROOT / "bridge" / "target" / "release" / "vector-bridge"
+_BRIDGE_DIR = _PLUGIN_ROOT / "bridge"
+_DEFAULT_BRIDGE_BIN = _BRIDGE_DIR / "target" / "release" / "vector-bridge"
 
 DEFAULT_BRIDGE_PORT = 8096
 DEFAULT_BRIDGE_HOST = "127.0.0.1"
@@ -60,6 +64,10 @@ DEFAULT_BRIDGE_HOST = "127.0.0.1"
 DEFAULT_STARTUP_TIMEOUT = 25
 MAX_MESSAGE_LENGTH = 4000
 DEFAULT_BOT_NAME = "Hermes"
+MIN_RUSTC = (1, 75)
+CARGO_BUILD_TIMEOUT = 900
+BRIDGE_CHECK_TIMEOUT = 30
+BRIDGE_SETUP_TIMEOUT = 90
 
 SIDECAR_TOKEN_HEADER = "X-Hermes-Sidecar-Token"
 HEALTH_POLL_INTERVAL = 0.5
@@ -70,8 +78,6 @@ SSE_STALE_TIMEOUT = 60.0
 BRIDGE_TERM_WAIT = 2.0
 INBOUND_DEDUP_MAX = 1024
 RUNTIME_RECORD_NAME = "vector-sidecar.json"
-
-_NOT_WIRED = "Vector sidecar is not wired yet"
 
 
 def resolve_bridge_bin() -> Path:
@@ -335,6 +341,56 @@ def _truncate_npub(npub: str) -> str:
     if len(npub) > 16:
         return f"{npub[:16]}..."
     return npub
+
+
+def _env_flag(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip().lower()
+
+
+def _pairing_enabled() -> bool:
+    """VECTOR_PAIRING default on. off/0/false/no drop unauthorized senders."""
+    return _env_flag("VECTOR_PAIRING", "on") not in (
+        "off",
+        "0",
+        "false",
+        "no",
+        "disabled",
+    )
+
+
+def _allow_all_users() -> bool:
+    return _env_flag("VECTOR_ALLOW_ALL_USERS") in ("1", "true", "yes", "on")
+
+
+def _allowed_npubs() -> set:
+    """Canonical npubs from VECTOR_ALLOWED_USERS (comma-separated)."""
+    found: set = set()
+    raw = os.getenv("VECTOR_ALLOWED_USERS") or ""
+    for part in raw.split(","):
+        npub = normalize_npub(part.strip())
+        if npub:
+            found.add(npub)
+    return found
+
+
+def _sender_is_authorized(peer: str) -> bool:
+    """Adapter-layer allowlist (VECTOR_ALLOW_ALL_USERS / VECTOR_ALLOWED_USERS)."""
+    if _allow_all_users():
+        return True
+    npub = normalize_npub(peer) or (peer or "").strip()
+    if not npub:
+        return False
+    return npub in _allowed_npubs()
+
+
+def _merge_allowed_users(operator_npub: str, existing: str) -> str:
+    """Operator npub first, then other already-allowlisted npubs."""
+    seen = [operator_npub]
+    for part in (existing or "").split(","):
+        npub = normalize_npub(part.strip())
+        if npub and npub not in seen:
+            seen.append(npub)
+    return ",".join(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +909,14 @@ class VectorAdapter(BasePlatformAdapter):
         if bot_npub and peer == bot_npub:
             return
 
+        # VECTOR_PAIRING=off: drop before handle_message so pairing codes are not sent.
+        if not _pairing_enabled() and not _sender_is_authorized(peer):
+            logger.info(
+                "Vector: dropping unauthorized sender %s (VECTOR_PAIRING=off)",
+                _truncate_npub(peer),
+            )
+            return
+
         name = _truncate_npub(peer)
         source = self.build_source(
             chat_id=peer,
@@ -1136,6 +1200,328 @@ def _env_enablement():
     return seed
 
 
+def _coerce_port(value: Any, default: int = DEFAULT_BRIDGE_PORT) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _sidecar_pid_alive(pid: Any) -> bool:
+    """Best-effort liveness for the runtime-record sidecar pid."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 1:
+        return False
+    if os.name != "posix":
+        return True
+    return _pid_alive(pid_int)
+
+
+def _parse_rustc_version(text: str) -> Optional[tuple]:
+    """Parse ``rustc 1.75.0 (...)`` → ``(1, 75)``."""
+    match = re.search(r"rustc\s+(\d+)\.(\d+)", text or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _probe_rustc() -> Optional[tuple]:
+    try:
+        result = subprocess.run(
+            ["rustc", "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return _parse_rustc_version(result.stdout or result.stderr or "")
+
+
+def _parse_bridge_json(stdout: str) -> Optional[Dict[str, Any]]:
+    """First JSON object on stdout that carries a ``status`` field."""
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and "status" in line):
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and "status" in data:
+            return data
+    return None
+
+
+def _bridge_cli_env(data_dir: Path) -> Dict[str, str]:
+    """Env for --check/--setup: data dir set, secrets never inherited."""
+    env = {**os.environ, "VECTOR_DATA_DIR": str(data_dir)}
+    env.pop("VECTOR_NSEC", None)
+    env.pop("VECTOR_MNEMONIC", None)
+    env.pop("VECTOR_STUB", None)
+    env.pop("VECTOR_SIDECAR_TOKEN", None)
+    return env
+
+
+def _run_bridge_cli(
+    bin_path: Path,
+    data_dir: Path,
+    args: List[str],
+    *,
+    timeout: float = 60.0,
+) -> tuple:
+    """Run vector-bridge identity CLI. Returns ``(parsed_json, returncode, stderr)``."""
+    try:
+        result = subprocess.run(
+            [str(bin_path), *args],
+            env=_bridge_cli_env(data_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, 124, f"timed out after {timeout:.0f}s"
+    except OSError as e:
+        return None, 127, str(e)
+    data = _parse_bridge_json(result.stdout or "")
+    err = (result.stderr or "").strip()
+    return data, result.returncode, err
+
+
+def _write_temp_secret(contents: str) -> Path:
+    """Write a one-shot 0600 file for --nsec-file / --mnemonic-file."""
+    fd, name = tempfile.mkstemp(prefix=".vector-import.", suffix=".tmp")
+    try:
+        try:
+            os.chmod(name, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write((contents or "").strip() + "\n")
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+    return Path(name)
+
+
+def _normalize_identity_choice(raw: str) -> Optional[str]:
+    value = (raw or "").strip().lower()
+    if value in ("c", "create", "new"):
+        return "create"
+    if value in ("n", "nsec", "import", "import nsec"):
+        return "nsec"
+    if value in ("m", "mnemonic", "seed", "import mnemonic"):
+        return "mnemonic"
+    return None
+
+
+def _config_yaml_path() -> Path:
+    try:
+        home = get_hermes_home()
+    except Exception:
+        home = Path.home() / ".hermes"
+    return Path(home) / "config.yaml"
+
+
+def _merge_vector_display_config(config_path: Optional[Path] = None) -> bool:
+    """D12: merge display.platforms.vector without clobbering other keys."""
+    path = Path(config_path) if config_path else _config_yaml_path()
+    try:
+        import yaml
+    except ImportError:
+        logger.warning("Vector: PyYAML not available; skipping display YAML merge")
+        return False
+
+    data: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("Vector: failed to read %s: %s", path, e)
+            return False
+        if raw.strip():
+            try:
+                loaded = yaml.safe_load(raw)
+            except Exception as e:
+                logger.warning(
+                    "Vector: %s is unparseable (%s); refusing to overwrite", path, e
+                )
+                return False
+            if loaded is None:
+                data = {}
+            elif not isinstance(loaded, dict):
+                logger.warning(
+                    "Vector: %s root is not a mapping; skipping display merge", path
+                )
+                return False
+            else:
+                data = loaded
+
+    display = data.get("display")
+    if not isinstance(display, dict):
+        display = {}
+        data["display"] = display
+    platforms = display.get("platforms")
+    if not isinstance(platforms, dict):
+        platforms = {}
+        display["platforms"] = platforms
+    vector = platforms.get("vector")
+    if not isinstance(vector, dict):
+        vector = {}
+        platforms["vector"] = vector
+    vector["tool_progress"] = "off"
+    vector["interim_assistant_messages"] = False
+
+    try:
+        text = yaml.safe_dump(
+            data, default_flow_style=False, sort_keys=False, allow_unicode=True
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".vector-config.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        logger.warning("Vector: failed to write display YAML to %s: %s", path, e)
+        return False
+    return True
+
+
+def _ensure_bridge_binary(io) -> Optional[Path]:
+    """Return vector-bridge path, cargo-building in bridge/ if the default is missing."""
+    bin_path = resolve_bridge_bin()
+    if bin_path.is_file():
+        io.print_info(f"Using vector-bridge at {bin_path}")
+        return bin_path
+
+    override = (os.getenv("VECTOR_BRIDGE_BIN") or "").strip()
+    if override and Path(override) != _DEFAULT_BRIDGE_BIN:
+        io.print_error(f"VECTOR_BRIDGE_BIN={override} does not exist.")
+        io.print_info(
+            "Unset VECTOR_BRIDGE_BIN to let setup build "
+            "bridge/target/release/vector-bridge, or point it at a built binary."
+        )
+        return None
+
+    cargo = shutil.which("cargo")
+    if not cargo:
+        io.print_error("cargo not found. Install Rust 1.75+ from https://rustup.rs")
+        io.print_info("  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
+        io.print_info("Then re-run: hermes gateway setup")
+        return None
+
+    rustc = _probe_rustc()
+    if rustc is None:
+        io.print_error("rustc not found. Install Rust 1.75+ from https://rustup.rs")
+        return None
+    if rustc < MIN_RUSTC:
+        io.print_error(
+            f"rustc {rustc[0]}.{rustc[1]} is too old; vector-bridge needs >= 1.75"
+        )
+        return None
+
+    cargo_toml = _BRIDGE_DIR / "Cargo.toml"
+    if not cargo_toml.is_file():
+        io.print_error(f"Bridge crate not found at {cargo_toml}")
+        io.print_info("Reinstall the vector-platform plugin so bridge/ is present.")
+        return None
+
+    io.print_info(
+        "Building vector-bridge (cargo build --release; may take several minutes)..."
+    )
+    try:
+        result = subprocess.run(
+            [cargo, "build", "--release"],
+            cwd=str(_BRIDGE_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=CARGO_BUILD_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        io.print_error(
+            f"cargo build timed out after {CARGO_BUILD_TIMEOUT}s. Retry or build "
+            "manually: cd bridge && cargo build --release"
+        )
+        return None
+    except OSError as e:
+        io.print_error(f"cargo build failed to start: {e}")
+        return None
+
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        io.print_error(f"cargo build --release failed:\n{err[-4000:]}")
+        return None
+
+    built = _DEFAULT_BRIDGE_BIN
+    if not built.is_file():
+        io.print_error(f"cargo build succeeded but {built} is missing")
+        return None
+    io.print_success(f"Built vector-bridge at {built}")
+    return built
+
+
+def _load_setup_io():
+    """CLI printers/prompts. Lazy so the plugin stays importable in tests."""
+    try:
+        from hermes_cli.setup import (
+            prompt,
+            prompt_yes_no,
+            save_env_value,
+            get_env_value,
+            print_header,
+            print_info,
+            print_warning,
+            print_success,
+            print_error,
+        )
+    except ImportError:
+        from hermes_cli.config import get_env_value, save_env_value
+        from hermes_cli.cli_output import (
+            prompt,
+            prompt_yes_no,
+            print_header,
+            print_info,
+            print_warning,
+            print_success,
+            print_error,
+        )
+    return SimpleNamespace(
+        prompt=prompt,
+        prompt_yes_no=prompt_yes_no,
+        save_env_value=save_env_value,
+        get_env_value=get_env_value,
+        print_header=print_header,
+        print_info=print_info,
+        print_warning=print_warning,
+        print_success=print_success,
+        print_error=print_error,
+    )
+
+
 async def _standalone_send(
     pconfig,
     chat_id,
@@ -1146,15 +1532,274 @@ async def _standalone_send(
     force_document=False,
     caption=None,
 ):
-    """Out-of-process Vector delivery. Runtime-record sender is PR 5."""
-    return {"error": _NOT_WIRED}
+    """Out-of-process Vector delivery via the live sidecar HTTP API.
+
+    Cron ``deliver=vector`` works when the gateway is up: this reads
+    ``~/.hermes/runtime/vector-sidecar.json`` (0600) for port + token and
+    POSTs ``/send`` with ``X-Hermes-Sidecar-Token``.
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+    port = _coerce_port(
+        extra.get("bridge_port") or os.getenv("VECTOR_BRIDGE_PORT"),
+        DEFAULT_BRIDGE_PORT,
+    )
+    host = _client_host(
+        str(extra.get("bridge_host") or os.getenv("VECTOR_BRIDGE_HOST") or DEFAULT_BRIDGE_HOST)
+    )
+
+    token = None
+    stale_hint = ""
+    record = _read_runtime_record()
+    if record and record.get("token"):
+        if _sidecar_pid_alive(record.get("pid")):
+            token = str(record["token"])
+            port = _coerce_port(record.get("port"), port)
+        else:
+            stale_hint = (
+                " A stale sidecar runtime record was found (pid "
+                f"{record.get('pid')} is not running) — the gateway "
+                "appears to be down."
+            )
+
+    if not token:
+        return {
+            "error": (
+                "Vector standalone send requires a running sidecar. "
+                "Start the Hermes gateway (which spawns vector-bridge and "
+                "records its address under <hermes-home>/runtime/"
+                f"{RUNTIME_RECORD_NAME})." + stale_hint
+            )
+        }
+
+    url = f"http://{host}:{port}/send"
+    headers = {SIDECAR_TOKEN_HEADER: token}
+    try:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+            text = message or ""
+            if not str(text).strip() and not (media_files or []):
+                return {"error": "Vector send requires a message body"}
+            if str(text).strip():
+                resp = await client.post(
+                    url,
+                    json={"to": chat_id, "body": text},
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    err = (resp.text or "")[:200]
+                    return {
+                        "error": f"Vector /send returned {resp.status_code}: {err}"
+                    }
+            if media_files:
+                logger.debug("Vector standalone send: media is not implemented in v1")
+            return {"success": True, "platform": "vector", "chat_id": chat_id}
+    except Exception as e:
+        return {"error": f"Vector send failed: {e}"}
+
+
+def _run_interactive_setup(io) -> None:
+    """Wizard body (testable with a mocked io + subprocess)."""
+    io.print_header("Vector")
+    existing_npub = (io.get_env_value("VECTOR_NPUB") or "").strip()
+    if existing_npub:
+        io.print_info(
+            f"Vector: already configured (npub: {_truncate_npub(existing_npub)})"
+        )
+        if not io.prompt_yes_no("Reconfigure Vector?", False):
+            return
+
+    bin_path = _ensure_bridge_binary(io)
+    if not bin_path:
+        return
+
+    data_dir = Path(io.get_env_value("VECTOR_DATA_DIR") or resolve_data_dir())
+    io.print_info(f"Data dir: {data_dir}")
+
+    check_data, check_code, check_err = _run_bridge_cli(
+        bin_path, data_dir, ["--check"], timeout=BRIDGE_CHECK_TIMEOUT
+    )
+    if check_code not in (0, None) and check_data is None:
+        io.print_error(
+            f"vector-bridge --check failed (exit {check_code}): {check_err or 'no output'}"
+        )
+        return
+
+    existing_identity_npub = None
+    if check_data and check_data.get("status") == "existing":
+        existing_identity_npub = (check_data.get("npub") or "").strip() or None
+
+    identity_choice = "create"
+    import_secret = None
+    import_kind = None  # "nsec" | "mnemonic"
+    wipe_identity = False
+    env_nsec = (io.get_env_value("VECTOR_NSEC") or "").strip()
+    env_mnemonic = (io.get_env_value("VECTOR_MNEMONIC") or "").strip()
+
+    if existing_identity_npub:
+        io.print_warning(
+            f"An identity already exists (npub: {existing_identity_npub})."
+        )
+        io.print_warning(
+            "Replacing identity.nsec creates a NEW bot. Contacts will not recognize it."
+        )
+        if io.prompt_yes_no("Reconfigure identity anyway?", False):
+            wipe_identity = True
+        else:
+            identity_choice = None
+    if identity_choice is not None:
+        default_mode = "create"
+        if env_nsec:
+            default_mode = "nsec"
+            io.print_info(
+                "VECTOR_NSEC is set in .env; choosing 'nsec' will copy it into "
+                "identity.nsec (then delete the env var)."
+            )
+        elif env_mnemonic:
+            default_mode = "mnemonic"
+            io.print_info(
+                "VECTOR_MNEMONIC is set in .env; choosing 'mnemonic' will import it."
+            )
+        io.print_info(
+            "Create a new Vector identity, or import an nsec / 12-word mnemonic."
+        )
+        raw_choice = io.prompt(
+            "Identity [create / nsec / mnemonic]", default=default_mode
+        )
+        identity_choice = _normalize_identity_choice(raw_choice or default_mode)
+        if identity_choice is None:
+            io.print_error("Choose create, nsec, or mnemonic.")
+            return
+        if identity_choice == "nsec":
+            import_secret = env_nsec or io.prompt("nsec (nsec1…; input hidden)", password=True)
+            if not (import_secret or "").strip():
+                io.print_error("nsec is required for import.")
+                return
+            import_kind = "nsec"
+        elif identity_choice == "mnemonic":
+            import_secret = env_mnemonic or io.prompt(
+                "12-word mnemonic (input hidden)", password=True
+            )
+            words = (import_secret or "").split()
+            if len(words) != 12:
+                io.print_error("Invalid mnemonic — must be exactly 12 words.")
+                return
+            import_kind = "mnemonic"
+
+    bot_name = io.prompt(
+        "Bot display name",
+        default=io.get_env_value("VECTOR_BOT_NAME") or DEFAULT_BOT_NAME,
+    ) or DEFAULT_BOT_NAME
+
+    io.print_info("Enter YOUR Vector npub (hex / npub1 / nostr:npub1).")
+    io.print_info("This is who the bot will DM and who is allowed to message it.")
+    existing_home = (io.get_env_value("VECTOR_HOME_CHANNEL") or "").strip()
+    operator_raw = io.prompt(
+        "Your Vector npub", default=existing_home or None
+    )
+    operator_npub = normalize_npub(operator_raw or "")
+    if not operator_npub:
+        io.print_error(
+            "A valid Vector npub is required (hex, npub1…, or nostr:npub1)."
+        )
+        operator_raw = io.prompt("Your Vector npub")
+        operator_npub = normalize_npub(operator_raw or "")
+    if not operator_npub:
+        io.print_error("Operator npub is required — aborting Vector setup.")
+        return
+
+    pairing_on = io.prompt_yes_no(
+        "Enable pairing codes for unknown npubs?", True
+    )
+
+    if wipe_identity:
+        nsec_path = Path(data_dir) / "identity.nsec"
+        try:
+            nsec_path.unlink(missing_ok=True)
+        except OSError as e:
+            io.print_error(f"Could not replace {nsec_path}: {e}")
+            return
+
+    extra_args: List[str] = []
+    temp_secret: Optional[Path] = None
+    try:
+        if import_kind and import_secret:
+            temp_secret = _write_temp_secret(import_secret)
+            flag = "--nsec-file" if import_kind == "nsec" else "--mnemonic-file"
+            extra_args = [flag, str(temp_secret)]
+
+        io.print_info("Running vector-bridge --setup...")
+        setup_data, setup_code, setup_err = _run_bridge_cli(
+            bin_path,
+            data_dir,
+            ["--setup", *extra_args],
+            timeout=BRIDGE_SETUP_TIMEOUT,
+        )
+    finally:
+        if temp_secret is not None:
+            try:
+                temp_secret.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if not setup_data or setup_code != 0:
+        io.print_error(
+            f"vector-bridge --setup failed (exit {setup_code}): "
+            f"{setup_err or 'could not parse output'}"
+        )
+        return
+
+    bot_npub = (setup_data.get("npub") or "").strip()
+    status = setup_data.get("status") or ""
+    if not bot_npub:
+        io.print_error("Bridge returned incomplete data (no npub).")
+        return
+
+    existing_allowed = io.get_env_value("VECTOR_ALLOWED_USERS") or ""
+    io.save_env_value("VECTOR_NPUB", bot_npub)
+    io.save_env_value("VECTOR_BOT_NAME", bot_name)
+    io.save_env_value("VECTOR_DATA_DIR", str(data_dir))
+    io.save_env_value("VECTOR_HOME_CHANNEL", operator_npub)
+    io.save_env_value(
+        "VECTOR_ALLOWED_USERS", _merge_allowed_users(operator_npub, existing_allowed)
+    )
+    io.save_env_value("VECTOR_PAIRING", "on" if pairing_on else "off")
+
+    if env_nsec:
+        io.print_warning(
+            "VECTOR_NSEC is still in .env. Delete it — the sidecar never reads it."
+        )
+    if env_mnemonic:
+        io.print_warning(
+            "VECTOR_MNEMONIC is still in .env. Delete it after you have a backup."
+        )
+
+    if _merge_vector_display_config():
+        io.print_info(
+            "Wrote display.platforms.vector.tool_progress: off to config.yaml"
+        )
+    else:
+        io.print_warning(
+            "Could not merge display.platforms.vector into config.yaml. "
+            "Add tool_progress: off under display.platforms.vector yourself "
+            "or Hermes will post a new Vector DM per tool event."
+        )
+
+    if status == "created":
+        io.print_success(f"Account created! Bot npub: {bot_npub}")
+    elif status == "restored":
+        io.print_success(f"Account restored! Bot npub: {bot_npub}")
+    else:
+        io.print_success(f"Existing account found! Bot npub: {bot_npub}")
+    io.print_info("Share this npub with contacts.")
+    io.print_info(
+        f"Back up {data_dir / 'identity.nsec'} offline — replacing it is a new bot."
+    )
+    io.print_success("Vector configured!")
+    io.print_info("Restart the gateway: hermes gateway restart")
 
 
 def interactive_setup() -> None:
-    """Does not mint identity or write env; setup is not wired."""
-    print("Vector setup is not wired.")
-    print("Enable with: hermes plugins enable vector-platform")
-    print("Identity create/import and sidecar build are not available.")
+    """Interactive ``hermes gateway setup`` flow for Vector."""
+    _run_interactive_setup(_load_setup_io())
 
 
 def register(ctx) -> None:

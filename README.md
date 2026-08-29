@@ -14,6 +14,8 @@ The plugin is a **first-class Vector bot identity** (its own nsec/npub), not an 
 ```bash
 git clone <this-repo> ~/.hermes/plugins/vector-platform
 hermes plugins enable vector-platform
+hermes gateway setup    # builds vector-bridge, create/import identity
+hermes gateway restart
 ```
 
 Confirm discovery:
@@ -22,7 +24,24 @@ Confirm discovery:
 hermes plugins list
 ```
 
-`hermes gateway setup` for Vector (identity create/import + sidecar build) lands in a later PR. `connect()` already spawns `vector-bridge` once the binary exists (`VECTOR_BRIDGE_BIN` or `bridge/target/release/vector-bridge`). Build it with `cd bridge && cargo build --release` until setup is wired.
+### Setup
+
+```bash
+hermes gateway setup
+# pick Vector → create or import identity, enter YOUR Vector npub
+hermes gateway restart
+```
+
+Setup will:
+
+1. Resolve `vector-bridge` (`VECTOR_BRIDGE_BIN` or `bridge/target/release/vector-bridge`). If missing, `cd bridge && cargo build --release` (Rust ≥ 1.75). Build happens **only** in setup, never at `hermes gateway start`.
+2. Run `--check` (read-only) against `VECTOR_DATA_DIR` (default `plugin-data/vector-platform/sdk`).
+3. Create a new nsec, or import via a temp `0600` `--nsec-file` / `--mnemonic-file` (never put the secret in the sidecar env).
+4. Require **your** Vector npub (`hex` / `npub1` / `nostr:npub1`) as `VECTOR_HOME_CHANNEL` and the first `VECTOR_ALLOWED_USERS` entry.
+5. Save `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, `VECTOR_ALLOWED_USERS`, `VECTOR_DATA_DIR`. **Do not** save nsec to `.env`.
+6. Merge `display.platforms.vector` into `~/.hermes/config.yaml` (see below).
+
+Share the bot npub with contacts. Back up `sdk/identity.nsec` offline — replacing it **is** a new bot. Restart the gateway.
 
 ### Option B — pip entry point
 
@@ -36,8 +55,8 @@ Entry point group: `hermes_agent.plugins` → `vector-platform = adapter:registe
 ## Prerequisites
 
 - Hermes Agent with the platform plugin registry (current `main`)
-- Rust **≥ 1.75** and a sibling [Vector](https://github.com/VectorPrivacy/Vector) checkout (needed when the sidecar crate ships)
-- A Vector bot identity created or imported by setup (writes `sdk/identity.nsec`, mode `0600`)
+- Rust **≥ 1.75** (`cargo`, `rustc`) and a sibling [Vector](https://github.com/VectorPrivacy/Vector) checkout so `bridge/Cargo.toml`'s `../../Vector/crates/vector-sdk` path resolves
+- A Vector bot identity created or imported by `hermes gateway setup` (writes `sdk/identity.nsec`, mode `0600`)
 
 ## Architecture
 
@@ -101,7 +120,7 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
 
 ## Display / tool progress
 
-Vector can edit messages, but v1 has no `/edit` route. Setup will write:
+Vector can edit messages, but v1 has no `/edit` route. Setup writes:
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -112,11 +131,23 @@ display:
       interim_assistant_messages: false
 ```
 
-Without that override the plugin inherits Hermes' global `tool_progress: all` and would post a new Vector DM per tool event. Markdown **is** rendered — opposite of Session.
+There is no `display.platform_tool_progress` key. Without the YAML override the plugin inherits Hermes' global `tool_progress: all` and would post a new Vector DM per tool event. Markdown **is** rendered — opposite of Session.
 
 ## Default-deny inbox
 
-`VECTOR_ALLOWED_USERS` + Hermes pairing codes. `VECTOR_ALLOW_ALL_USERS` is dev-only. Authz env names are registered on `PlatformEntry` from day one so `hermes pairing approve` can write back into the allowlist as soon as setup exists.
+`VECTOR_ALLOWED_USERS` + Hermes pairing codes (`VECTOR_PAIRING` default **on**). Setup requires the operator npub as the first allowlisted user. `VECTOR_ALLOW_ALL_USERS` is dev-only. `hermes pairing approve` writes back into `VECTOR_ALLOWED_USERS`.
+
+`VECTOR_PAIRING=off` drops unauthorized senders in the adapter **before** `handle_message`, so pairing codes are not sent. Leave pairing **on** unless you want a closed allowlist with no CLI approve path.
+
+## Cron delivery
+
+```text
+deliver=vector
+```
+
+Uses `VECTOR_HOME_CHANNEL` (via `cron_deliver_env_var`) and `standalone_sender_fn`, which POSTs to the live sidecar `/send` with `X-Hermes-Sidecar-Token` from `~/.hermes/runtime/vector-sidecar.json` (mode `0600`, written on connect).
+
+**Requirement:** the Hermes **gateway must be running** so `vector-bridge` is up. Cron in a separate process does not spawn its own sidecar.
 
 ## Development
 

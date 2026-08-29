@@ -948,3 +948,518 @@ class TestOrphanReap:
         monkeypatch.setattr(vector_adapter.os, "kill", lambda pid, sig: killed.append((pid, sig)))
         asyncio.run(adapter._reap_orphan_sidecar())
         assert killed == []
+
+
+# ---------------------------------------------------------------------------
+# Pairing pre-filter, display YAML merge, standalone send, setup wizard
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
+
+
+class TestPairingHelpers:
+    def test_default_on(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_PAIRING", raising=False)
+        assert vector_adapter._pairing_enabled() is True
+
+    def test_on_values(self, monkeypatch):
+        for val in ("on", "ON", "true", "1", "yes"):
+            monkeypatch.setenv("VECTOR_PAIRING", val)
+            assert vector_adapter._pairing_enabled() is True, val
+
+    def test_off_values(self, monkeypatch):
+        for val in ("off", "OFF", "0", "false", "no", "disabled"):
+            monkeypatch.setenv("VECTOR_PAIRING", val)
+            assert vector_adapter._pairing_enabled() is False, val
+
+    def test_operator_hex_normalized_into_allowlist(self):
+        merged = vector_adapter._merge_allowed_users(NPUB, HEX_PUBKEY)
+        assert merged == NPUB
+
+    def test_merge_keeps_other_npubs_after_operator(self):
+        merged = vector_adapter._merge_allowed_users(NPUB, PEER_NPUB)
+        assert merged.split(",")[0] == NPUB
+        assert PEER_NPUB in merged.split(",")
+
+    def test_sender_authorized_via_hex_allowlist(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", HEX_PUBKEY)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        assert vector_adapter._sender_is_authorized(NPUB) is True
+        assert vector_adapter._sender_is_authorized(PEER_NPUB) is False
+
+
+class TestPairingPrefilter:
+    def test_off_drops_unauthorized_before_handle_message(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "stranger", msg_id="unauth-1")
+            )
+        )
+        assert captured == []
+
+    def test_off_allows_allowlisted_sender(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_HEX)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "hello-op", msg_id="auth-1")
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].text == "hello-op"
+
+    def test_on_forwards_unauthorized_for_pairing_code(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_PAIRING", "on")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "please-pair", msg_id="pair-1")
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].source.chat_id == PEER_NPUB
+
+    def test_off_allow_all_users_still_forwards(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        monkeypatch.delenv("VECTOR_ALLOWED_USERS", raising=False)
+        monkeypatch.setenv("VECTOR_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "open", msg_id="open-1")
+            )
+        )
+        assert len(captured) == 1
+
+
+class TestDisplayYamlMerge:
+    def test_preserves_other_config(self, tmp_path):
+        if yaml is None:
+            return
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "model:\n  default: foo\n"
+            "display:\n  tool_progress: all\n  platforms:\n"
+            "    telegram:\n      tool_progress: all\n      streaming: true\n"
+            "other: 1\n",
+            encoding="utf-8",
+        )
+        assert vector_adapter._merge_vector_display_config(path) is True
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["model"]["default"] == "foo"
+        assert data["other"] == 1
+        assert data["display"]["tool_progress"] == "all"
+        assert data["display"]["platforms"]["telegram"]["tool_progress"] == "all"
+        assert data["display"]["platforms"]["telegram"]["streaming"] is True
+        assert data["display"]["platforms"]["vector"]["tool_progress"] == "off"
+        assert data["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
+
+    def test_creates_file_when_missing(self, tmp_path):
+        if yaml is None:
+            return
+        path = tmp_path / "nested" / "config.yaml"
+        assert vector_adapter._merge_vector_display_config(path) is True
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["display"]["platforms"]["vector"]["tool_progress"] == "off"
+        assert data["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
+
+    def test_refuses_unparseable(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        original = "this: [is: not: yaml: {{{"
+        path.write_text(original, encoding="utf-8")
+        assert vector_adapter._merge_vector_display_config(path) is False
+        assert path.read_text(encoding="utf-8") == original
+
+    def test_refuses_non_mapping_root(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        original = "- just a list\n"
+        path.write_text(original, encoding="utf-8")
+        assert vector_adapter._merge_vector_display_config(path) is False
+        assert path.read_text(encoding="utf-8") == original
+
+
+class TestStandaloneSend:
+    def test_reads_runtime_record_and_sends_token(self, monkeypatch, tmp_path):
+        token = "e" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+            rec_path = tmp_path / "runtime" / "vector-sidecar.json"
+            rec_path.parent.mkdir(parents=True, exist_ok=True)
+            rec_path.write_text(
+                json.dumps(
+                    {
+                        "port": port,
+                        "token": token,
+                        "pid": os.getpid(),
+                        "npub": NPUB,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(rec_path, 0o600)
+            pconfig = MagicMock()
+            pconfig.extra = {}
+            result = asyncio.run(
+                vector_adapter._standalone_send(pconfig, PEER_NPUB, "cron-hi")
+            )
+            assert result.get("success") is True
+            assert result.get("platform") == "vector"
+            assert result.get("chat_id") == PEER_NPUB
+            assert sidecar.sends == [{"to": PEER_NPUB, "body": "cron-hi"}]
+            assert sidecar.send_headers[0].get("X-Hermes-Sidecar-Token") == token
+        finally:
+            sidecar.stop()
+
+    def test_missing_record_errors(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        pconfig = MagicMock()
+        pconfig.extra = {}
+        result = asyncio.run(
+            vector_adapter._standalone_send(pconfig, PEER_NPUB, "nope")
+        )
+        assert "error" in result
+        assert "running sidecar" in result["error"]
+
+    def test_stale_pid_errors(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(vector_adapter, "_sidecar_pid_alive", lambda _pid: False)
+        rec_path = tmp_path / "runtime" / "vector-sidecar.json"
+        rec_path.parent.mkdir(parents=True, exist_ok=True)
+        rec_path.write_text(
+            json.dumps({"port": 8096, "token": "f" * 64, "pid": 999999}),
+            encoding="utf-8",
+        )
+        pconfig = MagicMock()
+        pconfig.extra = {}
+        result = asyncio.run(
+            vector_adapter._standalone_send(pconfig, PEER_NPUB, "stale")
+        )
+        assert "error" in result
+        assert "stale" in result["error"].lower() or "down" in result["error"].lower()
+
+
+class TestWizardHelpers:
+    def test_parse_rustc_version(self):
+        assert vector_adapter._parse_rustc_version(
+            "rustc 1.75.0 (82e1608df 2023-12-21)"
+        ) == (1, 75)
+        assert vector_adapter._parse_rustc_version("rustc 1.85.0-nightly") == (1, 85)
+        assert vector_adapter._parse_rustc_version("not rust") is None
+        assert vector_adapter._parse_rustc_version(
+            "rustc 1.74.0"
+        ) < vector_adapter.MIN_RUSTC
+
+    def test_parse_bridge_json(self):
+        stdout = "noise\n{\"status\": \"existing\", \"npub\": \"%s\"}\n" % NPUB
+        data = vector_adapter._parse_bridge_json(stdout)
+        assert data["status"] == "existing"
+        assert data["npub"] == NPUB
+        assert vector_adapter._parse_bridge_json("no json here") is None
+
+    def test_normalize_identity_choice(self):
+        assert vector_adapter._normalize_identity_choice("create") == "create"
+        assert vector_adapter._normalize_identity_choice("C") == "create"
+        assert vector_adapter._normalize_identity_choice("nsec") == "nsec"
+        assert vector_adapter._normalize_identity_choice("mnemonic") == "mnemonic"
+        assert vector_adapter._normalize_identity_choice("nope") is None
+
+    def test_bridge_cli_env_strips_secrets(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_NSEC", "nsec1secret")
+        monkeypatch.setenv("VECTOR_MNEMONIC", "abandon " * 12)
+        monkeypatch.setenv("VECTOR_STUB", "1")
+        monkeypatch.setenv("VECTOR_SIDECAR_TOKEN", "tok")
+        env = vector_adapter._bridge_cli_env(tmp_path)
+        assert env["VECTOR_DATA_DIR"] == str(tmp_path)
+        assert "VECTOR_NSEC" not in env
+        assert "VECTOR_MNEMONIC" not in env
+        assert "VECTOR_STUB" not in env
+        assert "VECTOR_SIDECAR_TOKEN" not in env
+
+    def test_write_temp_secret_is_0600(self, tmp_path):
+        path = vector_adapter._write_temp_secret("nsec1testsecret")
+        try:
+            assert path.is_file()
+            assert path.read_text(encoding="utf-8").strip() == "nsec1testsecret"
+            if os.name == "posix":
+                assert (path.stat().st_mode & 0o777) == 0o600
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_ensure_bridge_binary_skips_cargo_when_present(self, monkeypatch, tmp_path):
+        fake = tmp_path / "vector-bridge"
+        fake.write_text("")
+        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: fake)
+        cargo_calls = []
+        monkeypatch.setattr(
+            vector_adapter.subprocess,
+            "run",
+            lambda *a, **k: cargo_calls.append((a, k)) or MagicMock(),
+        )
+        io = SimpleNamespace(print_info=lambda *_a, **_k: None, print_error=lambda *_a, **_k: None)
+        assert vector_adapter._ensure_bridge_binary(io) == fake
+        assert cargo_calls == []
+
+    def test_ensure_bridge_binary_hints_when_cargo_missing(self, monkeypatch, tmp_path):
+        missing = tmp_path / "no-bridge"
+        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: missing)
+        monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
+        monkeypatch.setattr(vector_adapter.shutil, "which", lambda _name: None)
+        errors = []
+        io = SimpleNamespace(
+            print_info=lambda *_a, **_k: None,
+            print_error=lambda msg, *a, **k: errors.append(msg),
+            print_success=lambda *_a, **_k: None,
+        )
+        assert vector_adapter._ensure_bridge_binary(io) is None
+        assert errors
+        assert "cargo" in errors[0].lower() or "rustup" in errors[0].lower()
+
+
+def _fake_setup_io(*, prompts=None, yes_no=None, env=None):
+    saved: dict = {}
+    env_map = dict(env or {})
+
+    def prompt(question, default=None, password=False):
+        for key, val in (prompts or {}).items():
+            if key in question:
+                return default if val is None else val
+        return default or ""
+
+    def prompt_yes_no(question, default=True):
+        for key, val in (yes_no or {}).items():
+            if key in question:
+                return val
+        return default
+
+    def get_env_value(key):
+        return env_map.get(key)
+
+    def save_env_value(key, value):
+        saved[key] = value
+        env_map[key] = value
+
+    logs = {"info": [], "warn": [], "err": [], "ok": [], "header": []}
+    return SimpleNamespace(
+        prompt=prompt,
+        prompt_yes_no=prompt_yes_no,
+        get_env_value=get_env_value,
+        save_env_value=save_env_value,
+        print_header=lambda m: logs["header"].append(m),
+        print_info=lambda m: logs["info"].append(m),
+        print_warning=lambda m: logs["warn"].append(m),
+        print_success=lambda m: logs["ok"].append(m),
+        print_error=lambda m: logs["err"].append(m),
+        saved=saved,
+        logs=logs,
+    )
+
+
+class TestInteractiveSetup:
+    def test_create_normalizes_operator_npub_and_writes_env(
+        self, monkeypatch, tmp_path
+    ):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_data_dir", lambda: tmp_path / "sdk"
+        )
+        cli_calls = []
+
+        def fake_cli(_bin, _data, args, timeout=60):
+            cli_calls.append(list(args))
+            if "--check" in args:
+                return {"status": "not_registered"}, 0, ""
+            if "--setup" in args:
+                assert "--nsec-file" not in args
+                assert "--mnemonic-file" not in args
+                return {"status": "created", "npub": NPUB}, 0, ""
+            return None, 1, "unexpected"
+
+        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        io = _fake_setup_io(
+            prompts={
+                "Identity [create / nsec / mnemonic]": "create",
+                "Bot display name": "Hermes",
+                "Your Vector npub": HEX_PUBKEY,
+            },
+            yes_no={"Enable pairing codes": True},
+        )
+        vector_adapter._run_interactive_setup(io)
+        assert io.saved["VECTOR_NPUB"] == NPUB
+        assert io.saved["VECTOR_HOME_CHANNEL"] == NPUB
+        assert io.saved["VECTOR_ALLOWED_USERS"] == NPUB
+        assert io.saved["VECTOR_PAIRING"] == "on"
+        assert io.saved["VECTOR_BOT_NAME"] == "Hermes"
+        assert "VECTOR_NSEC" not in io.saved
+        assert cli_calls[0] == ["--check"]
+        assert cli_calls[1] == ["--setup"]
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+        assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "off"
+        assert cfg["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
+        assert any("Share this npub" in m for m in io.logs["info"])
+
+    def test_import_nsec_uses_temp_0600_file_not_env(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_data_dir", lambda: tmp_path / "sdk"
+        )
+        seen_files = []
+
+        def fake_cli(_bin, _data, args, timeout=60):
+            if "--check" in args:
+                return {"status": "not_registered"}, 0, ""
+            if "--nsec-file" in args:
+                idx = args.index("--nsec-file")
+                path = Path(args[idx + 1])
+                seen_files.append(path)
+                assert path.is_file()
+                if os.name == "posix":
+                    assert (path.stat().st_mode & 0o777) == 0o600
+                assert "nsec1imported" in path.read_text(encoding="utf-8")
+                return {"status": "restored", "npub": NPUB}, 0, ""
+            return None, 1, "missing nsec-file"
+
+        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        io = _fake_setup_io(
+            prompts={
+                "Identity [create / nsec / mnemonic]": "nsec",
+                "nsec (nsec1": "nsec1imported",
+                "Bot display name": "Hermes",
+                "Your Vector npub": f"nostr:{PEER_NPUB}",
+            },
+            yes_no={"Enable pairing codes": False},
+        )
+        vector_adapter._run_interactive_setup(io)
+        assert seen_files
+        assert not seen_files[0].exists()
+        assert io.saved["VECTOR_HOME_CHANNEL"] == PEER_NPUB
+        assert io.saved["VECTOR_ALLOWED_USERS"] == PEER_NPUB
+        assert io.saved["VECTOR_PAIRING"] == "off"
+        assert "VECTOR_NSEC" not in io.saved
+
+    def test_existing_identity_skips_create_import_unless_confirmed(
+        self, monkeypatch, tmp_path
+    ):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_data_dir", lambda: tmp_path / "sdk"
+        )
+        cli_calls = []
+
+        def fake_cli(_bin, _data, args, timeout=60):
+            cli_calls.append(list(args))
+            if "--check" in args:
+                return {"status": "existing", "npub": NPUB}, 0, ""
+            if "--setup" in args:
+                assert "--nsec-file" not in args
+                return {"status": "existing", "npub": NPUB}, 0, ""
+            return None, 1, "unexpected"
+
+        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        io = _fake_setup_io(
+            prompts={
+                "Identity [create / nsec / mnemonic]": "nsec",
+                "nsec (nsec1": "nsec1shouldnotbeused",
+                "Bot display name": "Hermes",
+                "Your Vector npub": PEER_NPUB,
+            },
+            yes_no={
+                "Reconfigure identity anyway?": False,
+                "Enable pairing codes": True,
+            },
+        )
+        vector_adapter._run_interactive_setup(io)
+        assert cli_calls[0] == ["--check"]
+        assert cli_calls[1] == ["--setup"]
+        assert io.saved["VECTOR_NPUB"] == NPUB
+        assert io.saved["VECTOR_HOME_CHANNEL"] == PEER_NPUB
+
+    def test_already_configured_can_skip(self, monkeypatch, tmp_path):
+        called = []
+        monkeypatch.setattr(
+            vector_adapter,
+            "_ensure_bridge_binary",
+            lambda _io: called.append("build") or tmp_path / "x",
+        )
+        io = _fake_setup_io(
+            env={"VECTOR_NPUB": NPUB},
+            yes_no={"Reconfigure Vector?": False},
+        )
+        vector_adapter._run_interactive_setup(io)
+        assert called == []
+        assert io.saved == {}
+
+    def test_operator_npub_required(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(
+            vector_adapter,
+            "_run_bridge_cli",
+            lambda *_a, **_k: ({"status": "not_registered"}, 0, ""),
+        )
+        io = _fake_setup_io(
+            prompts={
+                "Identity [create / nsec / mnemonic]": "create",
+                "Bot display name": "Hermes",
+                "Your Vector npub": "not-an-npub",
+            },
+        )
+        vector_adapter._run_interactive_setup(io)
+        assert io.saved == {}
+        assert any("required" in m.lower() for m in io.logs["err"])

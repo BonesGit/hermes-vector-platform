@@ -56,7 +56,7 @@ optional_env:
     prompt: "Bridge binary"
     password: false
   - name: VECTOR_STARTUP_TIMEOUT
-    description: "Seconds to wait for sidecar /health status=ready (default 30)"
+    description: "Seconds to wait for sidecar /health status=ready (default 25; keep below HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, default 30)"
     prompt: "Startup timeout"
     password: false
   - name: VECTOR_PAIRING

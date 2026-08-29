@@ -258,9 +258,12 @@ assert PEER_NPUB
 
 
 class FakeBridgeProc:
-    """Stand-in for vector-bridge so tests never spawn Rust."""
+    """Stand-in for vector-bridge so tests never spawn Rust.
 
-    def __init__(self, pid: int = 424242):
+    Default pid is -1 so disconnect() cannot killpg a live process.
+    """
+
+    def __init__(self, pid: int = -1):
         self.pid = pid
         self.returncode = None
         self.stdin = MagicMock()
@@ -277,6 +280,15 @@ class FakeBridgeProc:
         self._alive = False
         self.returncode = -9
 
+    def wait(self, timeout=None):
+        if not self._alive:
+            return self.returncode
+        if timeout is not None:
+            raise subprocess.TimeoutExpired("vector-bridge", timeout)
+        self._alive = False
+        self.returncode = 0
+        return self.returncode
+
 
 class MockSidecar:
     """Loopback HTTP sidecar: token auth, /health, /send, /typing, /events."""
@@ -292,6 +304,7 @@ class MockSidecar:
         self.typing_headers: list = []
         self.events_headers: list = []
         self.inject_queue: list = []
+        self.send_raw: bytes | None = None
         self.port: int | None = None
         self._httpd = None
 
@@ -363,6 +376,13 @@ class MockSidecar:
                 if path == "/send":
                     sidecar.sends.append(data)
                     sidecar.send_headers.append(dict(self.headers))
+                    if sidecar.send_raw is not None:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(sidecar.send_raw)))
+                        self.end_headers()
+                        self.wfile.write(sidecar.send_raw)
+                        return
                     return self._json(200, {"id": "evt-outbound-1"})
                 if path == "/typing":
                     sidecar.typing.append(data)
@@ -419,6 +439,13 @@ def _make_adapter(monkeypatch, tmp_path, **extra):
         vector_adapter, "bridge_port_is_listening", lambda *_a, **_k: False
     )
 
+    data_dir = Path(extra.get("data_dir") or (tmp_path / "sdk"))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if not extra.get("skip_identity"):
+        nsec = data_dir / "identity.nsec"
+        if not nsec.exists():
+            nsec.write_text("nsec1test")
+
     cfg = MagicMock()
     cfg.extra = {
         "npub": extra.get("npub", NPUB),
@@ -426,7 +453,7 @@ def _make_adapter(monkeypatch, tmp_path, **extra):
         "bridge_host": extra.get("bridge_host", "127.0.0.1"),
         "bot_name": extra.get("bot_name", "Hermes"),
         "startup_timeout": extra.get("startup_timeout", 5),
-        "data_dir": str(extra.get("data_dir") or (tmp_path / "sdk")),
+        "data_dir": str(data_dir),
     }
     return vector_adapter.VectorAdapter(cfg)
 
@@ -602,7 +629,7 @@ class TestSpawnEnv:
 
         monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
         proc = adapter._spawn_bridge()
-        assert proc.pid == 424242
+        assert proc.pid == -1
         kwargs = captured["kwargs"]
         assert kwargs["stdin"] == subprocess.PIPE
         assert kwargs["stdout"] is not subprocess.PIPE
@@ -616,7 +643,8 @@ class TestSpawnEnv:
         assert "VECTOR_MNEMONIC" not in env
         assert "VECTOR_STUB" not in env
         if sys.platform != "win32":
-            assert kwargs.get("preexec_fn") is os.setsid
+            assert kwargs.get("start_new_session") is True
+            assert "preexec_fn" not in kwargs
         adapter._close_bridge_log()
 
 
@@ -637,6 +665,34 @@ class TestConnectMissingBinary:
         assert adapter.has_fatal_error
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "vector_bridge_missing"
+
+    def test_missing_identity_is_fatal_not_retryable(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, skip_identity=True)
+        spawned = []
+        monkeypatch.setattr(
+            vector_adapter.VectorAdapter,
+            "_spawn_bridge",
+            lambda self: spawned.append(True) or FakeBridgeProc(),
+        )
+        ok = asyncio.run(adapter.connect())
+        assert ok is False
+        assert spawned == []
+        assert adapter.has_fatal_error
+        assert adapter.fatal_error_retryable is False
+        assert adapter.fatal_error_code == "vector_identity_missing"
+
+    def test_spawn_oserror_is_fatal_not_retryable(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+
+        def boom(*_a, **_k):
+            raise PermissionError("not executable")
+
+        monkeypatch.setattr(vector_adapter.subprocess, "Popen", boom)
+        ok = asyncio.run(adapter.connect())
+        assert ok is False
+        assert adapter.has_fatal_error
+        assert adapter.fatal_error_retryable is False
+        assert adapter.fatal_error_code == "vector_bridge_spawn_failed"
 
 
 class TestMockedSidecarHttp:
@@ -675,6 +731,7 @@ class TestMockedSidecarHttp:
         try:
             adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
             adapter._sidecar_token = "wrong-token"
+            adapter._running = True
 
             async def go():
                 adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
@@ -689,6 +746,40 @@ class TestMockedSidecarHttp:
             assert sidecar.sends == []
         finally:
             sidecar.stop()
+
+    def test_send_200_invalid_json_is_not_retryable(self, monkeypatch, tmp_path):
+        token = "d" * 64
+        sidecar = MockSidecar(token=token)
+        sidecar.send_raw = b"not-json"
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    result = await adapter.send(PEER_NPUB, "maybe-delivered")
+                    assert result.success is True
+                    assert result.message_id is None
+                    assert result.retryable is False
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.sends == [{"to": PEER_NPUB, "body": "maybe-delivered"}]
+        finally:
+            sidecar.stop()
+
+    def test_send_requires_running(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._http_client = MagicMock()
+        adapter._running = False
+        result = asyncio.run(adapter.send(PEER_NPUB, "nope"))
+        assert result.success is False
+        assert result.error == "Not connected"
+        adapter._http_client.post.assert_not_called()
 
     def test_connect_polls_health_and_sends_token(self, monkeypatch, tmp_path):
         token = "b" * 64
@@ -824,3 +915,36 @@ class TestFatalBridgeExit:
         assert adapter.has_fatal_error
         assert adapter.fatal_error_retryable is True
         assert adapter.fatal_error_code == "vector_bridge_exited"
+
+
+class TestOrphanReap:
+    def test_pid_is_vector_bridge(self, monkeypatch):
+        def fake_run(*_a, **_k):
+            r = MagicMock()
+            r.stdout = "/opt/plugins/vector-platform/bridge/target/release/vector-bridge"
+            return r
+
+        monkeypatch.setattr(vector_adapter.subprocess, "run", fake_run)
+        assert vector_adapter._pid_is_vector_bridge(99) is True
+
+    def test_pid_is_not_vector_bridge(self, monkeypatch):
+        def fake_run(*_a, **_k):
+            r = MagicMock()
+            r.stdout = "nginx: worker process"
+            return r
+
+        monkeypatch.setattr(vector_adapter.subprocess, "run", fake_run)
+        assert vector_adapter._pid_is_vector_bridge(99) is False
+
+    def test_reap_skips_foreign_listener(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            vector_adapter, "_find_listener_pids", lambda _port: [9999]
+        )
+        monkeypatch.setattr(
+            vector_adapter, "_pid_is_vector_bridge", lambda _pid: False
+        )
+        killed = []
+        monkeypatch.setattr(vector_adapter.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+        asyncio.run(adapter._reap_orphan_sidecar())
+        assert killed == []

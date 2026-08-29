@@ -94,7 +94,7 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
 | `VECTOR_BRIDGE_PORT` | no | Local HTTP port for the Rust sidecar (default `8096`) |
 | `VECTOR_BRIDGE_HOST` | no | Sidecar bind address (default `127.0.0.1`). LAN bind is a risk even with the token. |
 | `VECTOR_BRIDGE_BIN` | no | Absolute path to `vector-bridge` |
-| `VECTOR_STARTUP_TIMEOUT` | no | Seconds to wait for sidecar `/health status=ready` (default `30`) |
+| `VECTOR_STARTUP_TIMEOUT` | no | Seconds to wait for sidecar `/health status=ready` (default `25`). Must stay below `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` (Hermes default `30`); raise both if Vector login needs longer. |
 | `VECTOR_PAIRING` | no | `on` (default) = unknown npubs get a Hermes pairing code; `off` = drop them before `handle_message` |
 
 `VECTOR_SIDECAR_TOKEN` is generated at spawn time and is **not** a plugin.yaml env var. Never put nsec in the sidecar environment or in the plugin install tree.

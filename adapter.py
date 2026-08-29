@@ -54,7 +54,10 @@ _DEFAULT_BRIDGE_BIN = _PLUGIN_ROOT / "bridge" / "target" / "release" / "vector-b
 
 DEFAULT_BRIDGE_PORT = 8096
 DEFAULT_BRIDGE_HOST = "127.0.0.1"
-DEFAULT_STARTUP_TIMEOUT = 30
+# Must stay under GatewayRunner._PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT (30s).
+# Operators who raise VECTOR_STARTUP_TIMEOUT must also raise
+# HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT above it.
+DEFAULT_STARTUP_TIMEOUT = 25
 MAX_MESSAGE_LENGTH = 4000
 DEFAULT_BOT_NAME = "Hermes"
 
@@ -160,6 +163,60 @@ def _client_host(bind_host: str) -> str:
     if host in ("0.0.0.0", "::", "[::]"):
         return "127.0.0.1"
     return host
+
+
+def _identity_nsec_present(data_dir: Path) -> bool:
+    path = Path(data_dir) / "identity.nsec"
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _find_listener_pids(port: int) -> List[int]:
+    """PIDs listening on a local TCP port (empty if none/undeterminable)."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [int(tok) for tok in out.stdout.split() if tok.strip().isdigit()]
+
+
+def _pid_is_vector_bridge(pid: int) -> bool:
+    """True if ``pid``'s command line looks like vector-bridge."""
+    if pid <= 1:
+        return False
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "vector-bridge" in (out.stdout or "")
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _host_is_loopback(host: str) -> bool:
@@ -354,6 +411,18 @@ class VectorAdapter(BasePlatformAdapter):
             self._release_platform_lock()
             return False
 
+        if not _identity_nsec_present(self.data_dir):
+            nsec_path = Path(self.data_dir) / "identity.nsec"
+            msg = (
+                f"Vector identity not found at {nsec_path}. "
+                "Run `hermes gateway setup` to create or import an nsec. "
+                "Do not expect hermes gateway start to mint identity."
+            )
+            logger.error("Vector: %s", msg)
+            self._set_fatal_error("vector_identity_missing", msg, retryable=False)
+            self._release_platform_lock()
+            return False
+
         if not _host_is_loopback(self.bridge_host):
             logger.warning(
                 "VECTOR_BRIDGE_HOST=%s is not loopback; "
@@ -382,78 +451,98 @@ class VectorAdapter(BasePlatformAdapter):
                 return False
 
         self._sidecar_token = secrets.token_hex(32)
-
+        connected = False
         try:
-            self._bridge_process = self._spawn_bridge()
-        except Exception as e:
-            logger.error("Vector: failed to spawn sidecar: %s", e, exc_info=True)
-            self._close_bridge_log()
-            self._release_platform_lock()
-            return False
-
-        self._http_client = httpx.AsyncClient(timeout=30.0, trust_env=False)
-
-        logger.info(
-            "Vector: waiting up to %ds for sidecar /health status=ready...",
-            self.startup_timeout,
-        )
-        ready = False
-        deadline = time.monotonic() + self.startup_timeout
-        while time.monotonic() < deadline:
-            if self._bridge_process.poll() is not None:
+            try:
+                self._bridge_process = self._spawn_bridge()
+            except (FileNotFoundError, PermissionError, OSError) as e:
                 msg = (
-                    f"vector-bridge exited during startup "
-                    f"(code {self._bridge_process.returncode}). "
+                    f"failed to spawn vector-bridge ({e}). "
+                    "Check that the binary is executable, or run `hermes gateway setup`."
+                )
+                logger.error("Vector: %s", msg, exc_info=True)
+                self._set_fatal_error("vector_bridge_spawn_failed", msg, retryable=False)
+                return False
+            except Exception as e:
+                logger.error("Vector: failed to spawn sidecar: %s", e, exc_info=True)
+                self._set_fatal_error("vector_bridge_spawn_failed", str(e), retryable=False)
+                return False
+
+            self._http_client = httpx.AsyncClient(timeout=30.0, trust_env=False)
+
+            logger.info(
+                "Vector: waiting up to %ds for sidecar /health status=ready...",
+                self.startup_timeout,
+            )
+            ready = False
+            deadline = time.monotonic() + self.startup_timeout
+            while time.monotonic() < deadline:
+                if self._bridge_process.poll() is not None:
+                    msg = (
+                        f"vector-bridge exited during startup "
+                        f"(code {self._bridge_process.returncode}). "
+                        f"Check log: {self._bridge_log}"
+                    )
+                    logger.error("Vector: %s", msg)
+                    self._set_fatal_error("vector_bridge_exited", msg, retryable=True)
+                    return False
+
+                try:
+                    resp = await self._http_client.get(
+                        f"{self.bridge_url}/health",
+                        headers=self._token_headers(),
+                        timeout=2.0,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if data.get("status") == "ready":
+                            ready_npub = data.get("npub")
+                            if ready_npub:
+                                self._npub = ready_npub
+                            ready = True
+                            break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                await asyncio.sleep(HEALTH_POLL_INTERVAL)
+
+            if not ready:
+                msg = (
+                    f"Vector sidecar did not become ready in {self.startup_timeout}s. "
                     f"Check log: {self._bridge_log}"
                 )
                 logger.error("Vector: %s", msg)
-                self._set_fatal_error("vector_bridge_exited", msg, retryable=True)
-                await self._cleanup_failed_connect()
+                self._set_fatal_error("vector_bridge_startup_timeout", msg, retryable=True)
                 return False
 
-            try:
-                resp = await self._http_client.get(
-                    f"{self.bridge_url}/health",
-                    headers=self._token_headers(),
-                    timeout=2.0,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("status") == "ready":
-                        ready_npub = data.get("npub")
-                        if ready_npub:
-                            self._npub = ready_npub
-                        ready = True
-                        break
-            except Exception:
-                pass
-            await asyncio.sleep(HEALTH_POLL_INTERVAL)
-
-        if not ready:
-            msg = (
-                f"Vector sidecar did not become ready in {self.startup_timeout}s. "
-                f"Check log: {self._bridge_log}"
+            logger.info(
+                "Vector: bot npub = %s",
+                _truncate_npub(self._npub or ""),
             )
-            logger.error("Vector: %s", msg)
-            self._set_fatal_error("vector_bridge_startup_timeout", msg, retryable=True)
-            await self._cleanup_failed_connect()
-            return False
 
-        logger.info(
-            "Vector: bot npub = %s",
-            _truncate_npub(self._npub or ""),
-        )
+            pid = self._bridge_process.pid if self._bridge_process else 0
+            _write_runtime_record(self.bridge_port, self._sidecar_token or "", pid, self._npub)
 
-        pid = self._bridge_process.pid if self._bridge_process else 0
-        _write_runtime_record(self.bridge_port, self._sidecar_token or "", pid, self._npub)
-
-        # Set _running before SSE/health tasks so their loops don't exit immediately.
-        self._running = True
-        self._sse_task = asyncio.create_task(self._sse_listener())
-        self._health_task = asyncio.create_task(self._health_monitor())
-        self._mark_connected()
-        logger.info("Vector: connected on %s:%d", self.bridge_host, self.bridge_port)
-        return True
+            # Set _running before SSE/health tasks so their loops don't exit immediately.
+            self._running = True
+            self._sse_task = asyncio.create_task(self._sse_listener())
+            self._health_task = asyncio.create_task(self._health_monitor())
+            self._mark_connected()
+            connected = True
+            logger.info("Vector: connected on %s:%d", self.bridge_host, self.bridge_port)
+            return True
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if not connected:
+                try:
+                    await asyncio.shield(self._cleanup_failed_connect())
+                except Exception:
+                    logger.warning(
+                        "Vector: cleanup after failed connect raised",
+                        exc_info=True,
+                    )
 
     async def disconnect(self) -> None:
         self._running = False
@@ -509,7 +598,7 @@ class VectorAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not self._http_client:
+        if not self._running or not self._http_client:
             return SendResult(success=False, error="Not connected")
 
         if self._bridge_process and self._bridge_process.poll() is not None:
@@ -536,7 +625,19 @@ class VectorAdapter(BasePlatformAdapter):
                 timeout=30.0,
             )
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except (ValueError, json.JSONDecodeError) as e:
+                    logger.warning(
+                        "Vector: /send returned 200 but JSON was unreadable: %s",
+                        e,
+                    )
+                    # Sidecar may already have delivered; do not retry.
+                    return SendResult(success=True, message_id=None, retryable=False)
+                if not isinstance(data, dict):
+                    return SendResult(
+                        success=True, message_id=None, raw_response=data, retryable=False
+                    )
                 return SendResult(
                     success=True,
                     message_id=data.get("id") or data.get("messageId"),
@@ -558,7 +659,7 @@ class VectorAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e), retryable=True)
         except Exception as e:
             logger.error("Vector: exception while sending: %s", e)
-            return SendResult(success=False, error=str(e), retryable=True)
+            return SendResult(success=False, error=str(e), retryable=False)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         if not self._http_client:
@@ -874,11 +975,41 @@ class VectorAdapter(BasePlatformAdapter):
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
-            popen_kwargs["preexec_fn"] = os.setsid
+            # Photon: start_new_session, not preexec_fn=os.setsid (unsafe in threads).
+            popen_kwargs["start_new_session"] = True
 
         process = subprocess.Popen([str(bin_path)], **popen_kwargs)
         self._bridge_process = process
         return process
+
+    async def _wait_proc(self, proc: subprocess.Popen, timeout: float) -> None:
+        """Wait for ``proc`` up to ``timeout`` seconds; TimeoutExpired if still alive."""
+        try:
+            await asyncio.to_thread(proc.wait, timeout)
+        except subprocess.TimeoutExpired:
+            raise
+        except Exception:
+            deadline = time.monotonic() + max(float(timeout), 0.0)
+            while proc.poll() is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            if proc.poll() is None:
+                raise subprocess.TimeoutExpired("vector-bridge", timeout)
+
+    def _signal_bridge(self, proc: subprocess.Popen, sig) -> None:
+        pid = getattr(proc, "pid", -1) or -1
+        if sys.platform == "win32" or pid <= 1:
+            if sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
+            return
+        try:
+            os.killpg(os.getpgid(pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            if sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
 
     async def _stop_bridge_process(self) -> None:
         proc = self._bridge_process
@@ -890,73 +1021,66 @@ class VectorAdapter(BasePlatformAdapter):
                     proc.stdin.close()
                 except Exception:
                     pass
-            pid = proc.pid
-            if sys.platform == "win32":
+            if proc.poll() is not None:
+                return
+            try:
+                self._signal_bridge(proc, signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                await self._wait_proc(proc, BRIDGE_TERM_WAIT)
+            except subprocess.TimeoutExpired:
+                pass
+            if proc.poll() is None:
                 try:
-                    proc.terminate()
+                    self._signal_bridge(proc, signal.SIGKILL)
                 except Exception:
                     pass
-            else:
                 try:
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-            await asyncio.sleep(BRIDGE_TERM_WAIT)
-            if proc.poll() is None:
-                if sys.platform == "win32":
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        os.killpg(os.getpgid(pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
+                    await self._wait_proc(proc, 1.0)
+                except (subprocess.TimeoutExpired, Exception):
+                    pass
         except Exception as e:
             logger.warning("Vector: error stopping sidecar: %s", e)
         finally:
             self._bridge_process = None
 
     async def _reap_orphan_sidecar(self) -> None:
-        """If a previous vector-bridge still holds the port, SIGTERM its pid."""
-        record = _read_runtime_record()
-        if not record:
+        """Kill a previous vector-bridge still listening on our port.
+
+        Only signals PIDs whose command line contains ``vector-bridge``
+        (Photon: never kill a reused pid from a stale runtime record).
+        """
+        if sys.platform == "win32":
             return
-        try:
-            rec_port = int(record.get("port"))
-            rec_pid = int(record.get("pid"))
-        except (TypeError, ValueError):
+
+        def _inspect():
+            found = _find_listener_pids(self.bridge_port)
+            mine = [pid for pid in found if _pid_is_vector_bridge(pid)]
+            return mine, [pid for pid in found if pid not in mine]
+
+        stale, _foreign = await asyncio.to_thread(_inspect)
+        if not stale:
             return
-        if rec_port != self.bridge_port or rec_pid <= 0:
-            return
-        logger.warning(
-            "Vector: reaping orphan sidecar pid %d on port %d",
-            rec_pid,
-            rec_port,
-        )
-        try:
-            os.kill(rec_pid, signal.SIGTERM)
-        except OSError:
-            return
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
+        for pid in stale:
+            logger.warning(
+                "Vector: reaping orphan sidecar pid %d on port %d",
+                pid,
+                self.bridge_port,
+            )
             try:
-                os.kill(rec_pid, 0)
-            except OSError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            try:
-                os.kill(rec_pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
+        deadline = time.time() + 2.0
+        while time.time() < deadline and any(_pid_alive(p) for p in stale):
+            await asyncio.sleep(0.1)
+        for pid in stale:
+            if _pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
         _delete_runtime_record()
 
     def _close_bridge_log(self) -> None:

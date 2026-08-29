@@ -1546,6 +1546,29 @@ class TestInteractiveSetup:
         assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "off"
         assert cfg["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
 
+    def test_skip_reconfigure_still_adopts_stale_bak(self, monkeypatch, tmp_path):
+        called = []
+        data_dir = tmp_path / "sdk"
+        data_dir.mkdir()
+        bak = data_dir / "identity.nsec.bak"
+        bak.write_text("nsec1original\n")
+        monkeypatch.setattr(
+            vector_adapter,
+            "_ensure_bridge_binary",
+            lambda _io: called.append("build") or tmp_path / "x",
+        )
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        io = _fake_setup_io(
+            env={"VECTOR_NPUB": NPUB},
+            yes_no={"Reconfigure Vector?": False},
+        )
+        vector_adapter._run_interactive_setup(io)
+        assert called == []
+        assert (data_dir / "identity.nsec").read_text() == "nsec1original\n"
+        assert not bak.exists()
+        assert any("identity.nsec.bak" in m for m in io.logs["warn"])
+
     def test_operator_npub_required(self, monkeypatch, tmp_path):
         fake_bin = tmp_path / "vector-bridge"
         fake_bin.write_text("")

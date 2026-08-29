@@ -1863,6 +1863,10 @@ def _confirm_import_as_bot(io) -> bool:
 def _run_interactive_setup(io) -> None:
     """Wizard body (testable with a mocked io + subprocess)."""
     io.print_header("Vector")
+    data_dir = Path(io.get_env_value("VECTOR_DATA_DIR") or resolve_data_dir())
+    # Adopt before the already-configured early return: an interrupted
+    # reconfigure leaves VECTOR_NPUB set and only identity.nsec.bak on disk.
+    _adopt_stale_identity_backup(data_dir, io)
     existing_npub = (io.get_env_value("VECTOR_NPUB") or "").strip()
     if existing_npub:
         io.print_info(
@@ -1876,7 +1880,6 @@ def _run_interactive_setup(io) -> None:
     if not bin_path:
         return
 
-    data_dir = Path(io.get_env_value("VECTOR_DATA_DIR") or resolve_data_dir())
     io.print_info(f"Data dir: {data_dir}")
     _adopt_stale_identity_backup(data_dir, io)
 

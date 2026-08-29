@@ -1,0 +1,22 @@
+[package]
+name = "vector-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Hermes Vector platform sidecar (identity CLI)"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde_json = "1"
+# Same pin as vector-sdk; nip06 for Keys::from_mnemonic (--mnemonic-file).
+nostr = { version = "=0.45.1", default-features = false, features = ["std", "nip06"] }
+# Relative path resolves for /home/anthony/projects/{hermes-vector-platform,Vector}
+# and GitHub Actions sibling checkouts. Do not use a git dep or an absolute path.
+vector_sdk = { path = "../../Vector/crates/vector-sdk" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

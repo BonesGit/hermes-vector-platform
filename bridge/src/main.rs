@@ -164,21 +164,36 @@ fn npub_from_nsec(nsec: &str) -> Result<String, CliError> {
 
 fn write_identity(path: &Path, nsec: &str) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| CliError::io(parent, err))?;
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| CliError::io(parent, err))?;
+        }
     }
-    fs::write(path, nsec).map_err(|err| CliError::io(path, err))?;
-    restrict_to_owner(path);
-    Ok(())
+    write_restricted(path, nsec.as_bytes())
 }
 
 #[cfg(unix)]
-fn restrict_to_owner(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+fn write_restricted(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| CliError::io(path, err))?;
+    file.write_all(contents)
+        .map_err(|err| CliError::io(path, err))?;
+    // OpenOptions.mode applies only to newly created files.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| CliError::io(path, err))?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_to_owner(_path: &Path) {}
+fn write_restricted(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+    fs::write(path, contents).map_err(|err| CliError::io(path, err))
+}
 
 fn cmd_check(data_dir: &Path) -> Result<ExitCode, CliError> {
     let path = identity_path(data_dir);

@@ -9,10 +9,9 @@ publish = false
 
 [dependencies]
 serde_json = "1"
-# Same pin as vector-sdk; nip06 for Keys::from_mnemonic (--mnemonic-file).
+# nip06: Keys::from_mnemonic (--mnemonic-file). Not re-exported by vector_sdk::nostr.
 nostr = { version = "=0.45.1", default-features = false, features = ["std", "nip06"] }
-# Relative path resolves for /home/anthony/projects/{hermes-vector-platform,Vector}
-# and GitHub Actions sibling checkouts. Do not use a git dep or an absolute path.
+# From bridge/, ../../Vector is the sibling Vector checkout.
 vector_sdk = { path = "../../Vector/crates/vector-sdk" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

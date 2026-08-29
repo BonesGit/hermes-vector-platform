@@ -176,8 +176,47 @@ fn setup_restores_from_mnemonic_file() {
     assert_no_nsec_on_stdout(&out);
     let body = stdout_json(&out);
     assert_eq!(body["status"], "restored");
-    let npub = body["npub"].as_str().unwrap();
-    assert!(npub.starts_with("npub1"));
+    assert_eq!(
+        body["npub"],
+        "npub1az708q3kd9zy6z6f44zav5ygvdwelkzspf6mtusttx47lft2z38sghk0w7"
+    );
+}
+
+#[test]
+fn setup_invalid_nsec_file_does_not_create_identity() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("bad.nsec");
+    fs::write(&src, "nsec1thisisnotvalid").unwrap();
+    let data = dir.path().join("sdk");
+    fs::create_dir(&data).unwrap();
+
+    let out = run(&data, &["--setup", "--nsec-file", src.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let err: Value = serde_json::from_str(stderr.trim()).expect("stderr json");
+    assert_eq!(err["code"], "invalid_nsec");
+    assert!(!identity_path(&data).exists());
+    assert_no_nsec_on_stdout(&out);
+}
+
+#[test]
+fn setup_invalid_mnemonic_file_does_not_create_identity() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("bad.txt");
+    fs::write(&src, "not a mnemonic").unwrap();
+    let data = dir.path().join("sdk");
+    fs::create_dir(&data).unwrap();
+
+    let out = run(
+        &data,
+        &["--setup", "--mnemonic-file", src.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let err: Value = serde_json::from_str(stderr.trim()).expect("stderr json");
+    assert_eq!(err["code"], "invalid_mnemonic");
+    assert!(!identity_path(&data).exists());
+    assert_no_nsec_on_stdout(&out);
 }
 
 #[test]

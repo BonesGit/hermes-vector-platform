@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-HERMES_ROOT = Path.home() / ".hermes" / "hermes-agent"
+
+
+def _hermes_root() -> Path:
+    if override := os.environ.get("HERMES_AGENT_ROOT"):
+        return Path(override)
+    return Path.home() / ".hermes" / "hermes-agent"
+
+
+HERMES_ROOT = _hermes_root()
 if str(HERMES_ROOT) not in sys.path:
     sys.path.insert(0, str(HERMES_ROOT))
 

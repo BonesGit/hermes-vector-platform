@@ -8,32 +8,38 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      # GITHUB_WORKSPACE is .../hermes-vector-platform/hermes-vector-platform.
-      # From <plugin>/bridge, ../../Vector is this workspace's Vector/ checkout —
-      # the same layout as /home/anthony/projects/{hermes-vector-platform,Vector}.
+      # From hermes-vector-platform/bridge, ../../Vector is this workspace's Vector/.
       - uses: actions/checkout@v4
         with:
           path: hermes-vector-platform
       - uses: actions/checkout@v4
         with:
           repository: VectorPrivacy/Vector
+          ref: ccb7225d5738b0b289ecd90c8f1c528065c76174
           path: Vector
       - uses: dtolnay/rust-toolchain@stable
       - name: Test sidecar
         working-directory: hermes-vector-platform/bridge
-        run: cargo test
+        run: cargo test --locked
       - name: Build sidecar
         working-directory: hermes-vector-platform/bridge
-        run: cargo build --release
+        run: cargo build --release --locked
 
   pytest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install pytest
-        run: python3 -m pip install pytest
+      - name: Install Hermes + pytest
+        run: python3 -m pip install -e hermes-agent pytest
       - name: Plugin unit tests
+        env:
+          HERMES_AGENT_ROOT: ${{ github.workspace }}/hermes-agent
+          PYTHONPATH: ${{ github.workspace }}/hermes-agent
         run: python3 -m pytest tests/test_plugin_unit.py -q

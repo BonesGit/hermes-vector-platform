@@ -122,7 +122,7 @@ Without that override the plugin inherits Hermes' global `tool_progress: all` an
 
 ```bash
 cd hermes-vector-platform
-pytest -q            # needs Hermes on PYTHONPATH or ~/.hermes/hermes-agent
+pytest -q            # needs Hermes on PYTHONPATH, HERMES_AGENT_ROOT, or ~/.hermes/hermes-agent
 ```
 
 Tests load `adapter.py` as a free module and do **not** construct `Platform("vector")` — `_missing_()` only succeeds once the registry has the plugin.

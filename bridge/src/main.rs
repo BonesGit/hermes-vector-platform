@@ -1,22 +1,34 @@
-//! Identity bootstrap CLI for the Hermes Vector sidecar.
+//! Hermes Vector sidecar: identity CLI plus the localhost HTTP stub.
 //!
 //! `--check` / `--setup` read and write `<VECTOR_DATA_DIR>/identity.nsec` offline.
+//! With no flags, bind HTTP first (no VectorBot listen in this stub).
+
+mod api;
+mod events;
 
 use std::fs;
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use nostr::nips::nip06::FromMnemonic;
 use serde_json::json;
 use vector_sdk::nostr::{FromBech32, Keys, SecretKey, ToBech32};
 use vector_sdk::VectorBot;
 
-const IDENTITY_FILE: &str = "identity.nsec";
+use crate::api::{router, stub_npub, AppState};
 
-fn main() -> ExitCode {
+const IDENTITY_FILE: &str = "identity.nsec";
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 8096;
+const DEFAULT_SSE_PING: Duration = Duration::from_secs(30);
+
+#[tokio::main]
+async fn main() -> ExitCode {
     harden_process();
-    match run(std::env::args().collect()) {
+    match run(std::env::args().collect()).await {
         Ok(code) => code,
         Err(err) => {
             err.write_stderr();
@@ -35,7 +47,7 @@ fn harden_process() {
 #[cfg(not(all(target_os = "linux", not(debug_assertions))))]
 fn harden_process() {}
 
-fn run(args: Vec<String>) -> Result<ExitCode, CliError> {
+async fn run(args: Vec<String>) -> Result<ExitCode, CliError> {
     match parse_args(&args)? {
         Mode::Help => {
             print_usage();
@@ -46,6 +58,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, CliError> {
             nsec_file,
             mnemonic_file,
         } => cmd_setup(&require_data_dir()?, nsec_file, mnemonic_file),
+        Mode::Serve => serve().await,
     }
 }
 
@@ -56,6 +69,7 @@ enum Mode {
         nsec_file: Option<PathBuf>,
         mnemonic_file: Option<PathBuf>,
     },
+    Serve,
 }
 
 fn parse_args(args: &[String]) -> Result<Mode, CliError> {
@@ -115,14 +129,21 @@ fn parse_args(args: &[String]) -> Result<Mode, CliError> {
             mnemonic_file,
         });
     }
-    Err(CliError::usage("specify --check or --setup"))
+    if nsec_file.is_some() || mnemonic_file.is_some() {
+        return Err(CliError::usage(
+            "--nsec-file/--mnemonic-file are only valid with --setup",
+        ));
+    }
+    Ok(Mode::Serve)
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: vector-bridge --check | --setup [--nsec-file PATH | --mnemonic-file PATH]\n\
+        "Usage: vector-bridge [--check | --setup [--nsec-file PATH | --mnemonic-file PATH]]\n\
          \n\
-         Identity is <VECTOR_DATA_DIR>/identity.nsec. VECTOR_DATA_DIR is required.\n\
+         No flags: bind VECTOR_BRIDGE_HOST:VECTOR_BRIDGE_PORT (default 127.0.0.1:8096).\n\
+         VECTOR_SIDECAR_TOKEN is required for the HTTP server; empty token exits 1.\n\
+         Identity CLI: <VECTOR_DATA_DIR>/identity.nsec (VECTOR_DATA_DIR required).\n\
          --check never creates an identity. --setup writes the file if missing."
     );
 }
@@ -272,10 +293,134 @@ fn print_json(value: serde_json::Value) {
     println!("{value}");
 }
 
+async fn serve() -> Result<ExitCode, CliError> {
+    let token = std::env::var("VECTOR_SIDECAR_TOKEN").unwrap_or_default();
+    if token.trim().is_empty() {
+        return Err(CliError::EmptyToken);
+    }
+
+    let host = env_or("VECTOR_BRIDGE_HOST", DEFAULT_HOST);
+    if !is_loopback(&host) {
+        eprintln!(
+            "[vector-bridge] warning: VECTOR_BRIDGE_HOST={host} is not loopback; \
+             LAN clients with the token can reach this sidecar"
+        );
+    }
+    let port: u16 = env_or("VECTOR_BRIDGE_PORT", &DEFAULT_PORT.to_string())
+        .parse()
+        .map_err(|_| CliError::Other("VECTOR_BRIDGE_PORT must be a port number".into()))?;
+
+    let ping_interval = parse_ms_env("VECTOR_SSE_PING_MS").unwrap_or(DEFAULT_SSE_PING);
+    let state = AppState::new(token, ping_interval);
+
+    let addr = format!("{host}:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| CliError::Other(format!("bind {addr}: {e}")))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    eprintln!("[vector-bridge] listening on {bound}");
+
+    if let Some(delay) = parse_ms_env("VECTOR_STUB_READY_AFTER_MS") {
+        let ready_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            ready_state.mark_ready(stub_npub()).await;
+        });
+    }
+
+    let watch_stdin = std::env::var("VECTOR_SIDECAR_WATCH_STDIN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let shutting_down = std::sync::Arc::new(tokio::sync::Notify::new());
+    let notify = shutting_down.clone();
+    let shutdown_state = state.clone();
+    let shutdown = async move {
+        wait_shutdown(watch_stdin).await;
+        shutdown_state.events().disconnect_all();
+        notify.notify_waiters();
+    };
+
+    let server = axum::serve(listener, router(state)).with_graceful_shutdown(shutdown);
+    tokio::select! {
+        result = server => {
+            result.map_err(|e| CliError::Other(e.to_string()))?;
+        }
+        _ = async {
+            shutting_down.notified().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        } => {}
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn wait_shutdown(watch_stdin: bool) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    let stdin_eof = async {
+        if watch_stdin {
+            use tokio::io::AsyncReadExt;
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 256];
+            loop {
+                match stdin.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+        _ = stdin_eof => {}
+    }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => v,
+        _ => default.to_string(),
+    }
+}
+
+fn parse_ms_env(key: &str) -> Option<Duration> {
+    let raw = std::env::var(key).ok()?;
+    let ms: u64 = raw.parse().ok()?;
+    Some(Duration::from_millis(ms))
+}
+
+fn is_loopback(host: &str) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 enum CliError {
     Usage(String),
     InvalidNsec,
     InvalidMnemonic,
+    EmptyToken,
     Io { path: PathBuf, source: io::Error },
     Other(String),
 }
@@ -309,6 +454,12 @@ impl CliError {
                         "error": "not a valid BIP-39 mnemonic",
                         "code": "invalid_mnemonic"
                     })
+                );
+            }
+            CliError::EmptyToken => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "vector-bridge: VECTOR_SIDECAR_TOKEN is empty; refusing to bind"
                 );
             }
             CliError::Usage(msg) => {

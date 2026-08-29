@@ -1,14 +1,9 @@
 """Vector platform adapter for Hermes Agent.
 
-Vector is a private encrypted messenger on Nostr (NIP-17 gift-wrapped DMs).
-Each user is identified by a bech32 ``npub1…`` public key.
+Registers the ``vector`` platform, npub helpers, and a ``BasePlatformAdapter``
+stub. Vector users are identified by a bech32 ``npub1…`` public key.
 
-This adapter is a HYBRID (Session topology, Photon token):
-- Process management: a Rust ``vector-bridge`` sidecar wrapping ``vector-sdk``.
-- HTTP/SSE transport on ``127.0.0.1`` with header ``X-Hermes-Sidecar-Token``.
-
-Sidecar spawn, HTTP, and interactive setup land in later PRs. This module
-registers the ``vector`` platform, npub helpers, and a stub adapter.
+Sidecar HTTP is not implemented.
 
 Required env vars / config.extra keys:
     VECTOR_NPUB           Bot public key (npub1…)
@@ -175,7 +170,7 @@ def _parse_npub_target(ref: str) -> Optional[tuple[str, Optional[str]]]:
 # ---------------------------------------------------------------------------
 
 class VectorAdapter(BasePlatformAdapter):
-    """Vector adapter stub. Sidecar spawn / HTTP land in later PRs."""
+    """Vector ``BasePlatformAdapter``. Sidecar HTTP is not implemented."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     supports_code_blocks = True
@@ -305,15 +300,15 @@ async def _standalone_send(
     force_document=False,
     caption=None,
 ):
-    """Out-of-process Vector delivery. Sidecar HTTP lands in a later PR."""
+    """Out-of-process Vector delivery. No sidecar HTTP yet."""
     return {"error": _NOT_WIRED}
 
 
 def interactive_setup() -> None:
-    """Placeholder until the setup-wizard PR. Does not mint identity."""
-    print("Vector setup lands in a later PR.")
+    """Does not mint identity or write env; setup is not wired."""
+    print("Vector setup is not wired.")
     print("Enable with: hermes plugins enable vector-platform")
-    print("Identity create/import and sidecar build are not wired yet.")
+    print("Identity create/import and sidecar build are not available.")
 
 
 def register(ctx) -> None:

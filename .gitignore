@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+*.log
+.DS_Store
+plugin-data/
+identity.nsec
+target/
+bridge/target/

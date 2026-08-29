@@ -1,0 +1,65 @@
+name: vector-platform
+label: Vector
+kind: platform
+version: 0.1.0
+description: >
+  Vector (vectorapp.io) gateway adapter for Hermes Agent.
+  Spawns a local Rust sidecar wrapping vector-sdk and relays
+  DMs over HTTP/SSE. The plugin is a first-class Vector bot
+  identity (its own nsec/npub), not an impersonation of a human.
+author: TBD
+requires_env:
+  - name: VECTOR_NPUB
+    description: "Bot public key (npub1…); written by hermes gateway setup"
+    prompt: "Vector bot npub"
+    url: "https://vectorapp.io"
+    password: false
+optional_env:
+  - name: VECTOR_NSEC
+    description: "Import-only. Setup copies this into sdk/identity.nsec; the sidecar never reads it. Delete from .env after setup."
+    prompt: "Vector nsec (import)"
+    password: true
+  - name: VECTOR_MNEMONIC
+    description: "12-word BIP-39 seed (NIP-06 import)"
+    prompt: "Mnemonic"
+    password: true
+  - name: VECTOR_ALLOWED_USERS
+    description: "Comma-separated npubs allowed to DM the bot"
+    prompt: "Allowed npubs"
+    password: false
+  - name: VECTOR_ALLOW_ALL_USERS
+    description: "Allow any Vector user (dev only)"
+    prompt: "Allow all users?"
+    password: false
+  - name: VECTOR_HOME_CHANNEL
+    description: "Operator npub for cron / notification delivery"
+    prompt: "Home npub"
+    password: false
+  - name: VECTOR_BOT_NAME
+    description: "Display name (default Hermes)"
+    prompt: "Bot display name"
+    password: false
+  - name: VECTOR_DATA_DIR
+    description: "Absolute path for Vector SDK data (default plugin-data/vector-platform/sdk)"
+    prompt: "Data dir"
+    password: false
+  - name: VECTOR_BRIDGE_PORT
+    description: "Local HTTP port for the Rust sidecar (default 8096)"
+    prompt: "Bridge port"
+    password: false
+  - name: VECTOR_BRIDGE_HOST
+    description: "Sidecar bind address (default 127.0.0.1). LAN bind is a risk even with the token."
+    prompt: "Bridge host"
+    password: false
+  - name: VECTOR_BRIDGE_BIN
+    description: "Absolute path to vector-bridge binary"
+    prompt: "Bridge binary"
+    password: false
+  - name: VECTOR_STARTUP_TIMEOUT
+    description: "Seconds to wait for sidecar /health status=ready (default 30)"
+    prompt: "Startup timeout"
+    password: false
+  - name: VECTOR_PAIRING
+    description: "on (default) = unknown npubs get a Hermes pairing code; off = drop them before handle_message"
+    prompt: "Pairing (on/off)"
+    password: false

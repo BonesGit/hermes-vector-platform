@@ -49,7 +49,6 @@ from gateway.platforms.base import (
     SendResult,
     cache_image_from_url,
 )
-from gateway.session import build_session_key
 
 logger = logging.getLogger("hermes_plugins.vector_platform.adapter")
 
@@ -511,6 +510,8 @@ class VectorAdapter(BasePlatformAdapter):
         self._health_task: Optional[asyncio.Task] = None
         self._sidecar_token: Optional[str] = None
         self._inbound_ids: OrderedDict[str, None] = OrderedDict()
+        # File-only saves waiting to be attached to the next text from that peer.
+        self._pending_inbox: Dict[str, List[Tuple[str, str]]] = {}
 
         logger.info(
             "Vector plugin v%s initialized: port=%d host=%s bot=%s",
@@ -1136,6 +1137,9 @@ class VectorAdapter(BasePlatformAdapter):
             if _sender_is_authorized(peer):
                 await self._ack_file_only(peer, saved)
                 await self._write_inbox_breadcrumb(source, saved)
+                self._pending_inbox[peer] = [
+                    (str(path), mime) for path, _att, mime in saved
+                ]
             elif _pairing_enabled():
                 event = MessageEvent(
                     text="(file attachment)",
@@ -1153,7 +1157,14 @@ class VectorAdapter(BasePlatformAdapter):
         if saved:
             media_urls = [str(path) for path, _att, _mime in saved]
             media_types = [mime for _path, _att, mime in saved]
-            msg_type = _message_type_for_mime(media_types[0]) if media_types else MessageType.DOCUMENT
+        elif not is_file:
+            pending = self._pending_inbox.pop(peer, [])
+            media_urls = [p for p, _m in pending]
+            media_types = [m for _p, m in pending]
+        if media_types:
+            msg_type = _message_type_for_mime(media_types[0])
+        if saved:
+            self._pending_inbox.pop(peer, None)
 
         event = MessageEvent(
             text=text,
@@ -1325,28 +1336,33 @@ class VectorAdapter(BasePlatformAdapter):
             logger.warning("Vector: failed to write inbox session breadcrumb", exc_info=True)
 
     def _append_session_breadcrumb(self, source, content: str) -> None:
+        """Write into the gateway SessionStore's real session_id, not the routing key."""
+        store = getattr(self, "_session_store", None)
+        if store is None or not hasattr(store, "get_or_create_session"):
+            logger.warning("Vector: session store unavailable for inbox breadcrumb")
+            return
+        entry = store.get_or_create_session(source, touch_activity=False)
+        session_id = getattr(entry, "session_id", None)
+        if not session_id:
+            logger.warning("Vector: session store returned no session_id for breadcrumb")
+            return
         runner = getattr(self, "gateway_runner", None)
         db = getattr(runner, "_session_db", None) if runner is not None else None
         inner = getattr(db, "_db", db) if db is not None else None
         if inner is None or not hasattr(inner, "append_message"):
-            logger.debug("Vector: session db unavailable for inbox breadcrumb")
+            logger.warning("Vector: session db unavailable for inbox breadcrumb")
             return
-        session_key = build_session_key(
-            source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=self._session_key_profile(source),
-        )
         ensure = getattr(inner, "ensure_session", None)
         if callable(ensure):
-            ensure(session_key, source="vector")
+            ensure(session_id, source="vector")
         inner.append_message(
-            session_key,
+            session_id,
             "user",
             content,
             display_kind="internal_notification",
             platform_message_id=getattr(source, "message_id", None),
         )
+        logger.info("Vector: inbox breadcrumb written to session %s", session_id)
 
     # ------------------------------------------------------------------
     # Health monitor / process death

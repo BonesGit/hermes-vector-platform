@@ -1986,6 +1986,91 @@ class TestInboundFiles:
         assert len(inbox_files) == 1
         assert (tmp_path / "files" / "index.jsonl").is_file()
 
+    def test_file_only_followup_text_attaches_pending_inbox(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        handled = []
+
+        async def capture(event):
+            handled.append(event)
+
+        async def fake_download(att, dest, *, author_npub):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"img")
+            return dest
+
+        async def fake_send(**kwargs):
+            return vector_adapter.SendResult(success=True, message_id="ack")
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        adapter._download_attachment = fake_download  # type: ignore[method-assign]
+        adapter.send = fake_send  # type: ignore[method-assign]
+        adapter._append_session_breadcrumb = lambda *a, **k: None  # type: ignore[method-assign]
+
+        att = {"id": "att3", "name": "pic.jpg", "extension": "jpg", "size": 3}
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB, "", msg_id="fo1", is_file=True, attachments=[att]
+                )
+            )
+        )
+        assert handled == []
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "what is that image?", msg_id="fo2")
+            )
+        )
+        assert len(handled) == 1
+        assert handled[0].text == "what is that image?"
+        assert handled[0].media_urls
+        assert handled[0].media_types[0].startswith("image/")
+        assert handled[0].message_type == vector_adapter.MessageType.PHOTO
+        assert adapter._pending_inbox.get(PEER_NPUB) in (None, [])
+
+    def test_breadcrumb_uses_session_store_id_not_routing_key(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        written = []
+
+        class _Entry:
+            session_id = "20260829_real_session"
+
+        class _Store:
+            def get_or_create_session(self, source, touch_activity=True):
+                written.append(("store", getattr(source, "chat_id", None), touch_activity))
+                return _Entry()
+
+        class _DB:
+            def ensure_session(self, session_id, source="unknown"):
+                written.append(("ensure", session_id, source))
+
+            def append_message(self, session_id, role, content, **kwargs):
+                written.append(("append", session_id, role, content[:40], kwargs.get("display_kind")))
+
+        class _Runner:
+            _session_db = _DB()
+
+        adapter._session_store = _Store()
+        adapter.gateway_runner = _Runner()
+        src = adapter.build_source(
+            chat_id=PEER_NPUB, chat_type="dm", user_id=PEER_NPUB, user_name="p"
+        )
+        adapter._append_session_breadcrumb(src, "[Vector inbox] saved pic.jpg")
+        kinds = [w[0] for w in written]
+        assert kinds == ["store", "ensure", "append"]
+        assert written[1][1] == "20260829_real_session"
+        assert written[2][1] == "20260829_real_session"
+        assert written[2][1].startswith("2026")
+        assert "agent:main:vector" not in written[2][1]
+
     def test_file_plus_caption_goes_to_agent(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
         monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)

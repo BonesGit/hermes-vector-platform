@@ -205,9 +205,23 @@ pub(crate) async fn handle_bot_event(
                 )
                 .await;
             }
+            if let Some(dir) = data_dir.map(Path::to_path_buf) {
+                let bot = bot.clone();
+                tokio::spawn(async move {
+                    crate::missed::ack_missed_while_down(&bot, &dir).await;
+                });
+            }
         }
         BotEvent::Message(msg) => {
             if let Some(data) = map_incoming(&msg) {
+                if let Some(dir) = data_dir {
+                    crate::missed::note_live(
+                        dir,
+                        &data.chat_id,
+                        data.at_ms.max(0) as u64,
+                        &data.id,
+                    );
+                }
                 state.events().publish(data.sse_item());
             }
         }

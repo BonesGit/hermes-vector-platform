@@ -75,3 +75,11 @@ optional_env:
     description: "on (default) = unknown npubs get a Hermes pairing code; off = drop them before handle_message"
     prompt: "Pairing (on/off)"
     password: false
+  - name: VECTOR_MISSED_REACT
+    description: "off = do not ❌ DMs received while the sidecar was down (default on)"
+    prompt: "React on missed DMs? (on/off)"
+    password: false
+  - name: VECTOR_MISSED_REACT_EMOJI
+    description: "Unicode emoji for missed-DM ack (default ❌). Sidecar only; not used unless VECTOR_MISSED_REACT is on."
+    prompt: "Missed-DM reaction emoji"
+    password: false

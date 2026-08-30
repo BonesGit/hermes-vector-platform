@@ -118,6 +118,8 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
 | `VECTOR_BRIDGE_BIN` | no | Absolute path to `vector-bridge` |
 | `VECTOR_STARTUP_TIMEOUT` | no | Seconds to wait for sidecar `/health status=ready` (default `25`). Must stay below `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` (Hermes default `30`); raise both if Vector login needs longer. |
 | `VECTOR_PAIRING` | no | `on` (default) = unknown npubs get a Hermes pairing code; `off` = drop them before `handle_message` |
+| `VECTOR_MISSED_REACT` | no | `off` to skip ❌ on DMs received while the sidecar was down (default on) |
+| `VECTOR_MISSED_REACT_EMOJI` | no | Override the missed-DM reaction (default ❌) |
 
 `VECTOR_SIDECAR_TOKEN` is generated at spawn time and is **not** a plugin.yaml env var. Never put nsec in the sidecar environment or in the plugin install tree.
 
@@ -214,7 +216,7 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 | Port 8096 in use | `ss -ltnp \| rg 8096` or set `VECTOR_BRIDGE_PORT`. A leftover `vector-bridge` is reaped on connect; a foreign process is a retryable fatal. |
 | Lost the bot / contacts don't recognize it | Back up `sdk/identity.nsec` offline. Replacing that file **is** a new bot (new npub, lost DMs). |
 | Sidecar is a stub / no live DMs | `VECTOR_STUB` must **not** be set in the gateway. Production `connect()` strips it. Only HTTP unit tests set it (binds without `VectorBot::build`). |
-| Missed DMs while the sidecar was down | v1 does **not** catch up. `sync_dms` ingests SQLite only and does not dispatch to Hermes. The peer retries. History catch-up is v1.1. |
+| Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `VECTOR_MISSED_REACT=off` disables. Reaction gaps and later work: [REACTION.md](REACTION.md). |
 | Cron `deliver=vector` fails | Gateway must be running. Cron reads `~/.hermes/runtime/vector-sidecar.json` (`0600`, port + token). |
 | Gateway / sidecar status | `hermes gateway status`; `~/.hermes/logs/vector-bridge.log`. Logger is `hermes_plugins.vector_platform.adapter`. |
 

@@ -853,6 +853,29 @@ class VectorAdapter(BasePlatformAdapter):
             logger.error("Vector: exception while sending: %s", e)
             return SendResult(success=False, error=str(e), retryable=False)
 
+    async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """React on a Vector DM (unicode emoji). Used by missed-ack and future acks."""
+        if not self._http_client or not (message_id or "").strip() or not (emoji or "").strip():
+            return False
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/react",
+                json={
+                    "to": chat_id,
+                    "message_id": message_id,
+                    "emoji": emoji,
+                },
+                headers=self._token_headers(),
+                timeout=10.0,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.debug("Vector: send_reaction failed: %s", e)
+            return False
+
+    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> None:
+        await self.send_reaction(chat_id, message_id, emoji)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         if not self._http_client:
             return

@@ -318,7 +318,7 @@ fn payload_over_64kib_is_413() {
 #[test]
 fn v1_1_routes_are_501() {
     let server = spawn_server(&[]);
-    for path in ["/react", "/block"] {
+    for path in ["/block"] {
         let (status, body) = post(&server, path, Some(&server.token), json!({}));
         assert_eq!(status, 501, "{path} {body}");
         assert_eq!(body["code"], "not_implemented", "{path}");
@@ -354,6 +354,34 @@ fn post_profile_rejects_relative_banner_path() {
     );
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["code"], "bad_request");
+}
+
+#[test]
+fn post_react_requires_message_id() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/react",
+        Some(&server.token),
+        json!({"to": VALID_NPUB, "emoji": "❌"}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+}
+
+#[test]
+fn post_react_stub_ok() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/react",
+        Some(&server.token),
+        json!({"to": VALID_NPUB, "message_id": "deadbeef", "emoji": "❌"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
 }
 
 #[test]

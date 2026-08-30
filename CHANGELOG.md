@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **only if at least one is set**. Blank/unset = no profile publish (no
   default name of `Hermes` on the wire). `POST /profile` accepts
   `name` / `about` / `avatar_path` / `banner_path`.
+- Missed DMs while the sidecar was down are **not** sent to the agent. After
+  Ready, allowlisted chats get an ❌ reaction on those messages (`POST /react`,
+  `Channel::react`). First boot seeds a cursor and does not react. Disable with
+  `VECTOR_MISSED_REACT=off`.
 
 ### Changed
 

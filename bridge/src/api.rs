@@ -127,7 +127,7 @@ pub fn router(state: AppState) -> Router {
         .route("/send", post(send))
         .route("/typing", post(typing))
         .route("/profile", post(profile).get(not_implemented))
-        .route("/react", post(not_implemented))
+        .route("/react", post(react))
         .route("/send-file", post(send_file))
         .route("/download-attachment", post(download_attachment))
         .route("/block", post(not_implemented))
@@ -352,6 +352,41 @@ async fn typing(
             eprintln!("[vector-bridge] typing failed: {err}");
             ApiError::internal()
         })?;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ReactRequest {
+    to: String,
+    message_id: String,
+    #[serde(default)]
+    emoji: String,
+}
+
+async fn react(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<ReactRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let npub = parse_npub(&req.to)?;
+    let message_id = req.message_id.trim();
+    if message_id.is_empty() {
+        return Err(ApiError::bad_request("message_id is required"));
+    }
+    let emoji = req.emoji.trim();
+    if emoji.is_empty() {
+        return Err(ApiError::bad_request("emoji is required"));
+    }
+    state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        bot.dm(&npub)
+            .react(message_id, emoji)
+            .await
+            .map_err(|err| {
+                eprintln!("[vector-bridge] react failed: {err}");
+                ApiError::internal()
+            })?;
     }
     Ok(Json(json!({ "ok": true })))
 }

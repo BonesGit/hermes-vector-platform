@@ -631,7 +631,7 @@ Home channel: `VECTOR_HOME_CHANNEL` = operator npub. Cron `deliver=vector` + `cr
 - DM text in and out, threaded replies, typing. **Live** inbound only (process up).
 - Allowlist + pairing + home channel + cron delivery.
 - Sidecar lifecycle, `X-Hermes-Sidecar-Token`, stdin parent-death, lock, tests, README.
-- Documented gap: DMs received while the sidecar is down are not dispatched; the peer must retry.
+- Documented gap: DMs received while the sidecar is down are not dispatched to the agent. After Ready, allowlisted peers get an ❌ reaction on those messages (no Hermes turn). First boot seeds `sdk/missed-seen.json` and does not react.
 
 **v1.1 — media, polish, catch-up**
 

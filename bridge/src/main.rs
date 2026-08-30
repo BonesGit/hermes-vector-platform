@@ -6,6 +6,7 @@
 
 mod api;
 mod events;
+mod missed;
 mod profile;
 
 use std::fs;

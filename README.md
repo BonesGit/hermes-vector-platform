@@ -55,7 +55,7 @@ Entry point group: `hermes_agent.plugins` → `vector-platform = adapter:registe
 ## Prerequisites
 
 - Hermes Agent with the platform plugin registry (current `main`)
-- Rust **≥ 1.75** (`cargo`, `rustc`) and a sibling [Vector](https://github.com/VectorPrivacy/Vector) checkout so `bridge/Cargo.toml`'s `../../Vector/crates/vector-sdk` path resolves
+- Rust **≥ 1.75** (`cargo`, `rustc`). The sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk) `=0.9.0` (the last publish whose git SHA is on [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector) `master`). No local Vector checkout.
 - A Vector bot identity created or imported by `hermes gateway setup` (writes `sdk/identity.nsec`, mode `0600`)
 
 ## Architecture

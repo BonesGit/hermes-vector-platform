@@ -5,17 +5,17 @@
 | **Title** | Hermes Vector Platform: a first-class Vector bot identity for the Hermes gateway |
 | **Author** | TBD |
 | **Date** | 2026-08-28 |
-| **Status** | Draft (revised 2026-08-28) |
-| **Workspace** | `/home/anthony/projects/hermes-vector-platform` (empty; new project) |
+| **Status** | Draft (revised 2026-08-29) |
+| **Workspace** | `/home/anthony/projects/hermes-vector-platform` |
 | **Hermes install** | `/home/anthony/.hermes/hermes-agent` (also `/home/anthony/projects/hermes-agent`) |
-| **Vector source** | `/home/anthony/projects/Vector` ([VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector)) |
+| **Vector SDK** | crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk) `=0.9.0` (`vector-core` `0.8`). Publish SHA `b9aeb8d5` is on [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector) `master`. crates.io `0.10.0` (SHA `7bf7d335`) is **not** on that remote and is not used. |
 | **Closest prior art** | `/home/anthony/projects/hermes-session-platform` (installed at `~/.hermes/plugins/session-platform`) |
 
 ---
 
 ## Overview
 
-Hermes Agent already talks to people through Telegram, Discord, Session, Signal, and a growing set of *plugin* messaging adapters. Vector is a private encrypted messenger on Nostr (NIP-17 gift-wrapped DMs, Concord communities) with a first-class **Rust bot SDK** (`vector-sdk` 0.9.0 locally; `VectorBot` in `crates/vector-sdk/src/lib.rs`). There is **no Python SDK** in the Vector tree (verified: the only "python" hits in Vector are MIME mappings in `crates/vector-core/src/crypto/mod.rs`).
+Hermes Agent already talks to people through Telegram, Discord, Session, Signal, and a growing set of *plugin* messaging adapters. Vector is a private encrypted messenger on Nostr (NIP-17 gift-wrapped DMs, Concord communities) with a first-class **Rust bot SDK** (`vector_sdk` `=0.9.0` on crates.io; `VectorBot`). There is **no Python SDK** in the Vector tree (verified: the only "python" hits in Vector are MIME mappings in `crates/vector-core/src/crypto/mod.rs`).
 
 This document specifies a **user-installable Hermes platform plugin** (`kind: platform`) that gives Hermes **its own Vector identity** — a bot/agent npub that can DM other Vector users. The plugin is a first-class Vector participant, not a human impersonation layer. The recommended architecture is the same production shape as Session and Photon: a **Python `BasePlatformAdapter` that owns a native sidecar process**, except the sidecar is **Rust wrapping `vector-sdk`**, not Node wrapping a desktop library.
 
@@ -70,7 +70,7 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 - Tor (`vector_sdk` `tor` feature + `builder.tor()`). Document as v2.
 - Impersonating a human Vector account as the primary mode. Importing an existing nsec is supported for recovery, not as "Hermes logs in as you."
 - In-tree Hermes platform (`Platform.VECTOR` enum member, `toolsets.py` edits). Plugin auto-toolset `hermes-vector` already covers this (`toolsets.py` `resolve_toolset`, `hermes-<name>` branch).
-- Publishing the sidecar (or `vector-sdk`) to crates.io in v1 (path dep on the local Vector tree is enough).
+- Publishing the sidecar itself to crates.io in v1 (consumes crates.io `vector_sdk` `=0.9.0`).
 - Using `vector-agent` (MCP over stdio) as the Hermes transport.
 - Attaching to a running Vector desktop / another live `VectorBot` (one identity per process; no SDK attach API).
 - Dispatching DMs that arrived **while the sidecar process was down**. `sync_dms` / `Channel::history` ingest SQLite only; they do not re-fire `on_event`. v1 documents this; v1.1 may add an explicit history walk.
@@ -88,11 +88,11 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 | D3 | **DM session key = peer npub.** `chat_id = user_id = npub1…`, `chat_type = "dm"`. Hermes `build_session_key` then isolates each peer automatically. | `IncomingMessage.chat_id` for DMs *is* the sender npub (`vector-sdk` `BotEvent` docs). Same mapping Session uses (Session ID as `chat_id`). |
 | D4 | **Default-deny allowlist at the adapter/gateway layer**, not Vector SDK `whitelist()`. Pairing codes enabled (`VECTOR_PAIRING` default on). | SDK whitelist only gates **community invites** (`InvitePolicy`). DMs would otherwise be open to any npub that can gift-wrap to the bot. Hermes `_is_user_authorized` already default-denies. |
 | D5 | **v1 is DM text + typing + profile (`bot: true`) only.** Communities, files, reactions, slash commands, Tor, and catch-up of DMs missed while the sidecar was down are sequenced later. | Smallest path that satisfies "the plugin has its own npub and can chat with another Vector user." |
-| D6 | **Sidecar is a first-class crate in this repo** (`bridge/`), depending on `vector-sdk` via a **relative path** `../../Vector/crates/vector-sdk` (from `bridge/Cargo.toml`). That matches this operator (`/home/anthony/projects/{hermes-vector-platform,Vector}`) **and** CI sibling checkouts. Do not fork Vector. Do not use a git dep on `VectorPrivacy/Vector` — that repo has **no root `Cargo.toml`** (workspace is `crates/Cargo.toml`); Cargo git deps will not resolve. Do not use an absolute `/home/anthony/...` path (GitHub runners will not have it). Vector's workspace `[patch.crates-io]` for `nostr` does **not** inherit; consumers get stock `nostr` (vector-core README). There is **no plugin-root Cargo workspace** — the build command is `cd bridge && cargo build --release`, not `cargo build -p vector-bridge` from the repo root. Public tag later: crates.io, a vendored `crates/`, or a git repo that actually has a workspace at root. | Local tree is crate `0.9.0`; SDK README still documents `"0.3"`. Relative path is what both this machine and CI can compile. |
+| D6 | **Sidecar is a first-class crate in this repo** (`bridge/`), depending on crates.io **`vector_sdk = "=0.9.0"`** (crate name uses an underscore; pulls `vector-core` `0.8`). Exact pin — do not take crates.io `0.10.0`. Do not fork Vector. Do **not** use a git dep on `VectorPrivacy/Vector` — that repo has **no root `Cargo.toml`** (workspace is `crates/Cargo.toml`); Cargo git deps will not resolve. Do not use a sibling path `../../Vector/crates/vector-sdk` (operators and CI should not need a Vector checkout). Vector's workspace `[patch.crates-io]` for `nostr` does **not** inherit; consumers get stock `nostr` (vector-core README). There is **no plugin-root Cargo workspace** — the build command is `cd bridge && cargo build --release`, not `cargo build -p vector-bridge` from the repo root. | crates.io `0.9.0` publish SHA `b9aeb8d5` is an ancestor of GitHub `master`. crates.io `0.10.0` (2026-08-26, SHA `7bf7d335`) is **not** on that remote — treat as unpublished source and do not consume it. SDK README still documents `"0.3"`. |
 | D7 | **Bind `127.0.0.1` + header `X-Hermes-Sidecar-Token` on every route including `/health`.** Cron `standalone_sender_fn` reads a 0600 runtime record for port+token (Photon pattern). No `Authorization: Bearer`. Optional unauthenticated `/live` returns `{ok:true}` only. | Session's unauthenticated localhost bind was a real CVE-class bug (CHANGELOG: previously listened on `::`). Photon's header is `X-Hermes-Sidecar-Token` (`plugins/platforms/photon/sidecar/index.mjs`). One string everywhere. |
 | D8 | **Do not use `vector-agent` MCP as the adapter.** | MCP is a tool server (`crates/vector-agent/src/main.rs` + `tools.rs`) that buffers inbound DMs for `get_new_messages`. Hermes gateway needs push (`handle_message`) plus `send()`. Wrong inversion of control. |
 | D9 | **User plugin, not bundled.** `kind: platform` user plugins in `~/.hermes/plugins/` are gated by `plugins.enabled` (`hermes_cli/plugins.py` PluginManifest docs). Install = clone + enable + `hermes gateway setup`. Directory plugins **must** ship `__init__.py` exposing `register(ctx)` (Session pattern). | Session was declined in-tree (PR #6948, third-party product policy). Same shape. |
-| D10 | **v1 builds the sidecar during `hermes gateway setup` (`cargo build --release` in `bridge/`).** No prebuilt binaries. `ensure_deps_fn` does **not** compile; it returns False + install hint. `check_fn` stays side-effect free. | Hermes calls `ensure_deps_fn` from `create_adapter()` at gateway start. A multi-minute `vector-sdk` compile would blow `VECTOR_STARTUP_TIMEOUT` and systemd limits. Session installs Node deps in `interactive_setup`, not `ensure_deps_fn`. This operator has rustc and the Vector tree. Prebuilts are v1.1. |
+| D10 | **v1 builds the sidecar during `hermes gateway setup` (`cargo build --release` in `bridge/`).** No prebuilt binaries. `ensure_deps_fn` does **not** compile; it returns False + install hint. `check_fn` stays side-effect free. | Hermes calls `ensure_deps_fn` from `create_adapter()` at gateway start. A multi-minute `vector_sdk` compile would blow `VECTOR_STARTUP_TIMEOUT` and systemd limits. Session installs Node deps in `interactive_setup`, not `ensure_deps_fn`. This operator has rustc. Prebuilts are v1.1. |
 | D11 | **Unattended start. No `VECTOR_PASSWORD` / PIN in v1.** Headless `build()` without `.password()`. | Argon2id is 150MB / 10 iterations (`crypto::hash_pass`). A PIN would block `hermes gateway start`. Encrypted-at-rest nsec is v1.1. |
 | D12 | **Setup writes `display.platforms.vector.tool_progress: off` (and `interim_assistant_messages: false`) into the operator `config.yaml`.** There is no `display.platform_tool_progress` key. Resolution is `display.platforms.<platform>.tool_progress` → global `display.tool_progress` → `_PLATFORM_DEFAULTS` → `_GLOBAL_DEFAULTS["tool_progress"] = "all"` (`gateway/display_config.py`). `"vector"` is absent from `_PLATFORM_DEFAULTS` (adding it is a Hermes-core patch — a non-goal). A user plugin therefore inherits **`all`** unless setup writes the YAML override. Signal/Photon `_TIER_LOW` analog. Flip only when `/edit` ships (v1.1). | Vector *can* edit (`Channel::edit`); v1 has no `/edit` route. Without the override, Hermes posts a new Vector DM per tool event. |
 | D13 | **Normalize npubs with `PublicKey::parse` (Rust sidecar) and `normalize_npub()` (Python, in `adapter.py`).** Python copies Buzz stdlib bech32 (`hex_to_npub` / `npub_to_hex` in `plugins/platforms/buzz/adapter.py`, charset `qpzry9x8gf2tvdw0s3jn54khce6mua7l`, 32-byte payload) plus strip `nostr:` / whitespace. Persist canonical `npub1…`. No Python crypto package. Do not use a loose `npub1[0-9a-z]{58,}` regex. Sidecar `/send` still re-validates with `PublicKey::parse`. **`parse_target_ref_fn` is `_parse_npub_target`**, which wraps `normalize_npub()` and returns `Optional[tuple[str, Optional[str]]]` (`(npub, None)`); never register `normalize_npub` as the hook (Hermes rejects a bare string). | Same approach as `VectorBotBuilder::whitelist` (`PublicKey::parse` + `to_bech32`). Buzz already ships a stdlib codec; Session adds no nostr pip dep. `PlatformEntry.parse_target_ref_fn` is a `(chat_id, thread_id)` tuple (`gateway/platform_registry.py`). |
@@ -174,9 +174,9 @@ sequenceDiagram
   LICENSE
   CHANGELOG.md
   tests/test_plugin_unit.py
-  .github/workflows/ci.yml    # sibling Vector checkout; cd bridge && cargo build --release; pytest
+  .github/workflows/ci.yml    # cd bridge && cargo test/build --locked; pytest
   bridge/
-    Cargo.toml                # vector_sdk path = ../../Vector/crates/vector-sdk
+    Cargo.toml                # vector_sdk = "=0.9.0" (crates.io)
     src/main.rs               # CLI + axum server + VectorBot task
     src/api.rs                # request/response types, auth, errors
     src/events.rs             # single-client SSE from BotEvent
@@ -931,7 +931,7 @@ Do not emit Vector relay URLs containing auth, nsecs, or full env dumps.
 
 This is a **new plugin repo**, not a Hermes flag. Rollout is the operator's install:
 
-1. **Build sidecar** with `cd bridge && cargo build --release` (no plugin-root workspace; `-p vector-bridge` from the repo root **fails**). CI on ubuntu-x64 checkouts this repo and `VectorPrivacy/Vector` as siblings so `../../Vector/crates/vector-sdk` resolves.
+1. **Build sidecar** with `cd bridge && cargo build --release` (no plugin-root workspace; `-p vector-bridge` from the repo root **fails**). CI on ubuntu-x64 checkouts this repo only; `vector_sdk` comes from crates.io.
 2. **Unit tests** (`pytest`) without network: path helpers, allowlist parsing, npub target parse, env enablement, token header, port helper.
 3. **Sidecar smoke** against a throwaway data dir: `--setup` then `--check` returns the same npub.
 4. **Live DM** (manual): allowlist the operator npub; send a Vector DM; confirm Hermes replies.
@@ -943,23 +943,16 @@ This is a **new plugin repo**, not a Hermes flag. Rollout is the operator's inst
 
 **Rollback:** `hermes plugins disable vector-platform && hermes gateway restart`. Identity on disk is untouched. To destroy the bot, delete `plugin-data/vector-platform/` (irreversible without `identity.nsec` backup).
 
-**Version pin (v1):** relative path from `bridge/Cargo.toml`. Vector's git repo has **no root `Cargo.toml`** (workspace is `crates/Cargo.toml`), so `vector_sdk = { git = "https://github.com/VectorPrivacy/Vector", ... }` will not resolve. An absolute `/home/anthony/projects/Vector/...` path compiles here and **fails on GitHub-hosted runners**. Local crate is `0.9.0`; README still documents `"0.3"`. Workspace `[patch.crates-io]` for `nostr` does **not** inherit (vector-core README: consumers get stock `nostr`).
+**Version pin:** crates.io `vector_sdk = "=0.9.0"` in `bridge/Cargo.toml` (exact; will not float to `0.10`). Vector's git repo has **no root `Cargo.toml`** (workspace is `crates/Cargo.toml`), so `vector_sdk = { git = "https://github.com/VectorPrivacy/Vector", ... }` will not resolve. A sibling path `../../Vector/crates/vector-sdk` forced CI to checkout Vector. crates.io `0.10.0` is not on GitHub `master` (publish SHA `7bf7d335`); do not consume it. Workspace `[patch.crates-io]` for `nostr` does **not** inherit (vector-core README: consumers get stock `nostr`).
 
 ```toml
-# bridge/Cargo.toml — portable for this operator AND CI
+# bridge/Cargo.toml
 [dependencies]
-vector_sdk = { path = "../../Vector/crates/vector-sdk" }
+vector_sdk = "=0.9.0"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-# vector-core comes along via vector-sdk's path dep
+# vector-core 0.8 comes along via vector_sdk
 ```
-
-Layouts that make `../../Vector` resolve:
-
-| Context | Plugin repo | Vector checkout |
-| --- | --- | --- |
-| This operator | `/home/anthony/projects/hermes-vector-platform` | `/home/anthony/projects/Vector` |
-| GitHub Actions | `${{ github.workspace }}/hermes-vector-platform` | `${{ github.workspace }}/Vector` (`VectorPrivacy/Vector`) |
 
 CI sketch:
 
@@ -970,13 +963,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { path: hermes-vector-platform }
-      - uses: actions/checkout@v4
-        with: { repository: VectorPrivacy/Vector, path: Vector }
       - uses: dtolnay/rust-toolchain@stable
+      - name: Test sidecar
+        working-directory: bridge
+        run: cargo test --locked
       - name: Build sidecar
-        working-directory: hermes-vector-platform/bridge
-        run: cargo build --release
+        working-directory: bridge
+        run: cargo build --release --locked
   pytest:
     runs-on: ubuntu-latest
     steps:
@@ -984,15 +977,13 @@ jobs:
       - run: pytest -q
 ```
 
-Public plugin tag (later): crates.io once versions reconcile, vendor `crates/`, or consume a git remote that actually has a workspace `Cargo.toml` at the repository root. Resolve before any public release; do not block PR 2 on crates.io.
-
 ---
 
 ## Open Questions
 
 Resolved into Key Decisions (not re-litigated in PR 5):
 
-- ~~crates.io vs git pin~~ → **D6**: v1 relative path `../../Vector/crates/vector-sdk` from `bridge/`; CI sibling checkout. Public tag later. crates.io contents still unverified (external).
+- ~~crates.io vs git pin~~ → **D6**: crates.io `vector_sdk = "=0.9.0"`; no Vector checkout. Reject crates.io `0.10.0` (publish SHA not on GitHub).
 - ~~Prebuilt binaries~~ → **D10**: `cd bridge && cargo build --release` during `setup_fn` only; prebuilts v1.1.
 - ~~Encrypted-at-rest nsec~~ → **D11**: no PIN in v1; unattended start.
 - ~~Tool progress~~ → **D12**: setup writes `display.platforms.vector.tool_progress: off` (real Hermes key).
@@ -1002,9 +993,9 @@ Resolved into Key Decisions (not re-litigated in PR 5):
 - ~~Profile `about`~~ → **D14**: empty string; display name default `Hermes`; `bot: true` from SDK. No `"Hermes Agent"`, no hostname / `HERMES_HOME`.
 - ~~Relay set~~ → **D15**: SDK `TRUSTED_RELAYS` only. No `VECTOR_RELAYS` in v1.
 
-Still deferred (not needed before PR 2):
+Still deferred:
 
-1. **crates.io version at public tag time.** Local `0.9.0` vs README `"0.3"` — probe crates.io before the first GitHub release, not before PR 2.
+1. **GitHub Vector `master` vs crates.io.** Pin stays `=0.9.0` until a newer crates.io version's `.cargo_vcs_info.json` SHA is on Vector `master`. Do not take `0.10.0` as-is.
 
 ---
 
@@ -1014,7 +1005,7 @@ Still deferred (not needed before PR 2):
 | --- | --- | --- |
 | `vector-core` global state accidentally initialized twice (tests, double spawn) | High | One sidecar process; Python never links vector-core. Tests mock HTTP. |
 | Setup `cargo build` takes minutes and fails without rustc | Medium | `check_fn` does not build. `setup_fn` explains. v1.1 prebuilts. |
-| SDK API drift (0.3 docs vs 0.9 code) | Medium | Code against the cloned tree (`/home/anthony/projects/Vector/crates/vector-sdk/src/lib.rs`), relative path-dep `../../Vector/crates/vector-sdk`, run `echo_bot` once as a sanity check. |
+| SDK API drift (README `"0.3"` vs crates.io `0.9`) | Medium | Exact-pin `vector_sdk = "=0.9.0"` (git-known publish); `cargo test --locked` in CI. Reject crates.io versions whose vcs SHA is not on Vector `master`. |
 | Relay outage looks like "Hermes is down" | Low | SDK reconnects **relays** while the process is up; `/health` stays ready. DMs that arrived while the **sidecar process** was down are **not** dispatched in v1 (peer retries). Do not document process-down DMs as store-and-forward into Hermes. |
 | Two npubs from split identity paths | Critical (closed) | One `VECTOR_DATA_DIR`; SDK owns `identity.nsec` inside it (D2). |
 | Operator allowlists nobody and wonders why pairing codes appear | Low | Setup **requires** the operator npub as first allowed user (Session does this). |
@@ -1091,9 +1082,9 @@ Incremental, independently reviewable PRs against `/home/anthony/projects/hermes
 ### PR 2 — Rust sidecar crate: identity CLI + CI
 
 - **Title:** `feat(bridge): vector-bridge identity bootstrap + CI`
-- **Files:** `bridge/Cargo.toml` (`vector_sdk = { path = "../../Vector/crates/vector-sdk" }`), `bridge/src/main.rs` (CLI `--setup`/`--check`/`--nsec-file`/`--mnemonic-file` only — no HTTP, **no** `VectorBot::build()`), `bridge/.gitignore`, `.github/workflows/ci.yml` (sibling checkouts + `cd bridge && cargo build --release`; pytest)
+- **Files:** `bridge/Cargo.toml` (`vector_sdk = "=0.9.0"` from crates.io), `bridge/src/main.rs` (CLI `--setup`/`--check`/`--nsec-file`/`--mnemonic-file` only — no HTTP, **no** `VectorBot::build()`), `bridge/.gitignore`, `.github/workflows/ci.yml` (`cd bridge && cargo test/build --locked`; pytest)
 - **Depends on:** PR 1
-- **Description:** `VECTOR_DATA_DIR` is the SDK `data_dir`; identity is `<data_dir>/identity.nsec` (`0600`). `--check` is offline: missing/empty file → `not_registered`; else `SecretKey::from_bech32` → npub; **never mints**. `--setup` writes the file itself (`generate_nsec` / copy nsec-file / mnemonic derive). Never print nsec; never read nsec from env. Linux release: `prctl(PR_SET_DUMPABLE, 0)`. Manual test: `--check` on empty dir is `not_registered`; `--setup` then `--check` returns the same npub. CI checkouts `VectorPrivacy/Vector` to sibling `Vector/` so the relative path resolves.
+- **Description:** `VECTOR_DATA_DIR` is the SDK `data_dir`; identity is `<data_dir>/identity.nsec` (`0600`). `--check` is offline: missing/empty file → `not_registered`; else `SecretKey::from_bech32` → npub; **never mints**. `--setup` writes the file itself (`generate_nsec` / copy nsec-file / mnemonic derive). Never print nsec; never read nsec from env. Linux release: `prctl(PR_SET_DUMPABLE, 0)`. Manual test: `--check` on empty dir is `not_registered`; `--setup` then `--check` returns the same npub. CI does not checkout Vector.
 
 ### PR 3a — HTTP stub (no Vector listen)
 

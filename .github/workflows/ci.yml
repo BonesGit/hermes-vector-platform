@@ -8,21 +8,13 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      # From hermes-vector-platform/bridge, ../../Vector is this workspace's Vector/.
       - uses: actions/checkout@v4
-        with:
-          path: hermes-vector-platform
-      - uses: actions/checkout@v4
-        with:
-          repository: VectorPrivacy/Vector
-          ref: ccb7225d5738b0b289ecd90c8f1c528065c76174
-          path: Vector
       - uses: dtolnay/rust-toolchain@stable
       - name: Test sidecar
-        working-directory: hermes-vector-platform/bridge
+        working-directory: bridge
         run: cargo test --locked
       - name: Build sidecar
-        working-directory: hermes-vector-platform/bridge
+        working-directory: bridge
         run: cargo build --release --locked
 
   pytest:

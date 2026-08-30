@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk)
+  `=0.9.0` (and `vector-core` `0.8`) instead of a sibling
+  `../../Vector/crates/vector-sdk` path. GitHub Actions no longer checkouts
+  [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector). Exact pin:
+  crates.io `0.10.0` was published from git SHA `7bf7d335`, which is not on
+  Vector `master`; `0.9.0` was published from `b9aeb8d5`, which is.
+
 ## [0.2.0] — 2026-08-29
 
 Encrypted file attachments (Vector Blossom) in both directions.
@@ -51,8 +60,8 @@ missed while the sidecar was down is **not** in v1 — the peer retries.
 ### Notes
 
 - Requires Hermes Agent with the platform plugin registry (current `main`)
-- Requires Rust ≥ 1.75 and a sibling [Vector](https://github.com/VectorPrivacy/Vector)
-  checkout so `bridge/Cargo.toml`'s `../../Vector/crates/vector-sdk` path resolves
+- Requires Rust ≥ 1.75. Sidecar now depends on crates.io `vector_sdk` `=0.9.0`
+  (see Unreleased); v0.1.0 originally needed a sibling Vector checkout.
 - User plugins must be enabled: `hermes plugins enable vector-platform`
 - Sidecar binds `127.0.0.1:8096` by default; every route except `/live` needs
   the token. Do not set `VECTOR_STUB` in the gateway.

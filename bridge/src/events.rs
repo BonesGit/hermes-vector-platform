@@ -1,6 +1,7 @@
 //! Single-client last-writer-wins SSE (`GET /events`) from `BotEvent`.
 
 use std::convert::Infallible;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
@@ -178,12 +179,31 @@ pub(crate) async fn handle_bot_event(
     bot: &VectorBot,
     event: BotEvent,
     bot_name: &str,
+    bot_about: &str,
+    avatar_path: Option<&Path>,
+    banner_path: Option<&Path>,
+    data_dir: Option<&Path>,
 ) {
     match event {
         BotEvent::Ready { .. } => {
             state.mark_ready(bot.npub()).await;
-            if !bot.update_profile(bot_name, "", "", "").await {
-                eprintln!("[vector-bridge] sidecar-boot update_profile failed");
+            // Opt-in public kind-0: only publish when the operator set a
+            // name, about, avatar, and/or banner. Empty strings do *not*
+            // wipe a prior kind-0 (SDK merge); skipping is the private path.
+            if !bot_name.trim().is_empty()
+                || !bot_about.trim().is_empty()
+                || avatar_path.is_some()
+                || banner_path.is_some()
+            {
+                crate::profile::apply_own_profile(
+                    bot,
+                    bot_name,
+                    bot_about,
+                    avatar_path,
+                    banner_path,
+                    data_dir,
+                )
+                .await;
             }
         }
         BotEvent::Message(msg) => {

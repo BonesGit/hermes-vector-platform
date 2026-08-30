@@ -318,15 +318,56 @@ fn payload_over_64kib_is_413() {
 #[test]
 fn v1_1_routes_are_501() {
     let server = spawn_server(&[]);
-    for path in ["/react", "/block", "/profile"] {
-        let (status, body) = if path == "/profile" {
-            get(&server, "/profile?npub=npub1abc", Some(&server.token))
-        } else {
-            post(&server, path, Some(&server.token), json!({}))
-        };
+    for path in ["/react", "/block"] {
+        let (status, body) = post(&server, path, Some(&server.token), json!({}));
         assert_eq!(status, 501, "{path} {body}");
         assert_eq!(body["code"], "not_implemented", "{path}");
     }
+    let (status, body) = get(&server, "/profile?npub=npub1abc", Some(&server.token));
+    assert_eq!(status, 501, "{body}");
+    assert_eq!(body["code"], "not_implemented");
+}
+
+#[test]
+fn post_profile_rejects_relative_avatar_path() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/profile",
+        Some(&server.token),
+        json!({"name": "Hermes", "avatar_path": "relative.png"}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+}
+
+#[test]
+fn post_profile_rejects_relative_banner_path() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/profile",
+        Some(&server.token),
+        json!({"banner_path": "relative.png"}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+}
+
+#[test]
+fn post_profile_name_only_is_ok_in_stub() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/profile",
+        Some(&server.token),
+        json!({"name": "Hermes"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
 }
 
 #[test]

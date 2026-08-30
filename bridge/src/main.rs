@@ -6,6 +6,7 @@
 
 mod api;
 mod events;
+mod profile;
 
 use std::fs;
 use std::io::{self, Write};
@@ -361,7 +362,23 @@ fn spawn_vector_bot(state: AppState, data_dir: PathBuf, stop_tx: watch::Sender<S
         {
             Ok(bot) => {
                 state.set_bot(bot.clone()).await;
-                let bot_name = env_or("VECTOR_BOT_NAME", "Hermes");
+                // Unset name/about/avatar/banner = do not publish a public kind-0 card.
+                let bot_name = std::env::var("VECTOR_BOT_NAME")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let bot_about = std::env::var("VECTOR_BOT_ABOUT")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let env_image = |key: &str| {
+                    std::env::var(key)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                };
+                let avatar_path = env_image("VECTOR_BOT_AVATAR");
+                let banner_path = env_image("VECTOR_BOT_BANNER");
+                let profile_dir = data_dir.clone();
                 let listen_state = state.clone();
                 let handler_state = listen_state.clone();
                 tokio::spawn(async move {
@@ -369,8 +386,22 @@ fn spawn_vector_bot(state: AppState, data_dir: PathBuf, stop_tx: watch::Sender<S
                         .on_event(move |b, event| {
                             let state = handler_state.clone();
                             let bot_name = bot_name.clone();
+                            let bot_about = bot_about.clone();
+                            let avatar_path = avatar_path.clone();
+                            let banner_path = banner_path.clone();
+                            let profile_dir = profile_dir.clone();
                             async move {
-                                events::handle_bot_event(&state, &b, event, &bot_name).await;
+                                events::handle_bot_event(
+                                    &state,
+                                    &b,
+                                    event,
+                                    &bot_name,
+                                    &bot_about,
+                                    avatar_path.as_deref(),
+                                    banner_path.as_deref(),
+                                    Some(profile_dir.as_path()),
+                                )
+                                .await;
                             }
                         })
                         .await;

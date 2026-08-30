@@ -96,7 +96,7 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 | D11 | **Unattended start. No `VECTOR_PASSWORD` / PIN in v1.** Headless `build()` without `.password()`. | Argon2id is 150MB / 10 iterations (`crypto::hash_pass`). A PIN would block `hermes gateway start`. Encrypted-at-rest nsec is v1.1. |
 | D12 | **Setup writes `display.platforms.vector.tool_progress: off` (and `interim_assistant_messages: false`) into the operator `config.yaml`.** There is no `display.platform_tool_progress` key. Resolution is `display.platforms.<platform>.tool_progress` → global `display.tool_progress` → `_PLATFORM_DEFAULTS` → `_GLOBAL_DEFAULTS["tool_progress"] = "all"` (`gateway/display_config.py`). `"vector"` is absent from `_PLATFORM_DEFAULTS` (adding it is a Hermes-core patch — a non-goal). A user plugin therefore inherits **`all`** unless setup writes the YAML override. Signal/Photon `_TIER_LOW` analog. Flip only when `/edit` ships (v1.1). | Vector *can* edit (`Channel::edit`); v1 has no `/edit` route. Without the override, Hermes posts a new Vector DM per tool event. |
 | D13 | **Normalize npubs with `PublicKey::parse` (Rust sidecar) and `normalize_npub()` (Python, in `adapter.py`).** Python copies Buzz stdlib bech32 (`hex_to_npub` / `npub_to_hex` in `plugins/platforms/buzz/adapter.py`, charset `qpzry9x8gf2tvdw0s3jn54khce6mua7l`, 32-byte payload) plus strip `nostr:` / whitespace. Persist canonical `npub1…`. No Python crypto package. Do not use a loose `npub1[0-9a-z]{58,}` regex. Sidecar `/send` still re-validates with `PublicKey::parse`. **`parse_target_ref_fn` is `_parse_npub_target`**, which wraps `normalize_npub()` and returns `Optional[tuple[str, Optional[str]]]` (`(npub, None)`); never register `normalize_npub` as the hook (Hermes rejects a bare string). | Same approach as `VectorBotBuilder::whitelist` (`PublicKey::parse` + `to_bech32`). Buzz already ships a stdlib codec; Session adds no nostr pip dep. `PlatformEntry.parse_target_ref_fn` is a `(chat_id, thread_id)` tuple (`gateway/platform_registry.py`). |
-| D14 | **Profile `about` is empty.** Sidecar-boot `update_profile(VECTOR_BOT_NAME, "", "", "")` — display name default `Hermes`, avatar/banner empty, about `""`. Vector still tags `bot: true` via `update_bot_profile`. Do not use `"Hermes Agent"`. Do not leak hostname or `HERMES_HOME`. | Operator decision 2026-08-28. Kind-0 `about` is public. |
+| D14 | **Public kind-0 is opt-in.** Sidecar-boot calls `update_profile` **only** when `VECTOR_BOT_NAME`, `VECTOR_BOT_ABOUT`, `VECTOR_BOT_AVATAR`, and/or `VECTOR_BOT_BANNER` is set. Unset/blank = do not publish (no default name `Hermes` on the wire). When publishing: name/about from env; avatar/banner from `upload_image` public Blossom URLs or previously published URLs; `bot: true`. Empty strings passed to the SDK **merge** (they keep prior kind-0 fields); they do not wipe a card already on relays. NIP-24 extras (`display_name`, `website`, `nip05`, `lud16`) are not settable via Vector `update_profile`. Do not use `"Hermes Agent"`. Do not leak hostname or `HERMES_HOME`. | Operator decision 2026-08-28 / 2026-08-30 (opt-in kind-0). Kind-0 is public. |
 | D15 | **v1 uses SDK `state::TRUSTED_RELAYS` only.** No `VECTOR_RELAYS` env or builder override. Relays: `wss://jskitty.com/nostr`, `wss://asia.vectorapp.io/nostr`, `wss://nostr.computingcache.com`, `wss://relay.ditto.pub` (`vector-core/src/state.rs`). | Operator decision 2026-08-28. A custom relay list is a later knob if those endpoints are unreachable. |
 
 ---
@@ -303,7 +303,7 @@ sequenceDiagram
     HTTP->>Listen: tokio::spawn(on_event)
     Listen->>HTTP: BotEvent::Ready
     HTTP->>HTTP: /health → {status:"ready", npub}
-    HTTP->>Listen: update_profile(VECTOR_BOT_NAME, "", "", "") once (sidecar-boot)
+    HTTP->>Listen: update_profile(VECTOR_BOT_NAME, avatar_or_existing, "", "") once (sidecar-boot)
     Note over Listen: if listen() returns: graceful HTTP shutdown, process exit
   end
 ```
@@ -315,7 +315,7 @@ Rules:
 3. Run `build().await` on a task. Login failure → non-zero exit (Python `_handle_bridge_exit` / retryable fatal).
 4. Spawn `on_event` as a **background** task. When `listen()` returns, shut down the axum server and exit the process. Do not leave a zombie HTTP listener.
 5. Flip `/health` to `{status:"ready", npub}` only on `BotEvent::Ready`.
-6. **`update_profile` is sidecar-boot** (D14): `update_profile(&bot_name, "", "", "")` with `VECTOR_BOT_NAME` default `Hermes`, empty avatar/banner/**about**. SDK still tags `bot: true`. Python `POST /profile` is for a later rename only — do not call it from `connect()` in v1 (avoids a race with Ready).
+6. **`update_profile` is sidecar-boot and opt-in** (D14): called only when `VECTOR_BOT_NAME`, `VECTOR_BOT_ABOUT`, `VECTOR_BOT_AVATAR`, and/or `VECTOR_BOT_BANNER` is set. SDK still tags `bot: true` when we do publish. Python `POST /profile` is optional; do not call it from `connect()` (avoids a race with Ready).
 7. Stdin EOF (`VECTOR_SIDECAR_WATCH_STDIN=1`) triggers the same graceful shutdown as `listen()` return.
 
 #### Auth
@@ -336,7 +336,7 @@ Every route **except** `GET /live` requires header `X-Hermes-Sidecar-Token: <tok
 | GET | `/events` | token | SSE | see below |
 | POST | `/send` | token | `{to, body, reply_to?}` | `{id}` or 400/503 |
 | POST | `/typing` | token | `{to}` | `{ok: true}` |
-| POST | `/profile` | token | `{name, about}` | `{ok: true}` — `update_profile` (forces `bot: true`) |
+| POST | `/profile` | token | `{name?, about?, avatar_path?, banner_path?}` | `{ok: true}` — `update_profile` (forces `bot: true`). Image paths are absolute local files; omitted keeps the published picture/banner. `GET /profile` (peer fetch) stays 501. |
 
 v1.1 additions (stub the routes in v1, return `501` `{error, code:"not_implemented"}`): `/react`, `/send-file`, `/download-attachment`, `/block`, **`GET /profile?npub=`** (`VectorBot::fetch_profile` → `{name, about, …}`; used by `get_chat_info`). There is **no** profile-fetch route in v1 — `POST /profile` is self-rename only.
 

@@ -36,8 +36,20 @@ optional_env:
     prompt: "Home npub"
     password: false
   - name: VECTOR_BOT_NAME
-    description: "Display name (default Hermes)"
-    prompt: "Bot display name"
+    description: "Optional public display name (Nostr kind-0). Blank = do not publish a profile name."
+    prompt: "Bot display name (optional, public)"
+    password: false
+  - name: VECTOR_BOT_ABOUT
+    description: "Optional public about/bio text (Nostr kind-0). Blank = do not publish about."
+    prompt: "Bot about text (optional, public)"
+    password: false
+  - name: VECTOR_BOT_AVATAR
+    description: "Optional public avatar (jpg/png/webp/gif → Blossom URL in kind-0). Blank = do not publish a picture."
+    prompt: "Bot avatar image path (optional, public)"
+    password: false
+  - name: VECTOR_BOT_BANNER
+    description: "Optional public banner (jpg/png/webp/gif → Blossom URL in kind-0). Blank = do not publish a banner."
+    prompt: "Bot banner image path (optional, public)"
     password: false
   - name: VECTOR_DATA_DIR
     description: "Absolute path for Vector SDK data (default plugin-data/vector-platform/sdk)"

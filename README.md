@@ -38,7 +38,7 @@ Setup will:
 2. Run `--check` (read-only) against `VECTOR_DATA_DIR` (default `plugin-data/vector-platform/sdk`).
 3. Create a new nsec, or import via a temp `0600` `--nsec-file` / `--mnemonic-file` (never put the secret in the sidecar env).
 4. Require **your** Vector npub (`hex` / `npub1` / `nostr:npub1`) as `VECTOR_HOME_CHANNEL` and the first `VECTOR_ALLOWED_USERS` entry.
-5. Save `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, `VECTOR_ALLOWED_USERS`, `VECTOR_DATA_DIR`. **Do not** save nsec to `.env`.
+5. Save `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, `VECTOR_ALLOWED_USERS`, `VECTOR_DATA_DIR`, and optional public `VECTOR_BOT_NAME` / `VECTOR_BOT_ABOUT` / `VECTOR_BOT_AVATAR` / `VECTOR_BOT_BANNER`. **Do not** save nsec to `.env`.
 6. Merge `display.platforms.vector` into `~/.hermes/config.yaml` (see below).
 
 Share the bot npub with contacts. Back up `sdk/identity.nsec` offline — replacing it **is** a new bot. Restart the gateway.
@@ -108,7 +108,10 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
 | `VECTOR_ALLOWED_USERS` | recommended | Comma-separated npubs allowed to DM the bot |
 | `VECTOR_ALLOW_ALL_USERS` | no | Dev-only open access (dangerous) |
 | `VECTOR_HOME_CHANNEL` | for cron | Operator npub for cron / notification delivery |
-| `VECTOR_BOT_NAME` | no | Display name (default `Hermes`) |
+| `VECTOR_BOT_NAME` | no | Optional **public** display name (Nostr kind-0). Unset/blank = do not publish a name. There is no default of `Hermes` on the wire. |
+| `VECTOR_BOT_ABOUT` | no | Optional **public** about/bio (kind-0 `about`). Unset/blank = do not publish about. |
+| `VECTOR_BOT_AVATAR` | no | Optional **public** avatar (`picture`). Setup copies a jpg/png/webp/gif to `sdk/avatar.<ext>`; sidecar uploads to Blossom. Unset = do not publish a picture. |
+| `VECTOR_BOT_BANNER` | no | Optional **public** banner. Same as avatar; copied to `sdk/banner.<ext>`. Unset = do not publish a banner. |
 | `VECTOR_DATA_DIR` | no | Absolute path for Vector SDK data (default `plugin-data/vector-platform/sdk`) |
 | `VECTOR_BRIDGE_PORT` | no | Local HTTP port for the Rust sidecar (default `8096`) |
 | `VECTOR_BRIDGE_HOST` | no | Sidecar bind address (default `127.0.0.1`). LAN bind is a risk even with the token. |

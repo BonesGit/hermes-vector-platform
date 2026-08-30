@@ -67,7 +67,7 @@ DEFAULT_BRIDGE_HOST = "127.0.0.1"
 # HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT above it.
 DEFAULT_STARTUP_TIMEOUT = 25
 MAX_MESSAGE_LENGTH = 4000
-DEFAULT_BOT_NAME = "Hermes"
+AVATAR_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MIN_RUSTC = (1, 75)
 CARGO_BUILD_TIMEOUT = 900
 BRIDGE_CHECK_TIMEOUT = 30
@@ -120,6 +120,46 @@ def resolve_files_root() -> Path:
         except Exception:
             home = Path.home() / ".hermes"
         return Path(home) / "plugin-data" / "vector-platform" / "files"
+
+
+def validate_bot_image_src(src: str) -> Path:
+    """Resolve a local image path; raise ValueError if it cannot be used."""
+    path = Path(src).expanduser()
+    if not path.is_absolute():
+        path = path.resolve()
+    if not path.is_file():
+        raise ValueError(f"not a file: {path}")
+    suffix = path.suffix.lower()
+    if suffix not in AVATAR_SUFFIXES:
+        raise ValueError("image must be jpg, png, webp, or gif")
+    return path
+
+
+def install_bot_image(src: str, data_dir: Path, stem: str) -> Path:
+    """Copy a local image into VECTOR_DATA_DIR as ``{stem}.<ext>``.
+
+    Kind-0 pictures/banners are public (Blossom, not gift-wrap). The copy is
+    durable so setup can take a file from Downloads without depending on that
+    path later.
+    """
+    if stem not in ("avatar", "banner"):
+        raise ValueError("stem must be avatar or banner")
+    path = validate_bot_image_src(src)
+    suffix = path.suffix.lower()
+    dest_suffix = ".jpg" if suffix == ".jpeg" else suffix
+    dest = Path(data_dir) / f"{stem}{dest_suffix}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if path.resolve() != dest.resolve():
+        shutil.copy2(path, dest)
+    return dest
+
+
+def validate_bot_avatar_src(src: str) -> Path:
+    return validate_bot_image_src(src)
+
+
+def install_bot_avatar(src: str, data_dir: Path) -> Path:
+    return install_bot_image(src, data_dir, "avatar")
 
 
 def _sanitize_filename(name: str, fallback: str = "file") -> str:
@@ -494,7 +534,20 @@ class VectorAdapter(BasePlatformAdapter):
             or os.getenv("VECTOR_BRIDGE_HOST")
             or DEFAULT_BRIDGE_HOST
         )
-        self.bot_name: str = extra.get("bot_name") or os.getenv("VECTOR_BOT_NAME") or DEFAULT_BOT_NAME
+        self.bot_name: str = (
+            extra.get("bot_name") or os.getenv("VECTOR_BOT_NAME") or ""
+        ).strip()
+        self.bot_about: str = (
+            extra.get("bot_about") or os.getenv("VECTOR_BOT_ABOUT") or ""
+        ).strip()
+        raw_avatar = (
+            extra.get("bot_avatar") or os.getenv("VECTOR_BOT_AVATAR") or ""
+        ).strip()
+        self.bot_avatar: Optional[Path] = Path(raw_avatar).expanduser() if raw_avatar else None
+        raw_banner = (
+            extra.get("bot_banner") or os.getenv("VECTOR_BOT_BANNER") or ""
+        ).strip()
+        self.bot_banner: Optional[Path] = Path(raw_banner).expanduser() if raw_banner else None
         self.startup_timeout: int = int(
             extra.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
         )
@@ -1430,9 +1483,30 @@ class VectorAdapter(BasePlatformAdapter):
             "VECTOR_BRIDGE_PORT": str(self.bridge_port),
             "VECTOR_BRIDGE_HOST": self.bridge_host,
             "VECTOR_SIDECAR_TOKEN": self._sidecar_token or "",
-            "VECTOR_BOT_NAME": self.bot_name,
             "VECTOR_SIDECAR_WATCH_STDIN": "1",
         }
+        env.pop("VECTOR_BOT_NAME", None)
+        env.pop("VECTOR_BOT_ABOUT", None)
+        env.pop("VECTOR_BOT_AVATAR", None)
+        env.pop("VECTOR_BOT_BANNER", None)
+        if self.bot_name:
+            env["VECTOR_BOT_NAME"] = self.bot_name
+        if self.bot_about:
+            env["VECTOR_BOT_ABOUT"] = self.bot_about
+        if self.bot_avatar and self.bot_avatar.is_file():
+            env["VECTOR_BOT_AVATAR"] = str(self.bot_avatar.resolve())
+        elif self.bot_avatar:
+            logger.warning(
+                "Vector: VECTOR_BOT_AVATAR is not a file (%s); not publishing an avatar",
+                self.bot_avatar,
+            )
+        if self.bot_banner and self.bot_banner.is_file():
+            env["VECTOR_BOT_BANNER"] = str(self.bot_banner.resolve())
+        elif self.bot_banner:
+            logger.warning(
+                "Vector: VECTOR_BOT_BANNER is not a file (%s); not publishing a banner",
+                self.bot_banner,
+            )
         env.pop("VECTOR_NSEC", None)
         env.pop("VECTOR_MNEMONIC", None)
         env.pop("VECTOR_STUB", None)
@@ -1602,7 +1676,6 @@ def _env_enablement():
         return None
     seed = {
         "npub": npub,
-        "bot_name": os.getenv("VECTOR_BOT_NAME") or DEFAULT_BOT_NAME,
         "data_dir": str(resolve_data_dir()),
         "bridge_port": os.getenv("VECTOR_BRIDGE_PORT") or str(DEFAULT_BRIDGE_PORT),
         "bridge_host": os.getenv("VECTOR_BRIDGE_HOST") or DEFAULT_BRIDGE_HOST,
@@ -1614,6 +1687,18 @@ def _env_enablement():
             "chat_id": normalize_npub(home) or home,
             "name": os.getenv("VECTOR_HOME_CHANNEL_NAME") or "Home",
         }
+    bot_name = (os.getenv("VECTOR_BOT_NAME") or "").strip()
+    if bot_name:
+        seed["bot_name"] = bot_name
+    bot_about = (os.getenv("VECTOR_BOT_ABOUT") or "").strip()
+    if bot_about:
+        seed["bot_about"] = bot_about
+    avatar = (os.getenv("VECTOR_BOT_AVATAR") or "").strip()
+    if avatar:
+        seed["bot_avatar"] = avatar
+    banner = (os.getenv("VECTOR_BOT_BANNER") or "").strip()
+    if banner:
+        seed["bot_banner"] = banner
     return seed
 
 
@@ -2391,10 +2476,61 @@ def _run_interactive_setup(io) -> None:
                 return
             import_kind = "mnemonic"
 
-    bot_name = io.prompt(
-        "Bot display name",
-        default=io.get_env_value("VECTOR_BOT_NAME") or DEFAULT_BOT_NAME,
-    ) or DEFAULT_BOT_NAME
+    io.print_info(
+        "Name, about, avatar, and banner are public Nostr kind-0 metadata: "
+        "anyone who has the bot npub can fetch them from relays. Leave them "
+        "blank to publish no profile card."
+    )
+    bot_name = (
+        io.prompt(
+            "Bot display name (optional, public; blank = do not publish)",
+            default=io.get_env_value("VECTOR_BOT_NAME") or None,
+        )
+        or ""
+    ).strip()
+    bot_about = (
+        io.prompt(
+            "Bot about text (optional, public; blank = do not publish)",
+            default=io.get_env_value("VECTOR_BOT_ABOUT") or None,
+        )
+        or ""
+    ).strip()
+
+    current_avatar = (io.get_env_value("VECTOR_BOT_AVATAR") or "").strip()
+    if current_avatar:
+        io.print_info(f"Current bot avatar: {current_avatar}")
+    avatar_raw = (
+        io.prompt(
+            "Bot avatar image path (jpg/png/webp/gif; blank keeps current)",
+            default=None,
+        )
+        or ""
+    ).strip()
+    pending_avatar: Optional[str] = None
+    if avatar_raw:
+        try:
+            pending_avatar = str(validate_bot_image_src(avatar_raw))
+        except ValueError as e:
+            io.print_error(f"Avatar not installed: {e}")
+            io.print_info("Continuing without changing the avatar.")
+
+    current_banner = (io.get_env_value("VECTOR_BOT_BANNER") or "").strip()
+    if current_banner:
+        io.print_info(f"Current bot banner: {current_banner}")
+    banner_raw = (
+        io.prompt(
+            "Bot banner image path (jpg/png/webp/gif; blank keeps current)",
+            default=None,
+        )
+        or ""
+    ).strip()
+    pending_banner: Optional[str] = None
+    if banner_raw:
+        try:
+            pending_banner = str(validate_bot_image_src(banner_raw))
+        except ValueError as e:
+            io.print_error(f"Banner not installed: {e}")
+            io.print_info("Continuing without changing the banner.")
 
     io.print_info("Enter YOUR Vector npub (hex / npub1 / nostr:npub1).")
     io.print_info("This is who the bot will DM and who is allowed to message it.")
@@ -2470,6 +2606,19 @@ def _run_interactive_setup(io) -> None:
     existing_allowed = io.get_env_value("VECTOR_ALLOWED_USERS") or ""
     io.save_env_value("VECTOR_NPUB", bot_npub)
     io.save_env_value("VECTOR_BOT_NAME", bot_name)
+    io.save_env_value("VECTOR_BOT_ABOUT", bot_about)
+    if pending_avatar:
+        try:
+            installed = install_bot_image(pending_avatar, data_dir, "avatar")
+            io.save_env_value("VECTOR_BOT_AVATAR", str(installed))
+        except ValueError as e:
+            io.print_error(f"Avatar not installed: {e}")
+    if pending_banner:
+        try:
+            installed = install_bot_image(pending_banner, data_dir, "banner")
+            io.save_env_value("VECTOR_BOT_BANNER", str(installed))
+        except ValueError as e:
+            io.print_error(f"Banner not installed: {e}")
     io.save_env_value("VECTOR_DATA_DIR", str(data_dir))
     io.save_env_value("VECTOR_HOME_CHANNEL", operator_npub)
     io.save_env_value(

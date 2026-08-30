@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional public bot profile (Vector `update_profile` / kind-0 `name`,
+  `about`, `picture`, `banner`): `VECTOR_BOT_NAME`, `VECTOR_BOT_ABOUT`,
+  `VECTOR_BOT_AVATAR`, `VECTOR_BOT_BANNER`. Setup copies images to
+  `sdk/avatar.<ext>` / `sdk/banner.<ext>`. On Ready the sidecar publishes
+  **only if at least one is set**. Blank/unset = no profile publish (no
+  default name of `Hermes` on the wire). `POST /profile` accepts
+  `name` / `about` / `avatar_path` / `banner_path`.
+
 ### Changed
 
 - Sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk)

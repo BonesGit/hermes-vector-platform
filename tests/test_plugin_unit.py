@@ -199,6 +199,9 @@ class TestEnvEnablement:
         monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
         monkeypatch.delenv("VECTOR_BOT_NAME", raising=False)
         monkeypatch.delenv("VECTOR_BRIDGE_HOST", raising=False)
+        monkeypatch.delenv("VECTOR_BOT_AVATAR", raising=False)
+        monkeypatch.delenv("VECTOR_BOT_ABOUT", raising=False)
+        monkeypatch.delenv("VECTOR_BOT_BANNER", raising=False)
         seed = vector_adapter._env_enablement()
         assert seed is not None
         assert seed["npub"] == NPUB
@@ -206,6 +209,9 @@ class TestEnvEnablement:
         assert seed["bridge_host"] == "127.0.0.1"
         assert "data_dir" in seed
         assert "home_channel" not in seed
+        assert "bot_avatar" not in seed
+        assert "bot_about" not in seed
+        assert "bot_banner" not in seed
 
     def test_home_channel_seeded(self, monkeypatch):
         monkeypatch.setenv("VECTOR_NPUB", NPUB)
@@ -214,6 +220,58 @@ class TestEnvEnablement:
         seed = vector_adapter._env_enablement()
         assert seed["home_channel"]["chat_id"] == NPUB
         assert seed["home_channel"]["name"] == "Me"
+
+    def test_seeds_bot_avatar(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_NPUB", NPUB)
+        monkeypatch.setenv("VECTOR_BOT_AVATAR", "/abs/avatar.png")
+        seed = vector_adapter._env_enablement()
+        assert seed["bot_avatar"] == "/abs/avatar.png"
+
+    def test_seeds_bot_about(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_NPUB", NPUB)
+        monkeypatch.setenv("VECTOR_BOT_ABOUT", "A Vector bot")
+        seed = vector_adapter._env_enablement()
+        assert seed["bot_about"] == "A Vector bot"
+
+    def test_seeds_bot_banner(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_NPUB", NPUB)
+        monkeypatch.setenv("VECTOR_BOT_BANNER", "/abs/banner.png")
+        seed = vector_adapter._env_enablement()
+        assert seed["bot_banner"] == "/abs/banner.png"
+
+
+class TestInstallBotAvatar:
+    def test_copies_png_to_data_dir(self, tmp_path):
+        src = tmp_path / "face.PNG"
+        src.write_bytes(b"png-bytes")
+        dest = vector_adapter.install_bot_avatar(str(src), tmp_path / "sdk")
+        assert dest == tmp_path / "sdk" / "avatar.png"
+        assert dest.read_bytes() == b"png-bytes"
+
+    def test_copies_banner(self, tmp_path):
+        src = tmp_path / "wide.png"
+        src.write_bytes(b"banner")
+        dest = vector_adapter.install_bot_image(str(src), tmp_path / "sdk", "banner")
+        assert dest == tmp_path / "sdk" / "banner.png"
+        assert dest.read_bytes() == b"banner"
+
+    def test_rejects_non_image(self, tmp_path):
+        src = tmp_path / "notes.txt"
+        src.write_text("nope")
+        try:
+            vector_adapter.install_bot_avatar(str(src), tmp_path / "sdk")
+        except ValueError as e:
+            assert "jpg" in str(e)
+        else:
+            raise AssertionError("expected ValueError")
+
+    def test_rejects_missing_file(self, tmp_path):
+        try:
+            vector_adapter.validate_bot_avatar_src(str(tmp_path / "missing.png"))
+        except ValueError as e:
+            assert "not a file" in str(e)
+        else:
+            raise AssertionError("expected ValueError")
 
 
 class TestValidateConfig:
@@ -486,6 +544,14 @@ def _make_adapter(monkeypatch, tmp_path, **extra):
         vector_adapter, "bridge_port_is_listening", lambda *_a, **_k: False
     )
 
+    if not extra.get("bot_name"):
+        monkeypatch.delenv("VECTOR_BOT_NAME", raising=False)
+    if not extra.get("bot_about"):
+        monkeypatch.delenv("VECTOR_BOT_ABOUT", raising=False)
+    if not extra.get("bot_avatar"):
+        monkeypatch.delenv("VECTOR_BOT_AVATAR", raising=False)
+    if not extra.get("bot_banner"):
+        monkeypatch.delenv("VECTOR_BOT_BANNER", raising=False)
     data_dir = Path(extra.get("data_dir") or (tmp_path / "sdk"))
     data_dir.mkdir(parents=True, exist_ok=True)
     if not extra.get("skip_identity"):
@@ -498,10 +564,17 @@ def _make_adapter(monkeypatch, tmp_path, **extra):
         "npub": extra.get("npub", NPUB),
         "bridge_port": extra.get("bridge_port", 18096),
         "bridge_host": extra.get("bridge_host", "127.0.0.1"),
-        "bot_name": extra.get("bot_name", "Hermes"),
         "startup_timeout": extra.get("startup_timeout", 5),
         "data_dir": str(data_dir),
     }
+    if extra.get("bot_name"):
+        cfg.extra["bot_name"] = extra["bot_name"]
+    if extra.get("bot_about"):
+        cfg.extra["bot_about"] = extra["bot_about"]
+    if extra.get("bot_avatar"):
+        cfg.extra["bot_avatar"] = extra["bot_avatar"]
+    if extra.get("bot_banner"):
+        cfg.extra["bot_banner"] = extra["bot_banner"]
     return vector_adapter.VectorAdapter(cfg)
 
 
@@ -685,13 +758,76 @@ class TestSpawnEnv:
         assert env["VECTOR_SIDECAR_TOKEN"] == adapter._sidecar_token
         assert env["VECTOR_SIDECAR_WATCH_STDIN"] == "1"
         assert env["VECTOR_BRIDGE_PORT"] == str(adapter.bridge_port)
-        assert env["VECTOR_BOT_NAME"] == "Hermes"
+        assert "VECTOR_BOT_NAME" not in env
+        assert "VECTOR_BOT_ABOUT" not in env
+        assert "VECTOR_BOT_AVATAR" not in env
+        assert "VECTOR_BOT_BANNER" not in env
         assert "VECTOR_NSEC" not in env
         assert "VECTOR_MNEMONIC" not in env
         assert "VECTOR_STUB" not in env
         if sys.platform != "win32":
             assert kwargs.get("start_new_session") is True
             assert "preexec_fn" not in kwargs
+        adapter._close_bridge_log()
+
+    def test_spawn_passes_name_when_set(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, bot_name="Ada")
+        adapter._sidecar_token = "tok" + "ab" * 30
+        captured: dict = {}
+
+        def fake_popen(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeBridgeProc()
+
+        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        adapter._spawn_bridge()
+        assert captured["kwargs"]["env"]["VECTOR_BOT_NAME"] == "Ada"
+        adapter._close_bridge_log()
+
+    def test_spawn_passes_about_when_set(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, bot_about="kind-0 bio")
+        adapter._sidecar_token = "tok" + "ab" * 30
+        captured: dict = {}
+
+        def fake_popen(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeBridgeProc()
+
+        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        adapter._spawn_bridge()
+        assert captured["kwargs"]["env"]["VECTOR_BOT_ABOUT"] == "kind-0 bio"
+        adapter._close_bridge_log()
+
+    def test_spawn_passes_avatar_when_file_exists(self, monkeypatch, tmp_path):
+        pic = tmp_path / "face.png"
+        pic.write_bytes(b"png")
+        adapter = _make_adapter(monkeypatch, tmp_path, bot_avatar=str(pic))
+        adapter._sidecar_token = "tok" + "ab" * 30
+        captured: dict = {}
+
+        def fake_popen(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeBridgeProc()
+
+        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        adapter._spawn_bridge()
+        assert captured["kwargs"]["env"]["VECTOR_BOT_AVATAR"] == str(pic.resolve())
+        adapter._close_bridge_log()
+
+    def test_spawn_passes_banner_when_file_exists(self, monkeypatch, tmp_path):
+        pic = tmp_path / "banner.png"
+        pic.write_bytes(b"png")
+        adapter = _make_adapter(monkeypatch, tmp_path, bot_banner=str(pic))
+        adapter._sidecar_token = "tok" + "ab" * 30
+        captured: dict = {}
+
+        def fake_popen(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeBridgeProc()
+
+        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        adapter._spawn_bridge()
+        assert captured["kwargs"]["env"]["VECTOR_BOT_BANNER"] == str(pic.resolve())
         adapter._close_bridge_log()
 
 
@@ -1533,6 +1669,7 @@ class TestInteractiveSetup:
         assert io.saved["VECTOR_ALLOWED_USERS"] == NPUB
         assert io.saved["VECTOR_PAIRING"] == "on"
         assert io.saved["VECTOR_BOT_NAME"] == "Hermes"
+        assert io.saved["VECTOR_BOT_ABOUT"] == ""
         assert "VECTOR_NSEC" not in io.saved
         assert cli_calls[0] == ["--check"]
         assert cli_calls[1] == ["--setup"]
@@ -1540,6 +1677,49 @@ class TestInteractiveSetup:
         assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "off"
         assert cfg["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
         assert any("Share this npub" in m for m in io.logs["info"])
+
+    def test_setup_copies_avatar_into_data_dir(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        data_dir = tmp_path / "sdk"
+        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        src = tmp_path / "me.jpg"
+        src.write_bytes(b"jpeg")
+
+        def fake_cli(_bin, _data, args, timeout=60):
+            if "--check" in args:
+                return {"status": "not_registered"}, 0, ""
+            if "--setup" in args:
+                return {"status": "created", "npub": NPUB}, 0, ""
+            return None, 1, "unexpected"
+
+        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        io = _fake_setup_io(
+            prompts={
+                "Identity [create / nsec / mnemonic]": "create",
+                "Bot display name": "Hermes",
+                "Bot about text": "Public bio",
+                "Bot avatar image path": str(src),
+                "Bot banner image path": str(src),
+                "Your Vector npub": HEX_PUBKEY,
+            },
+            yes_no={"Enable pairing codes": True},
+        )
+        vector_adapter._run_interactive_setup(io)
+        dest = data_dir / "avatar.jpg"
+        banner = data_dir / "banner.jpg"
+        assert dest.is_file()
+        assert dest.read_bytes() == b"jpeg"
+        assert banner.is_file()
+        assert banner.read_bytes() == b"jpeg"
+        assert io.saved["VECTOR_BOT_AVATAR"] == str(dest)
+        assert io.saved["VECTOR_BOT_BANNER"] == str(banner)
+        assert io.saved["VECTOR_BOT_NAME"] == "Hermes"
+        assert io.saved["VECTOR_BOT_ABOUT"] == "Public bio"
 
     def test_import_nsec_uses_temp_0600_file_not_env(self, monkeypatch, tmp_path):
         fake_bin = tmp_path / "vector-bridge"

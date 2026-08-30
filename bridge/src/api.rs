@@ -358,8 +358,28 @@ async fn typing(
 
 #[derive(Deserialize)]
 struct ProfileRequest {
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     about: String,
+    #[serde(default)]
+    avatar_path: Option<String>,
+    #[serde(default)]
+    banner_path: Option<String>,
+}
+
+fn optional_abs_file(
+    raw: Option<&str>,
+    bad: &'static str,
+) -> Result<Option<PathBuf>, ApiError> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(s);
+    if !path.is_absolute() || !path.is_file() {
+        return Err(ApiError::bad_request(bad));
+    }
+    Ok(Some(path))
 }
 
 async fn profile(
@@ -368,9 +388,29 @@ async fn profile(
     JsonBody(req): JsonBody<ProfileRequest>,
 ) -> Result<Json<Value>, ApiError> {
     state.require_ready().await?;
+    let avatar_path = optional_abs_file(
+        req.avatar_path.as_deref(),
+        "avatar_path must be an existing absolute file",
+    )?;
+    let banner_path = optional_abs_file(
+        req.banner_path.as_deref(),
+        "banner_path must be an existing absolute file",
+    )?;
+    let data_dir = std::env::var("VECTOR_DATA_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
     if let Some(bot) = state.bot().await {
-        if !bot.update_profile(&req.name, "", "", &req.about).await {
-            eprintln!("[vector-bridge] update_profile failed");
+        if !crate::profile::apply_own_profile(
+            &bot,
+            &req.name,
+            &req.about,
+            avatar_path.as_deref(),
+            banner_path.as_deref(),
+            data_dir.as_deref(),
+        )
+        .await
+        {
             return Err(ApiError::internal());
         }
     }

@@ -318,13 +318,7 @@ fn payload_over_64kib_is_413() {
 #[test]
 fn v1_1_routes_are_501() {
     let server = spawn_server(&[]);
-    for path in [
-        "/react",
-        "/send-file",
-        "/download-attachment",
-        "/block",
-        "/profile",
-    ] {
+    for path in ["/react", "/block", "/profile"] {
         let (status, body) = if path == "/profile" {
             get(&server, "/profile?npub=npub1abc", Some(&server.token))
         } else {
@@ -333,6 +327,61 @@ fn v1_1_routes_are_501() {
         assert_eq!(status, 501, "{path} {body}");
         assert_eq!(body["code"], "not_implemented", "{path}");
     }
+}
+
+#[test]
+fn send_file_stub_requires_absolute_file() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/send-file",
+        Some(&server.token),
+        json!({"to": VALID_NPUB, "path": "relative.bin"}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let (status, body) = post(
+        &server,
+        "/send-file",
+        Some(&server.token),
+        json!({"to": VALID_NPUB, "path": tmp.path().to_string_lossy()}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body["id"].as_str().unwrap().len() >= 8);
+}
+
+#[test]
+fn download_attachment_stub_writes_dest() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let dir = tempfile::TempDir::new().unwrap();
+    let dest = dir.path().join("inbox").join("notes.pdf");
+    let (status, body) = post(
+        &server,
+        "/download-attachment",
+        Some(&server.token),
+        json!({
+            "dest": dest.to_string_lossy(),
+            "author_npub": VALID_NPUB,
+            "attachment": {
+                "id": "att1",
+                "key": "",
+                "nonce": "",
+                "extension": "pdf",
+                "name": "notes.pdf",
+                "url": "",
+                "path": "",
+                "size": 1,
+                "downloading": false,
+                "downloaded": true
+            }
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(dest.is_file(), "stub should create dest");
 }
 
 #[test]

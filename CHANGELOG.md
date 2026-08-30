@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-29
+
+Encrypted file attachments (Vector Blossom) in both directions.
+
+### Added
+
+- Sidecar `POST /send-file` and `POST /download-attachment`; SSE includes
+  `attachments` and no longer drops caption-less file messages
+- Inbox: `plugin-data/vector-platform/files/inbox/{npub}/{YYYY-MM-DD}/` plus
+  `.meta.json` and `files/index.jsonl`
+- File-only (no caption): Vector ack, session breadcrumb (no AI turn)
+- File + caption: save then `handle_message` with `media_urls` (vision/STT/docs)
+- Outbound `send_image` / `send_document` / `send_video` / `send_voice` /
+  `send_animation` via `/send-file` (no outbox copies)
+
 ## [0.1.0] — 2026-08-29
 
 First release of the standalone Vector plugin for Hermes Agent. Ready for

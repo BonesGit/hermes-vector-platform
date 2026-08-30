@@ -141,6 +141,21 @@ There is no `display.platform_tool_progress` key. Without the YAML override the 
 
 `VECTOR_PAIRING=off` drops unauthorized senders in the adapter **before** `handle_message`, so pairing codes are not sent. Leave pairing **on** unless you want a closed allowlist with no CLI approve path.
 
+## Files / attachments
+
+Inbound files from allowlisted peers are decrypted into:
+
+```text
+~/.hermes/plugin-data/vector-platform/files/inbox/{npub}/{YYYY-MM-DD}/
+```
+
+A sibling `.meta.json` and an append-only `files/index.jsonl` record original name, size, mime, and Vector event id. **No outbox copies** — files Hermes sends you exist only on Vector.
+
+- **File, no caption:** saved, Vector ack (`saved notes.pdf`), and a session breadcrumb (so a later “process the pdf I sent” can see the path). The AI turn is **not** started.
+- **File + text:** saved, then a normal Hermes turn with `media_urls` (images → vision, voice → STT, documents → path note).
+
+Unauthorized senders are not downloaded. Hermes outbound media uses `POST /send-file` (`send_image` / `send_document` / video / voice). Caption is a follow-up text DM (Vector’s SDK `send_file` has no caption field).
+
 ## Cron delivery
 
 ```text

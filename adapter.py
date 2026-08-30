@@ -18,8 +18,10 @@ Required env vars / config.extra keys:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -31,9 +33,10 @@ import sys
 import tempfile
 import time
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -44,14 +47,16 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_image_from_url,
 )
+from gateway.session import build_session_key
 
 logger = logging.getLogger("hermes_plugins.vector_platform.adapter")
 
 # ---------------------------------------------------------------------------
 # Plugin identity / paths
 # ---------------------------------------------------------------------------
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _BRIDGE_DIR = _PLUGIN_ROOT / "bridge"
 _DEFAULT_BRIDGE_BIN = _BRIDGE_DIR / "target" / "release" / "vector-bridge"
@@ -78,6 +83,10 @@ SSE_STALE_TIMEOUT = 60.0
 BRIDGE_TERM_WAIT = 2.0
 INBOUND_DEDUP_MAX = 1024
 RUNTIME_RECORD_NAME = "vector-sidecar.json"
+INBOX_NAME_MAX = 180
+DOWNLOAD_TIMEOUT = 120.0
+SEND_FILE_TIMEOUT = 120.0
+DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
 
 
 def resolve_bridge_bin() -> Path:
@@ -98,6 +107,75 @@ def resolve_data_dir() -> Path:
     except Exception:
         home = Path.home() / ".hermes"
     return Path(home) / "plugin-data" / "vector-platform" / "sdk"
+
+
+def resolve_files_root() -> Path:
+    """Durable inbox root: plugin-data/vector-platform/files (not sdk/)."""
+    try:
+        from plugins.plugin_storage import plugin_data_dir
+
+        return plugin_data_dir("vector-platform") / "files"
+    except Exception:
+        try:
+            home = get_hermes_home()
+        except Exception:
+            home = Path.home() / ".hermes"
+        return Path(home) / "plugin-data" / "vector-platform" / "files"
+
+
+def _sanitize_filename(name: str, fallback: str = "file") -> str:
+    """Keep a portable basename; empty or dotted-only names become fallback."""
+    raw = (name or "").strip().replace("\x00", "")
+    raw = Path(raw).name
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+    if not cleaned or cleaned in {".", ".."}:
+        cleaned = fallback
+    return cleaned[:INBOX_NAME_MAX]
+
+
+def _unique_path(directory: Path, filename: str) -> Path:
+    """Return directory/filename, adding -2, -3, … on collision."""
+    directory.mkdir(parents=True, exist_ok=True)
+    dest = directory / filename
+    if not dest.exists():
+        return dest
+    stem, suffix = dest.stem, dest.suffix
+    n = 2
+    while True:
+        candidate = directory / f"{stem}-{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _mime_for_attachment(att: dict) -> str:
+    name = str(att.get("name") or "")
+    ext = str(att.get("extension") or "").lstrip(".")
+    probe = name if "." in Path(name).name else (f"x.{ext}" if ext else name)
+    guessed, _ = mimetypes.guess_type(probe)
+    return guessed or "application/octet-stream"
+
+
+def _message_type_for_mime(mime: str) -> MessageType:
+    mime = (mime or "").lower()
+    if mime.startswith("image/"):
+        return MessageType.PHOTO
+    if mime.startswith("video/"):
+        return MessageType.VIDEO
+    if mime.startswith("audio/"):
+        if mime in {"audio/ogg", "audio/opus", "audio/ogg; codecs=opus"}:
+            return MessageType.VOICE
+        return MessageType.AUDIO
+    return MessageType.DOCUMENT
+
+
+def _inbound_media_max_bytes() -> int:
+    try:
+        from gateway.platforms.base import get_inbound_media_max_bytes
+
+        return int(get_inbound_media_max_bytes())
+    except Exception:
+        return DEFAULT_INBOUND_MEDIA_MAX_BYTES
 
 
 def bridge_port_is_listening(port: int, host: str = "127.0.0.1", timeout: float = 0.35) -> bool:
@@ -747,7 +825,29 @@ class VectorAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return SendResult(success=False, error="not implemented in v1")
+        path = image_url
+        if str(image_url).startswith(("http://", "https://")):
+            try:
+                path = await cache_image_from_url(image_url)
+            except Exception as e:
+                logger.warning("Vector: failed to cache outbound image URL: %s", e)
+                return SendResult(success=False, error=str(e), retryable=True)
+        return await self._send_local_file(
+            chat_id, path, caption=caption, reply_to=reply_to, metadata=metadata
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_local_file(
+            chat_id, image_path, caption=caption, reply_to=reply_to, metadata=metadata
+        )
 
     async def send_document(
         self,
@@ -759,7 +859,102 @@ class VectorAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        return SendResult(success=False, error="not implemented in v1")
+        return await self._send_local_file(
+            chat_id, file_path, caption=caption, reply_to=reply_to, metadata=metadata
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_local_file(
+            chat_id, video_path, caption=caption, reply_to=reply_to, metadata=metadata
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_local_file(
+            chat_id, audio_path, caption=caption, reply_to=reply_to, metadata=metadata
+        )
+
+    async def send_animation(
+        self,
+        chat_id: str,
+        animation_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        return await self.send_image(
+            chat_id, animation_url, caption=caption, reply_to=reply_to, metadata=metadata
+        )
+
+    async def _send_local_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        *,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not self._running or not self._http_client:
+            return SendResult(success=False, error="Not connected")
+        session_key = ""
+        try:
+            session_key = str((metadata or {}).get("session_id") or "")
+        except Exception:
+            session_key = ""
+        safe = self.validate_media_delivery_path(str(file_path), session_key=session_key)
+        if not safe:
+            logger.warning("Vector: refusing unsafe outbound path")
+            return SendResult(success=False, error="unsafe media path", retryable=False)
+        npub = normalize_npub(chat_id) or (chat_id or "").strip()
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/send-file",
+                json={"to": npub, "path": safe},
+                headers=self._token_headers(),
+                timeout=SEND_FILE_TIMEOUT,
+            )
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+        if resp.status_code != 200:
+            error_text = (resp.text or "")[:200]
+            return SendResult(
+                success=False,
+                error=f"Sidecar /send-file returned {resp.status_code}: {error_text}",
+                retryable=resp.status_code >= 500,
+            )
+        try:
+            data = resp.json() if resp.content else {}
+        except (ValueError, json.JSONDecodeError):
+            data = {}
+        file_id = None
+        if isinstance(data, dict):
+            file_id = data.get("id") or data.get("messageId")
+        if caption and str(caption).strip():
+            cap = await self.send(
+                chat_id=npub,
+                content=str(caption).strip(),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if not cap.success:
+                logger.warning("Vector: file sent but caption failed: %s", cap.error)
+        return SendResult(success=True, message_id=file_id, raw_response=data)
 
     # ------------------------------------------------------------------
     # SSE listener (inbound messages)
@@ -897,11 +1092,10 @@ class VectorAdapter(BasePlatformAdapter):
             logger.debug("Vector: dropping duplicate inbound id=%s", msg_id[:16])
             return
 
-        text = msg_data.get("text") or ""
-        if msg_data.get("is_file") and not str(text).strip():
-            logger.debug("Vector: dropping empty file message id=%s", msg_id[:16])
-            return
-        if not str(text).strip():
+        text = str(msg_data.get("text") or "")
+        attachments = msg_data.get("attachments") if isinstance(msg_data.get("attachments"), list) else []
+        is_file = bool(msg_data.get("is_file") or attachments)
+        if not text.strip() and not is_file:
             return
 
         raw_peer = msg_data.get("npub") or msg_data.get("chat_id") or ""
@@ -931,12 +1125,44 @@ class VectorAdapter(BasePlatformAdapter):
             message_id=msg_id or None,
         )
         reply_to_text = msg_data.get("reply_to_text") or None
+
+        saved: List[Tuple[Path, dict, str]] = []
+        if is_file and attachments and _sender_is_authorized(peer):
+            saved = await self._save_inbound_attachments(
+                peer, attachments, msg_id=msg_id, caption=text, at_ms=msg_data.get("at_ms")
+            )
+
+        if is_file and not text.strip():
+            if _sender_is_authorized(peer):
+                await self._ack_file_only(peer, saved)
+                await self._write_inbox_breadcrumb(source, saved)
+            elif _pairing_enabled():
+                event = MessageEvent(
+                    text="(file attachment)",
+                    message_type=MessageType.DOCUMENT,
+                    source=source,
+                    message_id=msg_id or None,
+                    reply_to_text=reply_to_text,
+                )
+                await self.handle_message(event)
+            return
+
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        msg_type = MessageType.TEXT
+        if saved:
+            media_urls = [str(path) for path, _att, _mime in saved]
+            media_types = [mime for _path, _att, mime in saved]
+            msg_type = _message_type_for_mime(media_types[0]) if media_types else MessageType.DOCUMENT
+
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=msg_type,
             source=source,
             message_id=msg_id or None,
             reply_to_text=reply_to_text,
+            media_urls=media_urls,
+            media_types=media_types,
         )
         await self.handle_message(event)
 
@@ -952,6 +1178,175 @@ class VectorAdapter(BasePlatformAdapter):
         while len(seen) > INBOUND_DEDUP_MAX:
             seen.popitem(last=False)
         return False
+
+    async def _save_inbound_attachments(
+        self,
+        peer: str,
+        attachments: List[dict],
+        *,
+        msg_id: str,
+        caption: str,
+        at_ms: Any,
+    ) -> List[Tuple[Path, dict, str]]:
+        """Download attachments into files/inbox/{npub}/{YYYY-MM-DD}/."""
+        saved: List[Tuple[Path, dict, str]] = []
+        max_bytes = _inbound_media_max_bytes()
+        try:
+            when = datetime.fromtimestamp(int(at_ms) / 1000.0) if at_ms else datetime.now()
+        except (TypeError, ValueError, OSError):
+            when = datetime.now()
+        day = when.strftime("%Y-%m-%d")
+        stamp = when.strftime("%H%M%S")
+        inbox = resolve_files_root() / "inbox" / peer / day
+        author = peer
+        for i, att in enumerate(attachments):
+            if not isinstance(att, dict):
+                continue
+            try:
+                size = int(att.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if max_bytes and size > max_bytes:
+                logger.warning(
+                    "Vector: skip inbound attachment over cap (%s bytes)", size
+                )
+                continue
+            orig = str(att.get("name") or "").strip() or f"file-{att.get('id') or i}"
+            ext = str(att.get("extension") or "").lstrip(".")
+            if ext and not orig.lower().endswith(f".{ext.lower()}"):
+                orig = f"{orig}.{ext}"
+            filename = _sanitize_filename(f"{stamp}-{orig}")
+            dest = _unique_path(inbox, filename)
+            path = await self._download_attachment(att, dest, author_npub=author)
+            if path is None:
+                continue
+            mime = _mime_for_attachment(att)
+            sha = ""
+            try:
+                sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                pass
+            meta = {
+                "original_name": orig,
+                "saved_as": path.name,
+                "size": path.stat().st_size if path.exists() else size,
+                "mime": mime,
+                "sha256": sha,
+                "vector_event_id": msg_id,
+                "attachment_id": att.get("id"),
+                "peer": peer,
+                "caption": caption or "",
+                "saved_at": time.time(),
+            }
+            try:
+                path.with_name(path.name + ".meta.json").write_text(
+                    json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+                )
+            except OSError:
+                logger.warning("Vector: failed to write inbox meta for %s", path.name)
+            self._append_inbox_index(meta | {"path": str(path)})
+            saved.append((path, att, mime))
+        return saved
+
+    async def _download_attachment(
+        self, att: dict, dest: Path, *, author_npub: str
+    ) -> Optional[Path]:
+        if not self._http_client:
+            return None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/download-attachment",
+                json={
+                    "attachment": att,
+                    "dest": str(dest),
+                    "author_npub": author_npub,
+                },
+                headers=self._token_headers(),
+                timeout=DOWNLOAD_TIMEOUT,
+            )
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            logger.warning("Vector: download-attachment failed: %s", e)
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "Vector: /download-attachment returned %s: %s",
+                resp.status_code,
+                (resp.text or "")[:200],
+            )
+            return None
+        if dest.is_file():
+            return dest
+        try:
+            data = resp.json()
+            p = Path(data.get("path") or "")
+            if p.is_file():
+                return p
+        except (ValueError, json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    def _append_inbox_index(self, row: dict) -> None:
+        index = resolve_files_root() / "index.jsonl"
+        try:
+            index.parent.mkdir(parents=True, exist_ok=True)
+            with index.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, default=str) + "\n")
+        except OSError:
+            logger.warning("Vector: failed to append files/index.jsonl")
+
+    async def _ack_file_only(self, peer: str, saved: List[Tuple[Path, dict, str]]) -> None:
+        if not saved:
+            await self.send(chat_id=peer, content="couldn't save attachment")
+            return
+        names = [path.name.split("-", 1)[-1] if "-" in path.name else path.name for path, *_ in saved]
+        if len(names) == 1:
+            body = f"saved {names[0]}"
+        else:
+            body = f"saved {len(names)} files: " + ", ".join(names)
+        await self.send(chat_id=peer, content=body)
+
+    async def _write_inbox_breadcrumb(
+        self, source, saved: List[Tuple[Path, dict, str]]
+    ) -> None:
+        if not saved:
+            return
+        lines = [
+            "[Vector inbox] Saved file(s) with no caption (not processed). "
+            "Paths for later reference:"
+        ]
+        for path, att, mime in saved:
+            orig = att.get("name") or path.name
+            lines.append(f"- {orig} ({mime}) `{path}`")
+        content = "\n".join(lines)
+        try:
+            await asyncio.to_thread(self._append_session_breadcrumb, source, content)
+        except Exception:
+            logger.warning("Vector: failed to write inbox session breadcrumb", exc_info=True)
+
+    def _append_session_breadcrumb(self, source, content: str) -> None:
+        runner = getattr(self, "gateway_runner", None)
+        db = getattr(runner, "_session_db", None) if runner is not None else None
+        inner = getattr(db, "_db", db) if db is not None else None
+        if inner is None or not hasattr(inner, "append_message"):
+            logger.debug("Vector: session db unavailable for inbox breadcrumb")
+            return
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(source),
+        )
+        ensure = getattr(inner, "ensure_session", None)
+        if callable(ensure):
+            ensure(session_key, source="vector")
+        inner.append_message(
+            session_key,
+            "user",
+            content,
+            display_kind="internal_notification",
+            platform_message_id=getattr(source, "message_id", None),
+        )
 
     # ------------------------------------------------------------------
     # Health monitor / process death

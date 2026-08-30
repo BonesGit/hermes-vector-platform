@@ -1908,3 +1908,190 @@ class TestInteractiveSetup:
         assert (data_dir / "identity.nsec").read_text() == "nsec1original\n"
         assert not bak.exists()
         assert io.saved["VECTOR_NPUB"] == NPUB
+
+
+class TestInboxFilenames:
+    def test_sanitize_strips_path_parts(self):
+        assert vector_adapter._sanitize_filename("../../etc/passwd") == "passwd"
+
+    def test_sanitize_empty_fallback(self):
+        assert vector_adapter._sanitize_filename("...") == "file"
+
+    def test_unique_path_adds_suffix(self, tmp_path):
+        first = vector_adapter._unique_path(tmp_path, "a.pdf")
+        first.write_text("1")
+        second = vector_adapter._unique_path(tmp_path, "a.pdf")
+        assert second.name == "a-2.pdf"
+
+
+class TestInboundFiles:
+    def test_file_only_acks_and_breadcrumb_skips_agent(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        handled = []
+        acks = []
+        crumbs = []
+
+        async def capture(event):
+            handled.append(event)
+
+        async def fake_download(att, dest, *, author_npub):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"pdf-bytes")
+            return dest
+
+        async def fake_send(**kwargs):
+            acks.append(kwargs)
+            return vector_adapter.SendResult(success=True, message_id="ack")
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        adapter._download_attachment = fake_download  # type: ignore[method-assign]
+        adapter.send = fake_send  # type: ignore[method-assign]
+        adapter._append_session_breadcrumb = (  # type: ignore[method-assign]
+            lambda source, content: crumbs.append(content)
+        )
+
+        att = {
+            "id": "att1",
+            "name": "notes.pdf",
+            "extension": "pdf",
+            "size": 9,
+            "key": "",
+            "nonce": "",
+            "url": "",
+            "path": "",
+        }
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "",
+                    msg_id="file-only-1",
+                    is_file=True,
+                    attachments=[att],
+                    at_ms=1_700_000_000_000,
+                )
+            )
+        )
+        assert handled == []
+        assert acks and "saved" in acks[0]["content"]
+        assert crumbs and "notes.pdf" in crumbs[0]
+        inbox_files = list((tmp_path / "files" / "inbox").rglob("*.pdf"))
+        assert len(inbox_files) == 1
+        assert (tmp_path / "files" / "index.jsonl").is_file()
+
+    def test_file_plus_caption_goes_to_agent(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        handled = []
+
+        async def capture(event):
+            handled.append(event)
+
+        async def fake_download(att, dest, *, author_npub):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"img")
+            return dest
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        adapter._download_attachment = fake_download  # type: ignore[method-assign]
+
+        att = {
+            "id": "att2",
+            "name": "shot.png",
+            "extension": "png",
+            "size": 3,
+        }
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "what's in this",
+                    msg_id="file-cap-1",
+                    is_file=True,
+                    attachments=[att],
+                )
+            )
+        )
+        assert len(handled) == 1
+        assert handled[0].text == "what's in this"
+        assert handled[0].media_urls
+        assert handled[0].message_type == vector_adapter.MessageType.PHOTO
+        assert Path(handled[0].media_urls[0]).is_file()
+
+    def test_file_only_unauthorized_pairing_off_not_saved(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        downloads = []
+
+        async def fake_download(att, dest, *, author_npub):
+            downloads.append(dest)
+            return dest
+
+        adapter._download_attachment = fake_download  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "",
+                    msg_id="unauth-file",
+                    is_file=True,
+                    attachments=[{"id": "x", "name": "x.bin", "extension": "bin"}],
+                )
+            )
+        )
+        assert downloads == []
+        assert not (tmp_path / "files" / "inbox").exists()
+
+
+class TestOutboundFiles:
+    def test_send_document_posts_send_file(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._running = True
+        payload = tmp_path / "out.pdf"
+        payload.write_bytes(b"pdf")
+        monkeypatch.setattr(
+            vector_adapter.VectorAdapter,
+            "validate_media_delivery_path",
+            staticmethod(lambda path, session_key="": str(path)),
+        )
+
+        class _Resp:
+            status_code = 200
+            content = b'{"id":"file1"}'
+
+            def json(self):
+                return {"id": "file1"}
+
+        posts = []
+
+        class _Client:
+            async def post(self, url, json=None, headers=None, timeout=None):
+                posts.append({"url": url, "json": json})
+                return _Resp()
+
+        adapter._http_client = _Client()
+        result = asyncio.run(
+            adapter.send_document(PEER_NPUB, str(payload), caption="here")
+        )
+        assert result.success
+        assert any(p["url"].endswith("/send-file") for p in posts)
+        assert posts[0]["json"]["path"] == str(payload)
+        assert any(p["url"].endswith("/send") for p in posts)

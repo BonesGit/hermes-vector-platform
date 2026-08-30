@@ -1,5 +1,6 @@
 //! HTTP types, auth, errors, and JSON routes for the sidecar.
 
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use vector_sdk::nostr::{PublicKey, ToBech32};
-use vector_sdk::VectorBot;
+use vector_sdk::{Attachment, VectorBot};
 
 use crate::events::{self, EventHub, SseItem};
 
@@ -127,8 +128,8 @@ pub fn router(state: AppState) -> Router {
         .route("/typing", post(typing))
         .route("/profile", post(profile).get(not_implemented))
         .route("/react", post(not_implemented))
-        .route("/send-file", post(not_implemented))
-        .route("/download-attachment", post(not_implemented))
+        .route("/send-file", post(send_file))
+        .route("/download-attachment", post(download_attachment))
         .route("/block", post(not_implemented))
         .route("/__test/ready", post(test_ready))
         .route("/__test/inject", post(events::inject))
@@ -374,6 +375,88 @@ async fn profile(
         }
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SendFileRequest {
+    to: String,
+    path: String,
+}
+
+async fn send_file(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<SendFileRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let npub = parse_npub(&req.to)?;
+    state.require_ready().await?;
+    let path = PathBuf::from(&req.path);
+    if !path.is_absolute() || !path.is_file() {
+        return Err(ApiError::bad_request(
+            "path must be an existing absolute file",
+        ));
+    }
+    if let Some(bot) = state.bot().await {
+        let id = bot.dm(&npub).send_file(&path).await.map_err(|err| {
+            eprintln!("[vector-bridge] send_file failed: {err}");
+            ApiError::internal()
+        })?;
+        Ok(Json(json!({ "id": id })))
+    } else {
+        Ok(Json(json!({ "id": state.next_event_id() })))
+    }
+}
+
+#[derive(Deserialize)]
+struct DownloadAttachmentRequest {
+    attachment: Attachment,
+    dest: String,
+    #[serde(default)]
+    author_npub: Option<String>,
+}
+
+fn dest_is_safe(dest: &Path) -> bool {
+    dest.is_absolute()
+        && dest
+            .components()
+            .all(|c| !matches!(c, Component::ParentDir))
+}
+
+async fn download_attachment(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<DownloadAttachmentRequest>,
+) -> Result<Json<Value>, ApiError> {
+    state.require_ready().await?;
+    let dest = PathBuf::from(&req.dest);
+    if !dest_is_safe(&dest) {
+        return Err(ApiError::bad_request(
+            "dest must be an absolute path without ..",
+        ));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| ApiError::internal())?;
+    }
+    let size = if let Some(bot) = state.bot().await {
+        let author = req.author_npub.as_deref().filter(|s| !s.is_empty());
+        let bytes = bot
+            .download_attachment_from(&req.attachment, author)
+            .await
+            .map_err(|err| {
+                eprintln!("[vector-bridge] download_attachment failed: {err}");
+                ApiError::internal()
+            })?;
+        let n = bytes.len();
+        std::fs::write(&dest, bytes).map_err(|_| ApiError::internal())?;
+        n
+    } else {
+        std::fs::write(&dest, b"").map_err(|_| ApiError::internal())?;
+        0
+    };
+    Ok(Json(json!({
+        "path": dest.to_string_lossy(),
+        "size": size,
+    })))
 }
 
 async fn not_implemented(_auth: Auth) -> ApiError {

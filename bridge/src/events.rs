@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
-use vector_sdk::{BotEvent, IncomingMessage, VectorBot};
+use vector_sdk::{Attachment, BotEvent, IncomingMessage, VectorBot};
 
 use crate::api::{ready_item, ApiError, AppState, Auth, JsonBody};
 
@@ -125,6 +125,8 @@ pub struct MessageEventData {
     pub reply_to_text: Option<String>,
     #[serde(default)]
     pub at_ms: i64,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 impl MessageEventData {
@@ -136,8 +138,8 @@ impl MessageEventData {
     }
 }
 
-/// Map an inbound Vector message to SSE payload. Drops `is_mine`, `is_group`,
-/// and empty-body events (including empty file messages).
+/// Map an inbound Vector message to SSE payload. Drops `is_mine` and `is_group`.
+/// Empty text is dropped unless the message carries attachments.
 pub(crate) fn map_incoming(incoming: &IncomingMessage) -> Option<MessageEventData> {
     if incoming.is_mine() {
         eprintln!("[vector-bridge] skip is_mine id={}", incoming.message.id);
@@ -147,11 +149,9 @@ pub(crate) fn map_incoming(incoming: &IncomingMessage) -> Option<MessageEventDat
         eprintln!("[vector-bridge] skip is_group id={}", incoming.message.id);
         return None;
     }
-    if incoming.text().is_empty() {
-        eprintln!(
-            "[vector-bridge] skip empty id={} is_file={}",
-            incoming.message.id, incoming.is_file
-        );
+    let has_files = incoming.is_file || !incoming.message.attachments.is_empty();
+    if incoming.text().is_empty() && !has_files {
+        eprintln!("[vector-bridge] skip empty id={}", incoming.message.id);
         return None;
     }
     Some(MessageEventData {
@@ -164,11 +164,12 @@ pub(crate) fn map_incoming(incoming: &IncomingMessage) -> Option<MessageEventDat
             .unwrap_or_else(|| incoming.chat_id.clone()),
         is_group: incoming.is_group,
         is_mine: incoming.is_mine(),
-        is_file: incoming.is_file,
+        is_file: has_files,
         text: incoming.text().to_string(),
         reply_to: incoming.message.replied_to.clone(),
         reply_to_text: incoming.message.replied_to_content.clone(),
         at_ms: incoming.message.at as i64,
+        attachments: incoming.message.attachments.clone(),
     })
 }
 
@@ -266,6 +267,7 @@ mod tests {
                 reply_to: "parent-id".into(),
                 reply_to_text: Some("quoted".into()),
                 at_ms: 1_785_979_414_499,
+                attachments: vec![],
             }
         );
         let payload: Value = serde_json::from_str(&data.sse_item().payload).unwrap();
@@ -300,10 +302,25 @@ mod tests {
     }
 
     #[test]
-    fn skips_empty_text_and_empty_file() {
+    fn skips_empty_text_without_files() {
         let empty = incoming("id1", "npub1peer", None, "", false, false, false);
         assert!(map_incoming(&empty).is_none());
-        let file = incoming("id2", "npub1peer", None, "", false, false, true);
-        assert!(map_incoming(&file).is_none());
+    }
+
+    #[test]
+    fn maps_file_only_empty_caption() {
+        let mut msg = incoming("id2", "npub1peer", None, "", false, false, true);
+        msg.message.attachments.push(Attachment {
+            id: "att1".into(),
+            name: "notes.pdf".into(),
+            extension: "pdf".into(),
+            size: 12,
+            ..Default::default()
+        });
+        let data = map_incoming(&msg).expect("file-only mapped");
+        assert!(data.is_file);
+        assert!(data.text.is_empty());
+        assert_eq!(data.attachments.len(), 1);
+        assert_eq!(data.attachments[0].name, "notes.pdf");
     }
 }

@@ -580,6 +580,7 @@ class VectorAdapter(BasePlatformAdapter):
         self._sent_message_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_reaction_ids: OrderedDict[str, None] = OrderedDict()
         # File-only saves waiting to be attached to the next text from that peer.
+        # Sequential Vector DMs (one file per event) append here until that text.
         self._pending_inbox: Dict[str, List[Tuple[str, str]]] = {}
 
         logger.info(
@@ -1362,9 +1363,13 @@ class VectorAdapter(BasePlatformAdapter):
             if _sender_is_authorized(peer):
                 await self._ack_file_only(peer, saved)
                 await self._write_inbox_breadcrumb(source, saved)
-                self._pending_inbox[peer] = [
-                    (str(path), mime) for path, _att, mime in saved
-                ]
+                pending = self._pending_inbox.setdefault(peer, [])
+                seen = {p for p, _m in pending}
+                for path, _att, mime in saved:
+                    key = str(path)
+                    if key not in seen:
+                        pending.append((key, mime))
+                        seen.add(key)
             elif _pairing_enabled():
                 event = MessageEvent(
                     text="(file attachment)",

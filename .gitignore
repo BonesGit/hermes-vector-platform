@@ -8,6 +8,7 @@ build/
 .mypy_cache/
 .venv/
 venv/
+uv.lock
 *.log
 .DS_Store
 plugin-data/

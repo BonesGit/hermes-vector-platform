@@ -2220,6 +2220,77 @@ class TestInboundFiles:
         assert handled[0].message_type == vector_adapter.MessageType.PHOTO
         assert adapter._pending_inbox.get(PEER_NPUB) in (None, [])
 
+    def test_sequential_file_only_messages_accumulate_pending_inbox(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        handled = []
+
+        async def capture(event):
+            handled.append(event)
+
+        async def fake_download(att, dest, *, author_npub):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"bytes")
+            return dest
+
+        async def fake_send(**kwargs):
+            return vector_adapter.SendResult(success=True, message_id="ack")
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        adapter._download_attachment = fake_download  # type: ignore[method-assign]
+        adapter.send = fake_send  # type: ignore[method-assign]
+        adapter._append_session_breadcrumb = lambda *a, **k: None  # type: ignore[method-assign]
+
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "",
+                    msg_id="seq-1",
+                    is_file=True,
+                    attachments=[
+                        {"id": "a", "name": "pic.jpg", "extension": "jpg", "size": 5}
+                    ],
+                )
+            )
+        )
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "",
+                    msg_id="seq-2",
+                    is_file=True,
+                    attachments=[
+                        {"id": "b", "name": "notes.pdf", "extension": "pdf", "size": 5}
+                    ],
+                )
+            )
+        )
+        assert handled == []
+        pending = adapter._pending_inbox.get(PEER_NPUB) or []
+        assert len(pending) == 2
+        names = [Path(p).name for p, _m in pending]
+        assert any("pic.jpg" in n for n in names)
+        assert any("notes.pdf" in n for n in names)
+
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "process these", msg_id="seq-3")
+            )
+        )
+        assert len(handled) == 1
+        assert handled[0].text == "process these"
+        assert len(handled[0].media_urls) == 2
+        assert len(handled[0].media_types) == 2
+        assert adapter._pending_inbox.get(PEER_NPUB) in (None, [])
+
     def test_breadcrumb_uses_session_store_id_not_routing_key(
         self, monkeypatch, tmp_path
     ):

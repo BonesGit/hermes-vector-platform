@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **off by default**; set `VECTOR_REACTIONS=on` to enable. Unreact keeps the
   reaction rumor id from `send_reaction` so 👀 is actually retracted before ✅.
 
+### Fixed
+
+- Sequential file-only Vector DMs accumulate in `_pending_inbox` until the
+  next text from that peer; previously each file replaced the last.
+
 ### Changed
 
 - Sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk)

@@ -157,7 +157,7 @@ Inbound files from allowlisted peers are decrypted into:
 
 A sibling `.meta.json` and an append-only `files/index.jsonl` record original name, size, mime, and Vector event id. **No outbox copies** — files Hermes sends you exist only on Vector.
 
-- **File, no caption:** saved, Vector ack (`saved notes.pdf`), and a session breadcrumb (so a later “process the pdf I sent” can see the path). The AI turn is **not** started.
+- **File, no caption:** saved, Vector ack (`saved notes.pdf`), and a session breadcrumb (so a later “process the pdf I sent” can see the path). The AI turn is **not** started. Sequential files from the same peer accumulate until the next text, which is attached as `media_urls`.
 - **File + text:** saved, then a normal Hermes turn with `media_urls` (images → vision, voice → STT, documents → path note).
 
 Unauthorized senders are not downloaded. Hermes outbound media uses `POST /send-file` (`send_image` / `send_document` / video / voice). Caption is a follow-up text DM (Vector’s SDK `send_file` has no caption field).

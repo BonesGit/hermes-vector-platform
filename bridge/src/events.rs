@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
-use vector_sdk::{Attachment, BotEvent, IncomingMessage, VectorBot};
+use vector_sdk::nostr::PublicKey;
+use vector_sdk::{Attachment, BotEvent, IncomingMessage, Message, Reaction, VectorBot};
 
 use crate::api::{ready_item, ApiError, AppState, Auth, JsonBody};
 
@@ -174,6 +175,47 @@ pub(crate) fn map_incoming(incoming: &IncomingMessage) -> Option<MessageEventDat
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageUpdateData {
+    pub id: String,
+    pub chat_id: String,
+    pub npub: String,
+    #[serde(default)]
+    pub mine: bool,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+}
+
+impl MessageUpdateData {
+    fn sse_item(&self) -> SseItem {
+        SseItem {
+            id: Some(format!("update:{}", self.id)),
+            payload: json!({ "type": "message_update", "data": self }).to_string(),
+        }
+    }
+}
+
+/// Map a DM `MessageUpdate` (reaction/edit snapshot). Non-DM chat ids (Concord
+/// channel ids) are dropped — v1 is DM-only.
+pub(crate) fn map_update(chat_id: &str, message: &Message) -> Option<MessageUpdateData> {
+    if PublicKey::parse(chat_id.trim()).is_err() {
+        return None;
+    }
+    if message.reactions.is_empty() {
+        return None;
+    }
+    Some(MessageUpdateData {
+        id: message.id.clone(),
+        chat_id: chat_id.to_string(),
+        npub: message.npub.clone().unwrap_or_else(|| chat_id.to_string()),
+        mine: message.mine,
+        text: message.content.clone(),
+        reactions: message.reactions.clone(),
+    })
+}
+
 pub(crate) async fn handle_bot_event(
     state: &AppState,
     bot: &VectorBot,
@@ -222,6 +264,11 @@ pub(crate) async fn handle_bot_event(
                         &data.id,
                     );
                 }
+                state.events().publish(data.sse_item());
+            }
+        }
+        BotEvent::MessageUpdate { chat_id, message } => {
+            if let Some(data) = map_update(&chat_id, &message) {
                 state.events().publish(data.sse_item());
             }
         }
@@ -339,6 +386,63 @@ mod tests {
     fn skips_empty_text_without_files() {
         let empty = incoming("id1", "npub1peer", None, "", false, false, false);
         assert!(map_incoming(&empty).is_none());
+    }
+
+    #[test]
+    fn maps_dm_reaction_update() {
+        let peer = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+        let mut message = Message {
+            id: "target-1".into(),
+            content: "hello".into(),
+            mine: true,
+            npub: Some(peer.into()),
+            ..Default::default()
+        };
+        message.reactions.push(Reaction {
+            id: "react-1".into(),
+            reference_id: "target-1".into(),
+            author_id: peer.into(),
+            emoji: "👍".into(),
+            emoji_url: None,
+        });
+        let data = map_update(peer, &message).expect("mapped");
+        assert_eq!(data.id, "target-1");
+        assert!(data.mine);
+        assert_eq!(data.reactions.len(), 1);
+        assert_eq!(data.reactions[0].emoji, "👍");
+        let payload: Value = serde_json::from_str(&data.sse_item().payload).unwrap();
+        assert_eq!(payload["type"], "message_update");
+        assert_eq!(payload["data"]["id"], "target-1");
+        assert_eq!(payload["data"]["reactions"][0]["emoji"], "👍");
+    }
+
+    #[test]
+    fn skips_update_without_reactions() {
+        let peer = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+        let message = Message {
+            id: "target-1".into(),
+            content: "edited".into(),
+            mine: true,
+            ..Default::default()
+        };
+        assert!(map_update(peer, &message).is_none());
+    }
+
+    #[test]
+    fn skips_update_for_community_channel_id() {
+        let mut message = Message {
+            id: "target-1".into(),
+            content: "hi".into(),
+            ..Default::default()
+        };
+        message.reactions.push(Reaction {
+            id: "react-1".into(),
+            reference_id: "target-1".into(),
+            author_id: "npub1peer".into(),
+            emoji: "👍".into(),
+            emoji_url: None,
+        });
+        assert!(map_update("not-an-npub", &message).is_none());
     }
 
     #[test]

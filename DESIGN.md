@@ -556,7 +556,7 @@ Unlike Session, Vector **supports edit** (`Channel::edit`). Per D12, v1 **setup 
 | Typing | `Channel::typing` | yes | — |
 | Profile `bot: true` | `update_profile` / `update_bot_profile` | yes on connect | — |
 | Files | `send_file` / `save_attachment` / Blossom AES-GCM | no | v1.1 — cache via `cache_document_from_bytes` |
-| Reactions | `Channel::react` | no | v1.1 — map Hermes reactions if desired |
+| Reactions | `Channel::react` / `react_custom` / core `delete_own_reaction` | yes (DM unicode + optional NIP-30 URL; unreact via `/react` `remove`) | communities |
 | Edits / deletes | `edit` / `delete` | no | v1.1 — enables tool-progress edits |
 | Communities | `community()`, `InvitePolicy` | ignore inbound | v2 + SDK `.whitelist(allowed_npubs)` |
 | Slash commands | `bot.command(...)` kind 10304 | no | v2 — either native Vector commands that proxy into Hermes, or ignore and let users type naturally |
@@ -636,7 +636,7 @@ Home channel: `VECTOR_HOME_CHANNEL` = operator npub. Cron `deliver=vector` + `cr
 **v1.1 — media, polish, catch-up**
 
 - Encrypted files (`send_file` / `download_attachment_from` + Hermes `cache_*_from_bytes`).
-- Emoji reactions.
+- Emoji reactions (agent react/unreact, inbound peer chips, optional `VECTOR_REACTIONS` 👀/✅/❌).
 - Message edit (unlocks tool-progress bubbles; then D12 can flip `display.platforms.vector.tool_progress`).
 - `GET /profile?npub=` → `fetch_profile` so `get_chat_info` can show display names.
 - After `Ready`, walk `Channel::history` for allowlisted chats; persist last-seen ids; SSE-emit unseen (dedup by rumor id).

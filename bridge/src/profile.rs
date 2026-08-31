@@ -142,7 +142,10 @@ async fn resolve_public_image_url(
             url
         }
         Err(err) => {
-            eprintln!("[vector-bridge] upload_image ({}) failed: {err}", slot.label());
+            eprintln!(
+                "[vector-bridge] upload_image ({}) failed: {err}",
+                slot.label()
+            );
             existing_image_url(bot, slot).await
         }
     }
@@ -213,7 +216,10 @@ mod tests {
             url: "https://example/b".into(),
         };
         write_image_cache(dir.path(), "banner", &cache);
-        assert_eq!(read_image_cache(dir.path(), "banner").as_ref(), Some(&cache));
+        assert_eq!(
+            read_image_cache(dir.path(), "banner").as_ref(),
+            Some(&cache)
+        );
         assert!(read_image_cache(dir.path(), "avatar").is_none());
     }
 }

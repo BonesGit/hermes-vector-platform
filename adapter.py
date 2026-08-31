@@ -13,6 +13,7 @@ Required env vars / config.extra keys:
     VECTOR_PAIRING        on (default) = pairing codes; off = drop unauthorized
     VECTOR_BRIDGE_PORT    HTTP port (default 8096)
     VECTOR_BRIDGE_HOST    Bind address (default 127.0.0.1)
+    VECTOR_REACTIONS      on = 👀/✅/❌ processing acks; default off
 """
 
 from __future__ import annotations
@@ -81,6 +82,8 @@ SSE_RETRY_DELAY_MAX = 60.0
 SSE_STALE_TIMEOUT = 60.0
 BRIDGE_TERM_WAIT = 2.0
 INBOUND_DEDUP_MAX = 1024
+LAST_INBOUND_CHATS_MAX = 200
+SENT_IDS_MAX = 1000
 RUNTIME_RECORD_NAME = "vector-sidecar.json"
 INBOX_NAME_MAX = 180
 DOWNLOAD_TIMEOUT = 120.0
@@ -479,6 +482,11 @@ def _pairing_enabled() -> bool:
     )
 
 
+def _processing_reactions_enabled() -> bool:
+    """VECTOR_REACTIONS default off. 👀/✅/❌ on the triggering DM while the agent works."""
+    return _env_flag("VECTOR_REACTIONS") in ("1", "true", "yes", "on")
+
+
 def _allow_all_users() -> bool:
     return _env_flag("VECTOR_ALLOW_ALL_USERS") in ("1", "true", "yes", "on")
 
@@ -524,6 +532,11 @@ class VectorAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     supports_code_blocks = True
 
+    # Shared reaction-ack flow (base.on_processing_complete): swap 👀 for
+    # ✅/❌. Gated by VECTOR_REACTIONS (default off) via _reactions_enabled.
+    _OK_EMOJI = "✅"
+    _FAIL_EMOJI = "❌"
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("vector"))
 
@@ -563,6 +576,9 @@ class VectorAdapter(BasePlatformAdapter):
         self._health_task: Optional[asyncio.Task] = None
         self._sidecar_token: Optional[str] = None
         self._inbound_ids: OrderedDict[str, None] = OrderedDict()
+        self._last_inbound_by_chat: OrderedDict[str, str] = OrderedDict()
+        self._sent_message_ids: OrderedDict[str, None] = OrderedDict()
+        self._seen_reaction_ids: OrderedDict[str, None] = OrderedDict()
         # File-only saves waiting to be attached to the next text from that peer.
         self._pending_inbox: Dict[str, List[Tuple[str, str]]] = {}
 
@@ -830,9 +846,11 @@ class VectorAdapter(BasePlatformAdapter):
                     return SendResult(
                         success=True, message_id=None, raw_response=data, retryable=False
                     )
+                message_id = data.get("id") or data.get("messageId")
+                self._record_sent_message(message_id)
                 return SendResult(
                     success=True,
-                    message_id=data.get("id") or data.get("messageId"),
+                    message_id=message_id,
                     raw_response=data,
                 )
             error_text = resp.text[:200] if resp.text else "No error text"
@@ -853,18 +871,28 @@ class VectorAdapter(BasePlatformAdapter):
             logger.error("Vector: exception while sending: %s", e)
             return SendResult(success=False, error=str(e), retryable=False)
 
-    async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
-        """React on a Vector DM (unicode emoji). Used by missed-ack and future acks."""
+    async def send_reaction(
+        self,
+        chat_id: str,
+        message_id: str,
+        emoji: str,
+        *,
+        emoji_url: Optional[str] = None,
+    ) -> bool:
+        """React on a Vector DM. Used by the Hermes react tool and optional acks."""
         if not self._http_client or not (message_id or "").strip() or not (emoji or "").strip():
             return False
+        body: Dict[str, Any] = {
+            "to": chat_id,
+            "message_id": message_id,
+            "emoji": emoji,
+        }
+        if emoji_url:
+            body["emoji_url"] = emoji_url
         try:
             resp = await self._http_client.post(
                 f"{self.bridge_url}/react",
-                json={
-                    "to": chat_id,
-                    "message_id": message_id,
-                    "emoji": emoji,
-                },
+                json=body,
                 headers=self._token_headers(),
                 timeout=10.0,
             )
@@ -873,8 +901,123 @@ class VectorAdapter(BasePlatformAdapter):
             logger.debug("Vector: send_reaction failed: %s", e)
             return False
 
-    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> None:
-        await self.send_reaction(chat_id, message_id, emoji)
+    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Lifecycle primitive: tapback ``emoji``. Soft-fails, never raises."""
+        return await self.send_reaction(chat_id, message_id, emoji)
+
+    async def _remove_reaction(self, chat_id: str, message_id: str) -> bool:
+        """Retract our tapback(s) on ``message_id``. Soft-fails, never raises."""
+        if not self._http_client or not (message_id or "").strip():
+            return False
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/react",
+                json={"to": chat_id, "message_id": message_id, "remove": True},
+                headers=self._token_headers(),
+                timeout=10.0,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.debug("Vector: remove_reaction failed: %s", e)
+            return False
+
+    def _chat_key(self, chat_id: Optional[str]) -> str:
+        raw = (chat_id or "").strip()
+        return normalize_npub(raw) or raw
+
+    def _record_last_inbound(
+        self, chat_id: Optional[str], message_id: Optional[str]
+    ) -> None:
+        if not chat_id or not message_id:
+            return
+        key = self._chat_key(chat_id)
+        if not key:
+            return
+        last = self._last_inbound_by_chat
+        if key in last:
+            del last[key]
+        last[key] = message_id
+        while len(last) > LAST_INBOUND_CHATS_MAX:
+            last.popitem(last=False)
+
+    def _record_sent_message(self, message_id: Optional[str]) -> None:
+        if not message_id:
+            return
+        sent = self._sent_message_ids
+        if message_id in sent:
+            del sent[message_id]
+        sent[message_id] = None
+        while len(sent) > SENT_IDS_MAX:
+            sent.popitem(last=False)
+
+    def _remember_reaction_id(self, reaction_id: str) -> None:
+        seen = self._seen_reaction_ids
+        if reaction_id in seen:
+            del seen[reaction_id]
+        seen[reaction_id] = None
+        while len(seen) > INBOUND_DEDUP_MAX:
+            seen.popitem(last=False)
+
+    def _reactions_enabled(self) -> bool:
+        """Processing-lifecycle 👀/✅/❌. Agent ``send_message(action=react)`` is not gated."""
+        return _processing_reactions_enabled()
+
+    async def add_reaction(
+        self,
+        chat_id: str,
+        emoji: str,
+        message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Hermes ``send_message(action="react")`` contract.
+
+        Without ``message_id``, targets the chat's most recent inbound Vector
+        event (typically the DM the agent is answering).
+        """
+        target = (message_id or "").strip() or self._last_inbound_by_chat.get(
+            self._chat_key(chat_id)
+        )
+        if not target:
+            return {
+                "success": False,
+                "error": "no message to react to — pass message_id (no "
+                "inbound message seen in this chat since the gateway started)",
+            }
+        ok = await self._add_reaction(chat_id, target, emoji)
+        if not ok:
+            return {
+                "success": False,
+                "error": "reaction failed (see gateway debug log)",
+            }
+        return {"success": True, "message_id": target}
+
+    async def remove_reaction(
+        self, chat_id: str, message_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Hermes ``send_message(action="unreact")`` contract."""
+        target = (message_id or "").strip() or self._last_inbound_by_chat.get(
+            self._chat_key(chat_id)
+        )
+        if not target:
+            return {
+                "success": False,
+                "error": "no message to unreact — pass message_id",
+            }
+        ok = await self._remove_reaction(chat_id, target)
+        if not ok:
+            return {
+                "success": False,
+                "error": "unreact failed (see gateway debug log)",
+            }
+        return {"success": True, "message_id": target}
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """React 👀 on the triggering DM while the agent works (VECTOR_REACTIONS)."""
+        if not self._reactions_enabled():
+            return
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if chat_id and message_id:
+            await self._add_reaction(chat_id, message_id, "\U0001f440")
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         if not self._http_client:
@@ -1031,6 +1174,7 @@ class VectorAdapter(BasePlatformAdapter):
             )
             if not cap.success:
                 logger.warning("Vector: file sent but caption failed: %s", cap.error)
+        self._record_sent_message(file_id)
         return SendResult(success=True, message_id=file_id, raw_response=data)
 
     # ------------------------------------------------------------------
@@ -1150,6 +1294,8 @@ class VectorAdapter(BasePlatformAdapter):
             logger.info("Vector SSE: sidecar emitted 'ready'")
         elif event_type == "message":
             await self._handle_message_event(data)
+        elif event_type == "message_update":
+            await self._handle_message_update(data)
         else:
             logger.debug("Vector SSE: unhandled event type '%s'", event_type)
 
@@ -1191,6 +1337,9 @@ class VectorAdapter(BasePlatformAdapter):
                 _truncate_npub(peer),
             )
             return
+
+        if msg_id:
+            self._record_last_inbound(peer, msg_id)
 
         name = _truncate_npub(peer)
         source = self.build_source(
@@ -1250,6 +1399,68 @@ class VectorAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             media_urls=media_urls,
             media_types=media_types,
+        )
+        await self.handle_message(event)
+
+    async def _handle_message_update(self, msg_data: dict) -> None:
+        """Peer reaction on a message we sent → ``reaction:added:<emoji>``."""
+        if (
+            isinstance(msg_data, dict)
+            and msg_data.get("type") == "message_update"
+            and "data" in msg_data
+        ):
+            msg_data = msg_data["data"]
+        if not isinstance(msg_data, dict):
+            return
+
+        reactions = msg_data.get("reactions")
+        if not isinstance(reactions, list) or not reactions:
+            return
+
+        target_id = str(msg_data.get("id") or "")
+        raw_peer = msg_data.get("npub") or msg_data.get("chat_id") or ""
+        peer = normalize_npub(raw_peer) or str(raw_peer).strip()
+        if not peer or not target_id:
+            return
+
+        bot_npub = normalize_npub(self._npub or "") if self._npub else None
+        ours = bool(msg_data.get("mine")) or target_id in self._sent_message_ids
+        last = reactions[-1] if isinstance(reactions[-1], dict) else None
+        if not isinstance(last, dict):
+            return
+        react_id = str(last.get("id") or "")
+        author = normalize_npub(str(last.get("author_id") or "")) or str(
+            last.get("author_id") or ""
+        ).strip()
+        emoji = str(last.get("emoji") or "")
+        already_seen = bool(react_id) and react_id in self._seen_reaction_ids
+        for row in reactions:
+            if isinstance(row, dict) and row.get("id"):
+                self._remember_reaction_id(str(row["id"]))
+        if already_seen or not ours or not emoji:
+            return
+        if bot_npub and author == bot_npub:
+            return
+        if not _pairing_enabled() and not _sender_is_authorized(peer):
+            return
+        name = _truncate_npub(peer)
+        source = self.build_source(
+            chat_id=peer,
+            chat_name=name,
+            chat_type="dm",
+            user_id=peer,
+            user_name=name,
+            message_id=react_id or None,
+        )
+        event = MessageEvent(
+            text=f"reaction:added:{emoji}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=react_id or None,
+            reply_to_message_id=target_id,
+            reply_to_text=str(msg_data.get("text") or "") or None,
+            reply_to_is_own_message=True,
+            raw_message=msg_data,
         )
         await self.handle_message(event)
 

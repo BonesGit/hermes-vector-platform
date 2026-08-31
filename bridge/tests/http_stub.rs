@@ -385,6 +385,39 @@ fn post_react_stub_ok() {
 }
 
 #[test]
+fn post_react_remove_without_emoji_is_ok_in_stub() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/react",
+        Some(&server.token),
+        json!({"to": VALID_NPUB, "message_id": "deadbeef", "remove": true}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+}
+
+#[test]
+fn post_react_custom_emoji_url_ok_in_stub() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/react",
+        Some(&server.token),
+        json!({
+            "to": VALID_NPUB,
+            "message_id": "deadbeef",
+            "emoji": ":wave:",
+            "emoji_url": "https://example.com/wave.png"
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+}
+
+#[test]
 fn post_profile_name_only_is_ok_in_stub() {
     let server = spawn_server(&[]);
     post(&server, "/__test/ready", Some(&server.token), json!({}));

@@ -404,9 +404,11 @@ class MockSidecar:
         self.ready = ready
         self.sends: list = []
         self.typing: list = []
+        self.reacts: list = []
         self.health_headers: list = []
         self.send_headers: list = []
         self.typing_headers: list = []
+        self.react_headers: list = []
         self.events_headers: list = []
         self.inject_queue: list = []
         self.send_raw: bytes | None = None
@@ -492,6 +494,10 @@ class MockSidecar:
                 if path == "/typing":
                     sidecar.typing.append(data)
                     sidecar.typing_headers.append(dict(self.headers))
+                    return self._json(200, {"ok": True})
+                if path == "/react":
+                    sidecar.reacts.append(data)
+                    sidecar.react_headers.append(dict(self.headers))
                     return self._json(200, {"ok": True})
                 return self._json(404, {"error": "not found", "code": "not_found"})
 
@@ -2360,3 +2366,254 @@ class TestOutboundFiles:
         assert any(p["url"].endswith("/send-file") for p in posts)
         assert posts[0]["json"]["path"] == str(payload)
         assert any(p["url"].endswith("/send") for p in posts)
+
+
+_EYES = "\U0001f440"
+_CHECK = "✅"
+
+
+class _FakeHttp:
+    def __init__(self, status: int = 200):
+        self.posts: list = []
+        self.status = status
+
+    async def post(self, url, json=None, headers=None, timeout=None):
+        self.posts.append({"url": url, "json": json})
+        status = self.status
+
+        class _Resp:
+            status_code = status
+
+        return _Resp()
+
+
+class TestReactions:
+    def test_add_reaction_posts_react(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        http = _FakeHttp()
+        adapter._http_client = http
+        result = asyncio.run(
+            adapter.add_reaction(PEER_NPUB, _EYES, message_id="target-1")
+        )
+        assert result == {"success": True, "message_id": "target-1"}
+        assert http.posts[0]["url"].endswith("/react")
+        assert http.posts[0]["json"] == {
+            "to": PEER_NPUB,
+            "message_id": "target-1",
+            "emoji": _EYES,
+        }
+
+    def test_add_reaction_falls_back_to_last_inbound(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        http = _FakeHttp()
+        adapter._http_client = http
+        adapter._record_last_inbound(PEER_NPUB, "inbound-9")
+        result = asyncio.run(adapter.add_reaction(PEER_NPUB, "👍"))
+        assert result["success"] is True
+        assert result["message_id"] == "inbound-9"
+        assert http.posts[0]["json"]["message_id"] == "inbound-9"
+
+    def test_add_reaction_hex_chat_uses_canonical_last_inbound(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        http = _FakeHttp()
+        adapter._http_client = http
+        adapter._record_last_inbound(PEER_HEX, "inbound-hex")
+        result = asyncio.run(adapter.add_reaction(PEER_NPUB, "👍"))
+        assert result["message_id"] == "inbound-hex"
+
+    def test_add_reaction_without_target_errors(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._http_client = _FakeHttp()
+        result = asyncio.run(adapter.add_reaction(PEER_NPUB, "👍"))
+        assert result["success"] is False
+        assert "no message" in result["error"]
+
+    def test_remove_reaction_posts_remove(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        http = _FakeHttp()
+        adapter._http_client = http
+        result = asyncio.run(
+            adapter.remove_reaction(PEER_NPUB, message_id="target-1")
+        )
+        assert result == {"success": True, "message_id": "target-1"}
+        assert http.posts[0]["json"] == {
+            "to": PEER_NPUB,
+            "message_id": "target-1",
+            "remove": True,
+        }
+
+    def test_processing_hooks_noop_when_disabled(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("VECTOR_REACTIONS", raising=False)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        http = _FakeHttp()
+        adapter._http_client = http
+        from gateway.platforms.base import (
+            MessageEvent,
+            MessageType,
+            ProcessingOutcome,
+        )
+
+        event = MessageEvent(
+            text="hi",
+            message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id=PEER_NPUB,
+                chat_name="p",
+                chat_type="dm",
+                user_id=PEER_NPUB,
+                user_name="p",
+            ),
+            message_id="target-1",
+        )
+        asyncio.run(adapter.on_processing_start(event))
+        asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+        assert http.posts == []
+
+    def test_processing_start_adds_eyes_when_enabled(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_REACTIONS", "on")
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        http = _FakeHttp()
+        adapter._http_client = http
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        event = MessageEvent(
+            text="hi",
+            message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id=PEER_NPUB,
+                chat_name="p",
+                chat_type="dm",
+                user_id=PEER_NPUB,
+                user_name="p",
+            ),
+            message_id="target-1",
+        )
+        asyncio.run(adapter.on_processing_start(event))
+        assert len(http.posts) == 1
+        assert http.posts[0]["json"]["emoji"] == _EYES
+        assert http.posts[0]["json"]["message_id"] == "target-1"
+
+    def test_processing_complete_swaps_to_check_when_enabled(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("VECTOR_REACTIONS", "on")
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        http = _FakeHttp()
+        adapter._http_client = http
+        from gateway.platforms.base import (
+            MessageEvent,
+            MessageType,
+            ProcessingOutcome,
+        )
+
+        event = MessageEvent(
+            text="hi",
+            message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id=PEER_NPUB,
+                chat_name="p",
+                chat_type="dm",
+                user_id=PEER_NPUB,
+                user_name="p",
+            ),
+            message_id="target-1",
+        )
+        asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+        assert [p["json"] for p in http.posts] == [
+            {"to": PEER_NPUB, "message_id": "target-1", "remove": True},
+            {"to": PEER_NPUB, "message_id": "target-1", "emoji": _CHECK},
+        ]
+
+    def test_inbound_records_last_inbound(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "hi", msg_id="live-1")
+            )
+        )
+        assert adapter._last_inbound_by_chat[PEER_NPUB] == "live-1"
+        assert captured[0].message_id == "live-1"
+
+    def test_inbound_peer_reaction_on_ours(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        adapter._record_sent_message("bot-msg-1")
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_update(
+                {
+                    "type": "message_update",
+                    "data": {
+                        "id": "bot-msg-1",
+                        "chat_id": PEER_NPUB,
+                        "npub": PEER_NPUB,
+                        "mine": True,
+                        "text": "the bot's earlier reply",
+                        "reactions": [
+                            {
+                                "id": "react-1",
+                                "author_id": PEER_NPUB,
+                                "emoji": "❤️",
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        assert len(captured) == 1
+        event = captured[0]
+        assert event.text == "reaction:added:❤️"
+        assert event.reply_to_message_id == "bot-msg-1"
+        assert event.reply_to_text == "the bot's earlier reply"
+        assert event.reply_to_is_own_message is True
+
+    def test_inbound_our_own_reaction_is_skipped(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_update(
+                {
+                    "type": "message_update",
+                    "data": {
+                        "id": "peer-msg-1",
+                        "chat_id": PEER_NPUB,
+                        "npub": PEER_NPUB,
+                        "mine": False,
+                        "text": "hi",
+                        "reactions": [
+                            {
+                                "id": "react-ours",
+                                "author_id": NPUB,
+                                "emoji": "👀",
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        assert captured == []
+
+    def test_reactions_env_default_off(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_REACTIONS", raising=False)
+        assert vector_adapter._processing_reactions_enabled() is False
+        monkeypatch.setenv("VECTOR_REACTIONS", "on")
+        assert vector_adapter._processing_reactions_enabled() is True
+        monkeypatch.setenv("VECTOR_REACTIONS", "false")
+        assert vector_adapter._processing_reactions_enabled() is False

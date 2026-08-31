@@ -83,3 +83,7 @@ optional_env:
     description: "Unicode emoji for missed-DM ack (default ❌). Sidecar only; not used unless VECTOR_MISSED_REACT is on."
     prompt: "Missed-DM reaction emoji"
     password: false
+  - name: VECTOR_REACTIONS
+    description: "on = react 👀 while the agent works, then ✅/❌ on the triggering DM (default off). Does not gate send_message action=react."
+    prompt: "Processing-lifecycle reactions? (on/off, default off)"
+    password: false

@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ready, allowlisted chats get an ❌ reaction on those messages (`POST /react`,
   `Channel::react`). First boot seeds a cursor and does not react. Disable with
   `VECTOR_MISSED_REACT=off`.
+- Hermes `send_message(action=react|unreact)` on Vector DMs: adapter
+  `add_reaction` / `remove_reaction` with last-inbound fallback. Sidecar
+  `POST /react` accepts `remove: true` (NIP-09 of our reaction rumor) and
+  optional `emoji_url` for NIP-30 custom emoji. Peer 👍 on a bot message is
+  dispatched as `reaction:added:<emoji>`. Processing-lifecycle 👀 → ✅/❌ is
+  **off by default**; set `VECTOR_REACTIONS=on` to enable. Unreact keeps the
+  reaction rumor id from `send_reaction` so 👀 is actually retracted before ✅.
 
 ### Changed
 

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Concord **communities** (join-first + optional bot-owned home room). Sidecar
+  forwards `is_group` SSE, sends/typing via `bot.channel(id)`, and auto-accepts
+  community invites only from `VECTOR_TRUSTED_INVITERS` /
+  `VECTOR_ALLOWED_USERS` (`VECTOR_INVITE_POLICY=manual` parks them). Adapter
+  maps joined Concord channels to `chat_type=group` and mention-gates
+  (`@npub` / `@VECTOR_BOT_NAME` / reply-to-bot; `@everyone` ignored).
+  Group senders: union of `VECTOR_ALLOWED_USERS` (DM list),
+  `VECTOR_GROUP_ALLOWED_USERS` (group-only), or any member on channels in
+  `VECTOR_GROUP_ALLOW_ALL`. The gateway learns open channels via
+  `extra.group_allowed_chats` (Hermes' chat-id allowlist). Group-only and
+  open-channel senders are stamped `role_authorized` so they are not dropped
+  after adapter admission. Pairing stays DM-only. The Vector app does not
+  show channel ids; on join the sidecar logs the full hex and the adapter DMs
+  `VECTOR_HOME_CHANNEL` a copy-pasteable `channel_id:` (once per channel,
+  persisted in `sdk/notified-channels.json`).
+  `VECTOR_CREATE_COMMUNITY=on`
+  creates a private Concord v2 community, persists
+  `sdk/home-community.json`, and direct-invites allowlisted npubs. No public
+  invite links. Trusted join is enough to listen — there is no
+  `VECTOR_GROUP_ALLOWED_CHATS` look-gate.
 - Optional public bot profile (Vector `update_profile` / kind-0 `name`,
   `about`, `picture`, `banner`): `VECTOR_BOT_NAME`, `VECTOR_BOT_ABOUT`,
   `VECTOR_BOT_AVATAR`, `VECTOR_BOT_BANNER`. Setup copies images to
@@ -34,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next text from that peer; previously each file replaced the last.
 
 ### Changed
+
+- Removed ``VECTOR_GROUP_ALLOWED_CHATS``. A trusted invite auto-join is
+  enough for the bot to listen; mention/people gates still apply.
 
 - Sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk)
   `=0.9.0` (and `vector-core` `0.8`) instead of a sibling

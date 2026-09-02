@@ -148,6 +148,113 @@ class TestParseNpubTarget:
             )
 
 
+CHANNEL_ID = "ab" * 32
+assert len(CHANNEL_ID) == 64
+
+
+class TestParseTargetRef:
+    def test_npub_is_dm(self):
+        assert vector_adapter._parse_target_ref(NPUB) == (NPUB, None)
+
+    def test_hex_pubkey_is_dm_when_unknown_channel(self, monkeypatch):
+        vector_adapter._known_channel_ids.clear()
+        monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
+        assert vector_adapter._parse_target_ref(HEX_PUBKEY) == (NPUB, None)
+
+    def test_remembered_channel_stays_hex(self):
+        vector_adapter._known_channel_ids.clear()
+        vector_adapter._remember_channel(CHANNEL_ID.upper())
+        assert vector_adapter._parse_target_ref(CHANNEL_ID) == (CHANNEL_ID, None)
+        vector_adapter._known_channel_ids.clear()
+
+    def test_unknown_channel_hex_encodes_as_npub(self, monkeypatch):
+        vector_adapter._known_channel_ids.clear()
+        monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
+        # CHANNEL_ID is valid 64-hex so normalize_npub encodes it as npub.
+        result = vector_adapter._parse_target_ref(CHANNEL_ID)
+        assert result is not None
+        assert result[1] is None
+        assert result[0].startswith("npub1")
+
+    def test_garbage(self):
+        assert vector_adapter._parse_target_ref("garbage") is None
+
+
+class TestMentionsBot:
+    def test_at_npub(self):
+        assert vector_adapter._mentions_bot(f"hey @{NPUB}", NPUB)
+
+    def test_nostr_npub(self):
+        assert vector_adapter._mentions_bot(f"nostr:{NPUB} ping", NPUB)
+
+    def test_bare_npub(self):
+        assert vector_adapter._mentions_bot(f"see {NPUB} please", NPUB)
+
+    def test_display_name(self):
+        assert vector_adapter._mentions_bot("hi @Hermes are you there", NPUB, "Hermes")
+
+    def test_everyone_is_not_a_mention(self):
+        assert not vector_adapter._mentions_bot("@everyone hello", NPUB, "Hermes")
+
+    def test_unrelated(self):
+        assert not vector_adapter._mentions_bot("hello there", NPUB, "Hermes")
+
+
+class TestKnownChannels:
+    def test_remember_is_required(self):
+        vector_adapter._known_channel_ids.clear()
+        assert vector_adapter._is_known_channel(CHANNEL_ID) is False
+        vector_adapter._remember_channel(f" {CHANNEL_ID.upper()} ")
+        assert vector_adapter._is_known_channel(CHANNEL_ID) is True
+        vector_adapter._known_channel_ids.clear()
+
+    def test_allow_all_env_counts_as_known(self, monkeypatch):
+        vector_adapter._known_channel_ids.clear()
+        monkeypatch.setenv("VECTOR_GROUP_ALLOW_ALL", CHANNEL_ID)
+        assert vector_adapter._is_known_channel(CHANNEL_ID) is True
+
+
+class TestGroupSenderAuth:
+    def test_dm_allowlist_unions_into_group(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is True
+        assert vector_adapter._group_sender_is_authorized(NPUB, CHANNEL_ID) is False
+
+    def test_group_only_users(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
+        monkeypatch.setenv("VECTOR_GROUP_ALLOWED_USERS", PEER_HEX)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is True
+        assert vector_adapter._sender_is_authorized(PEER_NPUB) is False
+
+    def test_allow_all_channel(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
+        monkeypatch.setenv("VECTOR_GROUP_ALLOW_ALL", CHANNEL_ID.upper())
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is True
+        other = "cd" * 32
+        assert vector_adapter._group_sender_is_authorized(PEER_NPUB, other) is False
+
+    def test_allow_all_star_not_wildcard(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
+        monkeypatch.setenv("VECTOR_GROUP_ALLOW_ALL", "*")
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is False
+
+    def test_global_allow_all_users(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
+        monkeypatch.setenv("VECTOR_ALLOW_ALL_USERS", "true")
+        assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is True
+
+
 class TestTruncateNpub:
     def test_long_npub_matches_session_16_prefix(self):
         out = vector_adapter._truncate_npub(NPUB)
@@ -202,6 +309,8 @@ class TestEnvEnablement:
         monkeypatch.delenv("VECTOR_BOT_AVATAR", raising=False)
         monkeypatch.delenv("VECTOR_BOT_ABOUT", raising=False)
         monkeypatch.delenv("VECTOR_BOT_BANNER", raising=False)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
         seed = vector_adapter._env_enablement()
         assert seed is not None
         assert seed["npub"] == NPUB
@@ -238,6 +347,15 @@ class TestEnvEnablement:
         monkeypatch.setenv("VECTOR_BOT_BANNER", "/abs/banner.png")
         seed = vector_adapter._env_enablement()
         assert seed["bot_banner"] == "/abs/banner.png"
+
+    def test_seeds_group_gates(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_NPUB", NPUB)
+        monkeypatch.setenv("VECTOR_GROUP_ALLOWED_USERS", PEER_NPUB)
+        monkeypatch.setenv("VECTOR_GROUP_ALLOW_ALL", CHANNEL_ID.upper())
+        seed = vector_adapter._env_enablement()
+        assert seed["group_allowed_chats"] == CHANNEL_ID
+        assert seed["group_allowed_users"] == PEER_NPUB
+        assert "group_allow_all" not in seed
 
 
 class TestInstallBotAvatar:
@@ -330,8 +448,9 @@ class TestRegister:
         assert kwargs["cron_deliver_env_var"] == "VECTOR_HOME_CHANNEL"
         assert kwargs["allowed_users_env"] == "VECTOR_ALLOWED_USERS"
         assert kwargs["allow_all_env"] == "VECTOR_ALLOW_ALL_USERS"
-        assert kwargs["parse_target_ref_fn"] is vector_adapter._parse_npub_target
+        assert kwargs["parse_target_ref_fn"] is vector_adapter._parse_target_ref
         assert kwargs["parse_target_ref_fn"] is not vector_adapter.normalize_npub
+        assert kwargs["parse_target_ref_fn"] is not vector_adapter._parse_npub_target
         assert kwargs["check_fn"] is vector_adapter.check_requirements
         assert kwargs["validate_config"] is vector_adapter.validate_config
         assert kwargs["env_enablement_fn"] is vector_adapter._env_enablement
@@ -340,6 +459,7 @@ class TestRegister:
         assert kwargs.get("ensure_deps_fn") is None
         assert kwargs["max_message_length"] == 4000
         assert "markdown" in kwargs["platform_hint"].lower()
+        assert "mention" in kwargs["platform_hint"].lower()
         sample = kwargs["parse_target_ref_fn"](HEX_PUBKEY)
         assert sample == (NPUB, None)
         assert not isinstance(sample, str)
@@ -411,6 +531,8 @@ class MockSidecar:
         self.react_headers: list = []
         self.events_headers: list = []
         self.inject_queue: list = []
+        self.communities: list = []
+        self.listed_communities: list = []
         self.send_raw: bytes | None = None
         self.port: int | None = None
         self._httpd = None
@@ -451,6 +573,8 @@ class MockSidecar:
                             200, {"status": "ready", "npub": sidecar.npub}
                         )
                     return self._json(200, {"status": "starting"})
+                if path == "/communities":
+                    return self._json(200, {"communities": sidecar.listed_communities})
                 if path == "/events":
                     sidecar.events_headers.append(dict(self.headers))
                     self.send_response(200)
@@ -499,6 +623,17 @@ class MockSidecar:
                     sidecar.reacts.append(data)
                     sidecar.react_headers.append(dict(self.headers))
                     return self._json(200, {"ok": True})
+                if path == "/communities":
+                    sidecar.communities.append(data)
+                    return self._json(
+                        200,
+                        {
+                            "created": True,
+                            "community_id": "cc" * 32,
+                            "channel_id": CHANNEL_ID,
+                            "name": data.get("name") or "Hermes",
+                        },
+                    )
                 return self._json(404, {"error": "not found", "code": "not_found"})
 
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -558,6 +693,19 @@ def _make_adapter(monkeypatch, tmp_path, **extra):
         monkeypatch.delenv("VECTOR_BOT_AVATAR", raising=False)
     if not extra.get("bot_banner"):
         monkeypatch.delenv("VECTOR_BOT_BANNER", raising=False)
+    vector_adapter._known_channel_ids.clear()
+    if extra.get("allowed_users"):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", extra["allowed_users"])
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+    if extra.get("group_allowed_users"):
+        monkeypatch.setenv("VECTOR_GROUP_ALLOWED_USERS", extra["group_allowed_users"])
+    if extra.get("group_allow_all"):
+        monkeypatch.setenv("VECTOR_GROUP_ALLOW_ALL", extra["group_allow_all"])
+    if extra.get("create_community"):
+        monkeypatch.setenv("VECTOR_CREATE_COMMUNITY", "on")
+    else:
+        monkeypatch.delenv("VECTOR_CREATE_COMMUNITY", raising=False)
+    monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
     data_dir = Path(extra.get("data_dir") or (tmp_path / "sdk"))
     data_dir.mkdir(parents=True, exist_ok=True)
     if not extra.get("skip_identity"):
@@ -623,6 +771,172 @@ class TestGetChatInfo:
         assert info["name"] == f"{NPUB[:16]}..."
         assert len(info["name"]) < len(NPUB)
 
+    def test_channel_hex_is_group(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        info = asyncio.run(adapter.get_chat_info(CHANNEL_ID))
+        assert info["type"] == "group"
+        assert info["chat_id"] == CHANNEL_ID
+        assert info["name"] == f"{CHANNEL_ID[:16]}..."
+
+    def test_group_allow_all_published_as_hermes_extra(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, group_allow_all=CHANNEL_ID.upper()
+        )
+        assert adapter.config.extra["group_allowed_chats"] == CHANNEL_ID
+        assert "group_allow_all" not in adapter.config.extra
+
+
+class TestJoinedChannelNotice:
+    def test_format_is_copy_pasteable(self):
+        community = "cc" * 32
+        body = vector_adapter._format_joined_notice(
+            community,
+            [{"channel_id": CHANNEL_ID, "name": "general"}],
+        )
+        assert f"channel_id: {CHANNEL_ID}" in body
+        assert f"community_id: {community}" in body
+        assert "VECTOR_GROUP_ALLOW_ALL" in body
+        assert "general" in body
+
+    def test_load_save_roundtrip(self, tmp_path):
+        ids = {CHANNEL_ID, "cd" * 32}
+        vector_adapter._save_notified_channel_ids(tmp_path, ids)
+        path = tmp_path / vector_adapter.NOTIFIED_CHANNELS_FILE
+        assert oct(path.stat().st_mode)[-3:] == "600"
+        assert vector_adapter._load_notified_channel_ids(tmp_path) == ids
+
+    def test_notify_dms_home_once(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
+        adapter._running = True
+        adapter._http_client = MagicMock()
+        sent = []
+
+        async def fake_send(chat_id, content, reply_to=None, metadata=None):
+            sent.append((chat_id, content))
+            return vector_adapter.SendResult(success=True, message_id="n1")
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        community = "cc" * 32
+
+        async def go():
+            await adapter._notify_joined_channels(
+                community, [{"channel_id": CHANNEL_ID, "name": "general"}]
+            )
+            await adapter._notify_joined_channels(
+                community, [{"channel_id": CHANNEL_ID, "name": "general"}]
+            )
+
+        asyncio.run(go())
+        assert len(sent) == 1
+        assert sent[0][0] == NPUB
+        assert CHANNEL_ID in sent[0][1]
+        saved = json.loads(
+            (Path(adapter.data_dir) / vector_adapter.NOTIFIED_CHANNELS_FILE).read_text()
+        )
+        assert CHANNEL_ID in saved
+
+    def test_notify_without_home_persists(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._running = True
+        sent = []
+
+        async def fake_send(*_a, **_k):
+            sent.append(1)
+            return vector_adapter.SendResult(success=True)
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        caplog.set_level(logging.INFO, logger="hermes_plugins.vector_platform.adapter")
+        asyncio.run(
+            adapter._notify_joined_channels(
+                "cc" * 32, [{"channel_id": CHANNEL_ID, "name": ""}]
+            )
+        )
+        assert sent == []
+        assert CHANNEL_ID in caplog.text
+        saved = json.loads(
+            (Path(adapter.data_dir) / vector_adapter.NOTIFIED_CHANNELS_FILE).read_text()
+        )
+        assert CHANNEL_ID in saved
+
+    def test_notify_failed_send_does_not_persist(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
+        adapter._running = True
+        adapter._http_client = MagicMock()
+
+        async def fake_send(*_a, **_k):
+            return vector_adapter.SendResult(success=False, error="boom")
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        asyncio.run(
+            adapter._notify_joined_channels(
+                "cc" * 32, [{"channel_id": CHANNEL_ID, "name": "x"}]
+            )
+        )
+        path = Path(adapter.data_dir) / vector_adapter.NOTIFIED_CHANNELS_FILE
+        assert not path.exists()
+        assert CHANNEL_ID not in adapter._notified_channel_ids
+
+    def test_community_joined_sse(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
+        adapter._running = True
+        adapter._http_client = MagicMock()
+        sent = []
+
+        async def fake_send(chat_id, content, **_k):
+            sent.append(content)
+            return vector_adapter.SendResult(success=True, message_id="n1")
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        asyncio.run(
+            adapter._dispatch_sse_event(
+                {
+                    "type": "community_joined",
+                    "data": {
+                        "community_id": "cc" * 32,
+                        "channels": [{"channel_id": CHANNEL_ID, "name": "general"}],
+                    },
+                }
+            )
+        )
+        assert sent
+        assert CHANNEL_ID in sent[0]
+
+    def test_empty_channels_does_not_dm(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
+        adapter._running = True
+        sent = []
+
+        async def fake_send(*_a, **_k):
+            sent.append(1)
+            return vector_adapter.SendResult(success=True)
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        asyncio.run(adapter._notify_joined_channels("cc" * 32, []))
+        assert sent == []
+
+    def test_community_joined_empty_syncs(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        called = []
+
+        async def fake_sync():
+            called.append(1)
+
+        monkeypatch.setattr(adapter, "_sync_joined_channels", fake_sync)
+        asyncio.run(
+            adapter._dispatch_sse_event(
+                {
+                    "type": "community_joined",
+                    "data": {"community_id": "cc" * 32, "channels": []},
+                }
+            )
+        )
+        assert called == [1]
+
 
 class TestInboundMapping:
     def test_chat_id_user_id_are_peer_npub(self, monkeypatch, tmp_path):
@@ -639,6 +953,7 @@ class TestInboundMapping:
         assert src.chat_id == PEER_NPUB
         assert src.user_id == PEER_NPUB
         assert src.chat_type == "dm"
+        assert src.role_authorized is not True
         assert captured[0].text == "hi"
         assert captured[0].message_id == "m1"
 
@@ -680,6 +995,273 @@ class TestInboundMapping:
         asyncio.run(
             adapter._handle_message_event(
                 _message_event(PEER_NPUB, "group", msg_id="g1", is_group=True)
+            )
+        )
+        assert captured == []
+
+    def test_group_mention_dispatches(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            bot_name="Hermes",
+            allowed_users=PEER_NPUB,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"hey @{NPUB} ping",
+                    msg_id="g-mention",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    community_id="cc" * 32,
+                )
+            )
+        )
+        assert len(captured) == 1
+        src = captured[0].source
+        assert src.chat_type == "group"
+        assert src.chat_id == CHANNEL_ID
+        assert src.user_id == PEER_NPUB
+        assert src.parent_chat_id == "cc" * 32
+        assert src.role_authorized is True
+
+    def test_group_unmentioned_dropped(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "just chatting",
+                    msg_id="g-quiet",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert captured == []
+
+    def test_group_unauthorized_mention_dropped_even_with_pairing(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_PAIRING", "on")
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=NPUB,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} please-pair",
+                    msg_id="g-unauth",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert captured == []
+
+    def test_group_reply_to_bot_counts(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=PEER_NPUB,
+        )
+        adapter._record_sent_message("bot-msg-1")
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "following up",
+                    msg_id="g-reply",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    reply_to="bot-msg-1",
+                )
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].source.chat_type == "group"
+
+    def test_group_unauthorized_sender_dropped_even_with_mention(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB, allowed_users=NPUB)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} hello",
+                    msg_id="g-deny",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert captured == []
+
+    def test_group_only_user_mention_dispatches(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=NPUB,
+            group_allowed_users=PEER_NPUB,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} ping",
+                    msg_id="g-group-only",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].source.user_id == PEER_NPUB
+        assert captured[0].source.role_authorized is True
+
+    def test_group_allow_all_any_member_mention(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=NPUB,
+            group_allow_all=CHANNEL_ID,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} ping",
+                    msg_id="g-open",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].source.role_authorized is True
+
+    def test_group_allow_all_still_needs_mention(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=NPUB,
+            group_allow_all=CHANNEL_ID,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "@everyone hello",
+                    msg_id="g-everyone",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert captured == []
+
+    def test_group_allow_all_does_not_need_look_list(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=NPUB,
+            group_allow_all=CHANNEL_ID,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} ping",
+                    msg_id="g-open-no-look",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert len(captured) == 1
+
+    def test_group_only_user_cannot_dm(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=NPUB,
+            group_allowed_users=PEER_NPUB,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "please dm", msg_id="dm-group-only")
             )
         )
         assert captured == []
@@ -911,6 +1493,82 @@ class TestMockedSidecarHttp:
             assert sidecar.send_headers[0].get("X-Hermes-Sidecar-Token") == token
             assert sidecar.typing == [{"to": PEER_NPUB}]
             assert sidecar.typing_headers[0].get("X-Hermes-Sidecar-Token") == token
+        finally:
+            sidecar.stop()
+
+    def test_send_and_typing_channel_hex(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    result = await adapter.send(CHANNEL_ID, "hello group")
+                    assert result.success
+                    await adapter.send_typing(CHANNEL_ID)
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.sends == [{"to": CHANNEL_ID, "body": "hello group"}]
+            assert sidecar.typing == [{"to": CHANNEL_ID}]
+        finally:
+            sidecar.stop()
+
+    def test_ensure_home_community_seeds_allowlist(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            vector_adapter._known_channel_ids.clear()
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    await adapter._ensure_home_community()
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.communities
+            assert CHANNEL_ID in vector_adapter._known_channel_ids
+        finally:
+            sidecar.stop()
+
+    def test_sync_joined_channels_notifies_home(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        sidecar.listed_communities = [
+            {
+                "community_id": "cc" * 32,
+                "channels": [{"channel_id": CHANNEL_ID, "name": "general"}],
+            }
+        ]
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    await adapter._sync_joined_channels()
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.sends
+            assert sidecar.sends[0]["to"] == NPUB
+            assert CHANNEL_ID in sidecar.sends[0]["body"]
         finally:
             sidecar.stop()
 
@@ -1674,6 +2332,7 @@ class TestInteractiveSetup:
         assert io.saved["VECTOR_HOME_CHANNEL"] == NPUB
         assert io.saved["VECTOR_ALLOWED_USERS"] == NPUB
         assert io.saved["VECTOR_PAIRING"] == "on"
+        assert io.saved["VECTOR_CREATE_COMMUNITY"] == "off"
         assert io.saved["VECTOR_BOT_NAME"] == "Hermes"
         assert io.saved["VECTOR_BOT_ABOUT"] == ""
         assert "VECTOR_NSEC" not in io.saved

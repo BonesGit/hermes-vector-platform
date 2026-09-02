@@ -24,15 +24,15 @@ optional_env:
     prompt: "Mnemonic"
     password: true
   - name: VECTOR_ALLOWED_USERS
-    description: "Comma-separated npubs allowed to DM the bot"
-    prompt: "Allowed npubs"
+    description: "Comma-separated npubs allowed to DM the bot. Also grants community turns (union). Pairing is DM-only."
+    prompt: "Allowed npubs (DMs)"
     password: false
   - name: VECTOR_ALLOW_ALL_USERS
     description: "Allow any Vector user (dev only)"
     prompt: "Allow all users?"
     password: false
   - name: VECTOR_HOME_CHANNEL
-    description: "Operator npub for cron / notification delivery"
+    description: "Operator npub for cron / join notices (channel ids)"
     prompt: "Home npub"
     password: false
   - name: VECTOR_BOT_NAME
@@ -86,4 +86,28 @@ optional_env:
   - name: VECTOR_REACTIONS
     description: "on = react 👀 while the agent works, then ✅/❌ on the triggering DM (default off). Does not gate send_message action=react."
     prompt: "Processing-lifecycle reactions? (on/off, default off)"
+    password: false
+  - name: VECTOR_GROUP_ALLOWED_USERS
+    description: "Comma-separated npubs who may trigger community turns without DM access. VECTOR_ALLOWED_USERS already get group access."
+    prompt: "Group-only npubs"
+    password: false
+  - name: VECTOR_GROUP_ALLOW_ALL
+    description: "Comma-separated channel ids (64-hex) where any member may @mention or reply to the bot. @everyone is ignored. No * wildcard. Copy the id from the join DM to VECTOR_HOME_CHANNEL or from vector-bridge.log (the Vector app does not show it)."
+    prompt: "Open community channel ids (any member)"
+    password: false
+  - name: VECTOR_TRUSTED_INVITERS
+    description: "Npubs whose community invites the bot auto-accepts (default: VECTOR_ALLOWED_USERS). VECTOR_INVITE_POLICY=manual parks all invites."
+    prompt: "Trusted community inviters (npubs)"
+    password: false
+  - name: VECTOR_INVITE_POLICY
+    description: "whitelist (default) or manual. public is refused."
+    prompt: "Community invite policy (whitelist/manual)"
+    password: false
+  - name: VECTOR_CREATE_COMMUNITY
+    description: "on = after Ready, create or reuse a bot-owned private Concord community (no public invite link)"
+    prompt: "Create a bot-owned home community? (on/off)"
+    password: false
+  - name: VECTOR_COMMUNITY_NAME
+    description: "Name for VECTOR_CREATE_COMMUNITY (default Hermes)"
+    prompt: "Home community name"
     password: false

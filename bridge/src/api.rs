@@ -170,6 +170,8 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(events::get_events))
         .route("/send", post(send))
         .route("/typing", post(typing))
+        .route("/communities", get(list_communities).post(create_community))
+        .route("/communities/invite", post(invite_to_community))
         .route("/profile", post(profile).get(not_implemented))
         .route("/react", post(react))
         .route("/send-file", post(send_file))
@@ -231,6 +233,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -293,6 +296,11 @@ impl ApiError {
             error: "internal error",
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -326,19 +334,27 @@ struct HealthBody {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     npub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_invites: Option<usize>,
 }
 
 async fn health(State(state): State<AppState>, _auth: Auth) -> Json<HealthBody> {
     let health = state.0.health.read().await;
     if health.ready {
+        let pending_invites = match state.bot().await {
+            Some(bot) => bot.pending_invites().ok().map(|v| v.len()),
+            None => None,
+        };
         Json(HealthBody {
             status: "ready",
             npub: health.npub.clone(),
+            pending_invites,
         })
     } else {
         Json(HealthBody {
             status: "starting",
             npub: None,
+            pending_invites: None,
         })
     }
 }
@@ -361,10 +377,10 @@ async fn send(
     _auth: Auth,
     JsonBody(req): JsonBody<SendRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let npub = parse_npub(&req.to)?;
+    let to = parse_send_target(&req.to)?;
     state.require_ready().await?;
     if let Some(bot) = state.bot().await {
-        let channel = bot.dm(&npub);
+        let channel = bot.channel(&to);
         let result = match req.reply_to.as_deref() {
             Some(id) if !id.is_empty() => channel.reply(id, &req.body).await,
             _ => channel.send(&req.body).await,
@@ -389,10 +405,10 @@ async fn typing(
     _auth: Auth,
     JsonBody(req): JsonBody<TypingRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let npub = parse_npub(&req.to)?;
+    let to = parse_send_target(&req.to)?;
     state.require_ready().await?;
     if let Some(bot) = state.bot().await {
-        bot.dm(&npub).typing().await.map_err(|err| {
+        bot.channel(&to).typing().await.map_err(|err| {
             eprintln!("[vector-bridge] typing failed: {err}");
             ApiError::internal()
         })?;
@@ -670,11 +686,247 @@ async fn test_ready(State(state): State<AppState>, _auth: Auth) -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
+const HOME_COMMUNITY_FILE: &str = "home-community.json";
+const STUB_COMMUNITY_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const STUB_CHANNEL_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn is_channel_id(raw: &str) -> bool {
+    raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `npub1…` → DM; 64-char hex → Concord channel. Matches SDK `channel_kind_for`.
+pub fn parse_send_target(raw: &str) -> Result<String, ApiError> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(ApiError::bad_request("to is required"));
+    }
+    if is_channel_id(s) {
+        return Ok(s.to_ascii_lowercase());
+    }
+    parse_npub(s)
+}
+
 pub fn parse_npub(raw: &str) -> Result<String, ApiError> {
     PublicKey::parse(raw.trim())
         .map_err(|_| ApiError::invalid_npub())?
         .to_bech32()
         .map_err(|_| ApiError::invalid_npub())
+}
+
+fn data_dir() -> Option<PathBuf> {
+    std::env::var("VECTOR_DATA_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn home_community_path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join(HOME_COMMUNITY_FILE))
+}
+
+fn load_home_community() -> Option<Value> {
+    let path = home_community_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_home_community(value: &Value) -> Result<(), ApiError> {
+    let path = home_community_path().ok_or_else(ApiError::internal)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| ApiError::internal())?;
+    }
+    let bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::internal())?;
+    std::fs::write(path, bytes).map_err(|_| ApiError::internal())?;
+    Ok(())
+}
+
+fn first_channel_id(summary: &Value) -> Option<String> {
+    summary
+        .get("channels")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|ch| {
+            ch.get("channel_id")
+                .or_else(|| ch.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
+fn invite_allowlisted(bot: &VectorBot, community_id: &str) {
+    let raw = std::env::var("VECTOR_ALLOWED_USERS").unwrap_or_default();
+    let me = bot.npub();
+    for part in raw.split(',') {
+        let Ok(npub) = parse_npub(part) else {
+            continue;
+        };
+        if npub == me {
+            continue;
+        }
+        let community = bot.community(community_id);
+        let npub = npub.clone();
+        tokio::spawn(async move {
+            if let Err(err) = community.invite(&npub).await {
+                eprintln!("[vector-bridge] invite {npub} failed: {err}");
+            } else {
+                eprintln!("[vector-bridge] direct-invited {npub}");
+            }
+        });
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateCommunityRequest {
+    #[serde(default)]
+    name: String,
+}
+
+async fn create_community(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<CreateCommunityRequest>,
+) -> Result<Json<Value>, ApiError> {
+    state.require_ready().await?;
+    if let Some(existing) = load_home_community() {
+        return Ok(Json(json!({
+            "created": false,
+            "community_id": existing.get("community_id"),
+            "channel_id": existing.get("channel_id"),
+            "name": existing.get("name"),
+        })));
+    }
+    let name = {
+        let n = req.name.trim();
+        if !n.is_empty() {
+            n.to_string()
+        } else {
+            std::env::var("VECTOR_COMMUNITY_NAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Hermes".into())
+        }
+    };
+    if let Some(bot) = state.bot().await {
+        let summary = bot.core().create_community_v2(&name).await.map_err(|err| {
+            eprintln!("[vector-bridge] create_community failed: {err}");
+            ApiError::internal()
+        })?;
+        let community_id = summary
+            .get("community_id")
+            .or_else(|| summary.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if community_id.is_empty() {
+            return Err(ApiError::internal());
+        }
+        let channel_id = first_channel_id(&summary).unwrap_or_default();
+        let stored = json!({
+            "community_id": community_id,
+            "channel_id": channel_id,
+            "name": name,
+        });
+        save_home_community(&stored)?;
+        invite_allowlisted(&bot, &community_id);
+        Ok(Json(json!({
+            "created": true,
+            "community_id": community_id,
+            "channel_id": channel_id,
+            "name": name,
+        })))
+    } else {
+        let stored = json!({
+            "community_id": STUB_COMMUNITY_ID,
+            "channel_id": STUB_CHANNEL_ID,
+            "name": name,
+        });
+        if home_community_path().is_some() {
+            save_home_community(&stored)?;
+        }
+        Ok(Json(json!({
+            "created": true,
+            "community_id": STUB_COMMUNITY_ID,
+            "channel_id": STUB_CHANNEL_ID,
+            "name": name,
+        })))
+    }
+}
+
+async fn list_communities(
+    State(state): State<AppState>,
+    _auth: Auth,
+) -> Result<Json<Value>, ApiError> {
+    state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        let mut out = Vec::new();
+        for community in bot.communities().await {
+            let id = community.id().to_string();
+            let channels: Vec<Value> = community
+                .channels()
+                .await
+                .into_iter()
+                .map(|ch| {
+                    json!({
+                        "channel_id": ch.id(),
+                        "name": ch.name(),
+                        "private": ch.is_private(),
+                        "readable": ch.is_readable(),
+                    })
+                })
+                .collect();
+            out.push(json!({
+                "community_id": id,
+                "dissolved": community.is_dissolved().await,
+                "channels": channels,
+            }));
+        }
+        Ok(Json(json!({ "communities": out })))
+    } else {
+        Ok(Json(json!({ "communities": [] })))
+    }
+}
+
+#[derive(Deserialize)]
+struct InviteRequest {
+    #[serde(default)]
+    community_id: String,
+    npub: String,
+}
+
+async fn invite_to_community(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<InviteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let npub = parse_npub(&req.npub)?;
+    state.require_ready().await?;
+    let community_id = {
+        let raw = req.community_id.trim();
+        if !raw.is_empty() {
+            raw.to_string()
+        } else {
+            load_home_community()
+                .and_then(|v| {
+                    v.get("community_id")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| ApiError::bad_request("community_id is required"))?
+        }
+    };
+    if let Some(bot) = state.bot().await {
+        bot.community(&community_id)
+            .invite(&npub)
+            .await
+            .map_err(|err| {
+                eprintln!("[vector-bridge] invite failed: {err}");
+                ApiError::internal()
+            })?;
+    }
+    Ok(Json(
+        json!({ "ok": true, "community_id": community_id, "npub": npub }),
+    ))
 }
 
 pub fn stub_npub() -> &'static str {
@@ -704,5 +956,18 @@ mod tests {
         assert!(same_pubkey(npub, npub));
         assert!(same_pubkey(hex, npub));
         assert!(same_event_id("Ab", "ab"));
+    }
+
+    #[test]
+    fn parse_send_target_npub_and_channel() {
+        let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+        assert_eq!(parse_send_target(npub).unwrap(), npub);
+        let channel = "A".repeat(64);
+        assert_eq!(parse_send_target(&channel).unwrap(), "a".repeat(64));
+        assert_eq!(
+            parse_send_target("not-an-npub").unwrap_err().code(),
+            "invalid_npub"
+        );
+        assert_eq!(parse_send_target("").unwrap_err().code(), "bad_request");
     }
 }

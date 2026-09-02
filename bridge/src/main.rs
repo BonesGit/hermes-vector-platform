@@ -19,7 +19,7 @@ use std::time::Duration;
 use nostr::nips::nip06::FromMnemonic;
 use serde_json::json;
 use tokio::sync::watch;
-use vector_sdk::nostr::{FromBech32, Keys, SecretKey, ToBech32};
+use vector_sdk::nostr::{FromBech32, Keys, PublicKey, SecretKey, ToBech32};
 use vector_sdk::{InvitePolicy, VectorBot};
 
 use crate::api::{router, stub_npub, AppState};
@@ -357,7 +357,7 @@ fn spawn_vector_bot(state: AppState, data_dir: PathBuf, stop_tx: watch::Sender<S
     tokio::spawn(async move {
         match VectorBot::builder()
             .data_dir(&data_dir)
-            .invite_policy(InvitePolicy::Manual)
+            .invite_policy(invite_policy_from_env())
             .build()
             .await
         {
@@ -549,6 +549,67 @@ async fn wait_shutdown(watch_stdin: bool) {
     }
 }
 
+/// Community invite policy from env. Never `.public()` — a public bot is a
+/// spam surface. Default is whitelist of `VECTOR_TRUSTED_INVITERS`, falling
+/// back to `VECTOR_ALLOWED_USERS`. Empty list or `VECTOR_INVITE_POLICY=manual`
+/// parks every invite.
+fn invite_policy_from_env() -> InvitePolicy {
+    invite_policy_from_parts(
+        &std::env::var("VECTOR_INVITE_POLICY").unwrap_or_default(),
+        std::env::var("VECTOR_TRUSTED_INVITERS").ok(),
+        std::env::var("VECTOR_ALLOWED_USERS").ok(),
+    )
+}
+
+fn invite_policy_from_parts(
+    mode: &str,
+    trusted: Option<String>,
+    allowed: Option<String>,
+) -> InvitePolicy {
+    let mode = mode.trim().to_ascii_lowercase();
+    if mode == "manual" {
+        eprintln!("[vector-bridge] invite policy=manual (park all community invites)");
+        return InvitePolicy::Manual;
+    }
+    if mode == "public" {
+        eprintln!(
+            "[vector-bridge] VECTOR_INVITE_POLICY=public is not supported; \
+             using whitelist/manual instead"
+        );
+    }
+    let raw = trusted
+        .filter(|s| !s.trim().is_empty())
+        .or(allowed)
+        .unwrap_or_default();
+    let npubs = parse_invite_whitelist(&raw);
+    if npubs.is_empty() {
+        eprintln!(
+            "[vector-bridge] invite policy=manual \
+             (no VECTOR_TRUSTED_INVITERS / VECTOR_ALLOWED_USERS)"
+        );
+        InvitePolicy::Manual
+    } else {
+        eprintln!(
+            "[vector-bridge] invite policy=whitelist ({} inviter{})",
+            npubs.len(),
+            if npubs.len() == 1 { "" } else { "s" }
+        );
+        InvitePolicy::Whitelist(npubs)
+    }
+}
+
+fn parse_invite_whitelist(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            PublicKey::parse(s).ok().and_then(|pk| pk.to_bech32().ok())
+        })
+        .collect()
+}
+
 fn env_or(key: &str, default: &str) -> String {
     match std::env::var(key) {
         Ok(v) if !v.is_empty() => v,
@@ -626,5 +687,53 @@ impl CliError {
                 let _ = writeln!(io::stderr(), "vector-bridge: {msg}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod invite_policy_tests {
+    use super::*;
+
+    const NPUB: &str = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+    const HEX: &str = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
+
+    fn whitelist(policy: &InvitePolicy) -> Option<&[String]> {
+        match policy {
+            InvitePolicy::Whitelist(list) => Some(list.as_slice()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn manual_mode_parks_even_with_allowlist() {
+        let policy = invite_policy_from_parts("manual", None, Some(NPUB.into()));
+        assert!(matches!(policy, InvitePolicy::Manual));
+    }
+
+    #[test]
+    fn empty_lists_are_manual() {
+        let policy = invite_policy_from_parts("", None, Some("  ,  ".into()));
+        assert!(matches!(policy, InvitePolicy::Manual));
+    }
+
+    #[test]
+    fn trusted_inviters_win_over_allowed_users() {
+        let policy =
+            invite_policy_from_parts("whitelist", Some(NPUB.into()), Some("npub1nope".into()));
+        let list = whitelist(&policy).expect("whitelist");
+        assert_eq!(list, &[NPUB]);
+    }
+
+    #[test]
+    fn allowed_users_are_the_default_whitelist() {
+        let policy = invite_policy_from_parts("", None, Some(format!("{HEX},not-an-npub")));
+        let list = whitelist(&policy).expect("whitelist");
+        assert_eq!(list, &[NPUB]);
+    }
+
+    #[test]
+    fn public_mode_is_refused() {
+        let policy = invite_policy_from_parts("public", None, Some(NPUB.into()));
+        assert!(whitelist(&policy).is_some());
     }
 }

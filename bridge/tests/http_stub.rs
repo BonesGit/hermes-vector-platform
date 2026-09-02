@@ -291,6 +291,25 @@ fn send_validates_npub_and_requires_ready() {
     let id = body["id"].as_str().expect("id");
     assert_eq!(id.len(), 64);
 
+    let channel = "a".repeat(64);
+    let (status, body) = post(
+        &server,
+        "/send",
+        Some(&server.token),
+        json!({ "to": channel, "body": "hi group" }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"].as_str().expect("id").len(), 64);
+
+    let (status, body) = post(
+        &server,
+        "/typing",
+        Some(&server.token),
+        json!({ "to": channel }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+
     let (status, body) = post(
         &server,
         "/typing",
@@ -520,6 +539,82 @@ fn sse_ping_and_fake_inject() {
     assert!(buf.contains("id: deadbeef"), "{buf}");
     assert!(buf.contains("\"text\":\"hello\""), "{buf}");
     assert!(buf.contains("\"type\":\"message\""), "{buf}");
+}
+
+#[test]
+fn sse_inject_group_message() {
+    let server = spawn_server(&[("VECTOR_SSE_PING_MS", "5000")]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let mut stream = open_sse(server.port, &server.token);
+    let channel = "a".repeat(64);
+    let (status, body) = post(
+        &server,
+        "/__test/inject",
+        Some(&server.token),
+        json!({
+            "id": "group-1",
+            "chat_id": channel,
+            "npub": VALID_NPUB,
+            "is_group": true,
+            "is_mine": false,
+            "text": "hello group",
+            "community_id": "c".repeat(64),
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    let buf = read_sse_until(
+        &mut stream,
+        |s| s.contains("group-1") && s.contains("hello group"),
+        Duration::from_secs(3),
+    );
+    assert!(buf.contains("\"is_group\":true"), "{buf}");
+    assert!(buf.contains(&channel), "{buf}");
+}
+
+#[test]
+fn communities_stub_create_list_invite() {
+    let dir = TempDir::new().unwrap();
+    let server = spawn_server(&[("VECTOR_DATA_DIR", dir.path().to_str().unwrap())]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    let (status, body) = get(&server, "/communities", Some(&server.token));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["communities"], json!([]));
+
+    let (status, body) = post(
+        &server,
+        "/communities",
+        Some(&server.token),
+        json!({ "name": "Home" }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["created"], true);
+    assert_eq!(body["name"], "Home");
+    let community_id = body["community_id"].as_str().unwrap().to_string();
+    let channel_id = body["channel_id"].as_str().unwrap().to_string();
+    assert_eq!(community_id.len(), 64);
+    assert_eq!(channel_id.len(), 64);
+
+    let (status, body) = post(
+        &server,
+        "/communities",
+        Some(&server.token),
+        json!({ "name": "Other" }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["created"], false);
+    assert_eq!(body["community_id"], community_id);
+    assert_eq!(body["name"], "Home");
+
+    let (status, body) = post(
+        &server,
+        "/communities/invite",
+        Some(&server.token),
+        json!({ "npub": VALID_NPUB }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["community_id"], community_id);
 }
 
 #[test]

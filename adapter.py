@@ -4,16 +4,24 @@ Registers the ``vector`` platform, npub helpers, and a ``BasePlatformAdapter``
 that owns a Rust ``vector-bridge`` sidecar over loopback HTTP/SSE.
 
 Vector users are identified by a bech32 ``npub1…`` public key. Session mapping
-is ``chat_id = user_id = peer npub``, ``chat_type = "dm"``.
+is ``chat_id = user_id = peer npub``, ``chat_type = "dm"`` for DMs, and
+``chat_id = channel hex``, ``chat_type = "group"``, ``user_id = sender npub``
+for Concord channels.
 
 Required env vars / config.extra keys:
-    VECTOR_NPUB           Bot public key (npub1…)
-    VECTOR_ALLOWED_USERS  Comma-separated allowlisted npubs
-    VECTOR_HOME_CHANNEL   Operator npub for cron delivery
-    VECTOR_PAIRING        on (default) = pairing codes; off = drop unauthorized
-    VECTOR_BRIDGE_PORT    HTTP port (default 8096)
-    VECTOR_BRIDGE_HOST    Bind address (default 127.0.0.1)
-    VECTOR_REACTIONS      on = 👀/✅/❌ processing acks; default off
+    VECTOR_NPUB                  Bot public key (npub1…)
+    VECTOR_ALLOWED_USERS         Comma-separated npubs allowed to DM (also
+                                 grants community turns; pairing is DM-only)
+    VECTOR_HOME_CHANNEL          Operator npub for cron + join notices
+    VECTOR_PAIRING               on (default) = pairing codes; off = drop unauthorized
+    VECTOR_BRIDGE_PORT           HTTP port (default 8096)
+    VECTOR_BRIDGE_HOST           Bind address (default 127.0.0.1)
+    VECTOR_REACTIONS             on = 👀/✅/❌ processing acks; default off
+    VECTOR_GROUP_ALLOWED_USERS    Npubs who may trigger community turns without DMs
+    VECTOR_GROUP_ALLOW_ALL       Channel ids where any member may @mention / reply
+    VECTOR_TRUSTED_INVITERS      Optional inviter npubs (default: ALLOWED_USERS)
+    VECTOR_INVITE_POLICY         manual | whitelist (default whitelist)
+    VECTOR_CREATE_COMMUNITY      on = bot-owned home community after Ready
 """
 
 from __future__ import annotations
@@ -85,6 +93,7 @@ INBOUND_DEDUP_MAX = 1024
 LAST_INBOUND_CHATS_MAX = 200
 SENT_IDS_MAX = 1000
 RUNTIME_RECORD_NAME = "vector-sidecar.json"
+NOTIFIED_CHANNELS_FILE = "notified-channels.json"
 INBOX_NAME_MAX = 180
 DOWNLOAD_TIMEOUT = 120.0
 SEND_FILE_TIMEOUT = 120.0
@@ -454,10 +463,178 @@ def normalize_npub(ref: str) -> Optional[str]:
     return None
 
 
+_CHANNEL_ID_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def normalize_channel_id(ref: str) -> Optional[str]:
+    """64-char hex Concord channel id, lowercased."""
+    raw = (ref or "").strip()
+    if _CHANNEL_ID_RE.fullmatch(raw):
+        return raw.lower()
+    return None
+
+
 def _parse_npub_target(ref: str) -> Optional[tuple[str, Optional[str]]]:
-    """parse_target_ref_fn: (chat_id, thread_id). DMs have no thread."""
+    """DM-only parse: hex / ``npub1`` / ``nostr:npub1`` → ``(npub, None)``."""
     npub = normalize_npub(ref)
     return (npub, None) if npub else None
+
+
+def _parse_target_ref(ref: str) -> Optional[tuple[str, Optional[str]]]:
+    """parse_target_ref_fn: DM npub or known Concord channel hex.
+
+    64-hex that we have seen as a joined community channel (inbound, Ready
+    roster, home-community create, or ``VECTOR_GROUP_ALLOW_ALL``) stays a
+    channel id. Anything else that ``normalize_npub`` accepts is a DM.
+    """
+    channel = normalize_channel_id(ref)
+    if channel and _is_known_channel(channel):
+        return (channel, None)
+    npub = normalize_npub(ref)
+    if npub:
+        return (npub, None)
+    if channel:
+        return (channel, None)
+    return None
+
+
+def _channel_ids_from_csv(raw: str) -> set:
+    """Canonical 64-hex channel ids from a comma-separated string. No ``*``."""
+    found: set = set()
+    for part in (raw or "").split(","):
+        cid = normalize_channel_id(part)
+        if cid:
+            found.add(cid)
+    return found
+
+
+def _channel_ids_from_env(name: str) -> set:
+    """Canonical 64-hex channel ids from a comma-separated env var. No ``*``."""
+    return _channel_ids_from_csv(os.getenv(name) or "")
+
+
+def _sync_group_allowed_chats_extra(extra: dict) -> None:
+    """Publish VECTOR_GROUP_ALLOW_ALL as Hermes ``extra.group_allowed_chats``.
+
+    Gateway ``_is_user_authorized`` reads that key for any group/channel
+    (even when ``VECTOR_ALLOWED_USERS`` is set). The old ``group_allow_all``
+    extra key is not a Hermes hook.
+    """
+    if not isinstance(extra, dict):
+        return
+    ids = set(_group_allow_all_chats())
+    ids |= _channel_ids_from_csv(str(extra.get("group_allowed_chats") or ""))
+    ids |= _channel_ids_from_csv(str(extra.get("group_allow_all") or ""))
+    extra.pop("group_allow_all", None)
+    if ids:
+        extra["group_allowed_chats"] = ",".join(sorted(ids))
+    else:
+        extra.pop("group_allowed_chats", None)
+
+
+_known_channel_ids: set = set()
+
+
+def _remember_channel(channel_id: str) -> None:
+    """Record a Concord channel the bot is in (not a user-facing allowlist)."""
+    cid = normalize_channel_id(channel_id)
+    if cid:
+        _known_channel_ids.add(cid)
+
+
+def _is_known_channel(channel_id: str) -> bool:
+    cid = normalize_channel_id(channel_id) or (channel_id or "").strip().lower()
+    if not cid:
+        return False
+    return cid in _known_channel_ids or cid in _group_allow_all_chats()
+
+
+def _group_allow_all_chats() -> set:
+    """People-gate: VECTOR_GROUP_ALLOW_ALL channel ids (any member, mention-only)."""
+    return _channel_ids_from_env("VECTOR_GROUP_ALLOW_ALL")
+
+
+def _mentions_bot(text: str, bot_npub: Optional[str], bot_name: Optional[str] = None) -> bool:
+    """True if ``text`` @mentions the bot npub or display name. Not ``@everyone``."""
+    body = text or ""
+    if not body.strip():
+        return False
+    npub = normalize_npub(bot_npub or "") if bot_npub else None
+    if npub:
+        if f"@{npub}" in body or f"nostr:{npub}" in body:
+            return True
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(npub)}(?![A-Za-z0-9])", body):
+            return True
+    name = (bot_name or "").strip()
+    if name and re.search(rf"@{re.escape(name)}\b", body, re.IGNORECASE):
+        return True
+    return False
+
+
+def _reply_to_bot(reply_to: Optional[str], sent_ids) -> bool:
+    rid = (reply_to or "").strip()
+    return bool(rid) and rid in sent_ids
+
+
+def _home_operator_npub() -> Optional[str]:
+    """VECTOR_HOME_CHANNEL as npub, or None."""
+    return normalize_npub((os.getenv("VECTOR_HOME_CHANNEL") or "").strip())
+
+
+def _format_joined_notice(community_id: str, channels: list) -> str:
+    """Operator-facing DM/log body with copy-pasteable channel ids."""
+    lines = [
+        "Vector: I joined a community.",
+        "Copy a channel_id into VECTOR_GROUP_ALLOW_ALL if you want every member to @mention me.",
+        "",
+    ]
+    cid = (community_id or "").strip()
+    if cid:
+        lines.append(f"community_id: {cid}")
+    for row in channels:
+        if not isinstance(row, dict):
+            continue
+        channel_id = str(row.get("channel_id") or "").strip()
+        if not channel_id:
+            continue
+        name = str(row.get("name") or "").strip()
+        if name:
+            lines.append(f"channel_id: {channel_id}  ({name})")
+        else:
+            lines.append(f"channel_id: {channel_id}")
+    lines.append("")
+    lines.append(
+        "You can already @mention me there if you are on VECTOR_ALLOWED_USERS."
+    )
+    return "\n".join(lines)
+
+
+def _load_notified_channel_ids(data_dir: Path) -> set:
+    path = Path(data_dir) / NOTIFIED_CHANNELS_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    found: set = set()
+    for part in raw:
+        cid = normalize_channel_id(str(part or ""))
+        if cid:
+            found.add(cid)
+    return found
+
+
+def _save_notified_channel_ids(data_dir: Path, ids: set) -> None:
+    path = Path(data_dir) / NOTIFIED_CHANNELS_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ordered = sorted(ids)
+        path.write_text(json.dumps(ordered) + "\n", encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+    except OSError as e:
+        logger.debug("Vector: could not persist notified channel ids: %s", e)
 
 
 def _truncate_npub(npub: str) -> str:
@@ -491,10 +668,14 @@ def _allow_all_users() -> bool:
     return _env_flag("VECTOR_ALLOW_ALL_USERS") in ("1", "true", "yes", "on")
 
 
-def _allowed_npubs() -> set:
-    """Canonical npubs from VECTOR_ALLOWED_USERS (comma-separated)."""
+def _create_community_enabled() -> bool:
+    return _env_flag("VECTOR_CREATE_COMMUNITY") in ("1", "true", "yes", "on")
+
+
+def _npubs_from_env(name: str) -> set:
+    """Canonical npubs from a comma-separated env var."""
     found: set = set()
-    raw = os.getenv("VECTOR_ALLOWED_USERS") or ""
+    raw = os.getenv(name) or ""
     for part in raw.split(","):
         npub = normalize_npub(part.strip())
         if npub:
@@ -502,14 +683,44 @@ def _allowed_npubs() -> set:
     return found
 
 
+def _allowed_npubs() -> set:
+    """Canonical npubs from VECTOR_ALLOWED_USERS (comma-separated)."""
+    return _npubs_from_env("VECTOR_ALLOWED_USERS")
+
+
+def _group_allowed_users() -> set:
+    """Group-only senders (VECTOR_GROUP_ALLOWED_USERS). Does not grant DMs."""
+    return _npubs_from_env("VECTOR_GROUP_ALLOWED_USERS")
+
+
 def _sender_is_authorized(peer: str) -> bool:
-    """Adapter-layer allowlist (VECTOR_ALLOW_ALL_USERS / VECTOR_ALLOWED_USERS)."""
+    """Adapter-layer DM allowlist (VECTOR_ALLOW_ALL_USERS / VECTOR_ALLOWED_USERS)."""
     if _allow_all_users():
         return True
     npub = normalize_npub(peer) or (peer or "").strip()
     if not npub:
         return False
     return npub in _allowed_npubs()
+
+
+def _group_sender_is_authorized(peer: str, channel_id: str) -> bool:
+    """Who may trigger a community turn.
+
+    Union: ``VECTOR_ALLOW_ALL_USERS``, channel in ``VECTOR_GROUP_ALLOW_ALL``,
+    DM allowlist (``VECTOR_ALLOWED_USERS``), or ``VECTOR_GROUP_ALLOWED_USERS``.
+    Pairing is never offered in a channel.
+    """
+    if _allow_all_users():
+        return True
+    cid = normalize_channel_id(channel_id) or (channel_id or "").strip().lower()
+    if cid and cid in _group_allow_all_chats():
+        return True
+    if _sender_is_authorized(peer):
+        return True
+    npub = normalize_npub(peer) or (peer or "").strip()
+    if not npub:
+        return False
+    return npub in _group_allowed_users()
 
 
 def _merge_allowed_users(operator_npub: str, existing: str) -> str:
@@ -540,7 +751,10 @@ class VectorAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("vector"))
 
-        extra = config.extra or {}
+        extra = config.extra if isinstance(getattr(config, "extra", None), dict) else {}
+        if getattr(config, "extra", None) is not extra:
+            config.extra = extra
+        _sync_group_allowed_chats_extra(extra)
         self.bridge_port: int = int(extra.get("bridge_port", DEFAULT_BRIDGE_PORT))
         self.bridge_host: str = str(
             extra.get("bridge_host")
@@ -582,6 +796,7 @@ class VectorAdapter(BasePlatformAdapter):
         # File-only saves waiting to be attached to the next text from that peer.
         # Sequential Vector DMs (one file per event) append here until that text.
         self._pending_inbox: Dict[str, List[Tuple[str, str]]] = {}
+        self._notified_channel_ids: set = _load_notified_channel_ids(self.data_dir)
 
         logger.info(
             "Vector plugin v%s initialized: port=%d host=%s bot=%s",
@@ -737,6 +952,9 @@ class VectorAdapter(BasePlatformAdapter):
             self._running = True
             self._sse_task = asyncio.create_task(self._sse_listener())
             self._health_task = asyncio.create_task(self._health_monitor())
+            if _create_community_enabled():
+                await self._ensure_home_community()
+            await self._sync_joined_channels()
             self._mark_connected()
             connected = True
             logger.info("Vector: connected on %s:%d", self.bridge_host, self.bridge_port)
@@ -924,6 +1142,9 @@ class VectorAdapter(BasePlatformAdapter):
 
     def _chat_key(self, chat_id: Optional[str]) -> str:
         raw = (chat_id or "").strip()
+        channel = normalize_channel_id(raw)
+        if channel and _is_known_channel(channel):
+            return channel
         return normalize_npub(raw) or raw
 
     def _record_last_inbound(
@@ -1015,6 +1236,8 @@ class VectorAdapter(BasePlatformAdapter):
         """React 👀 on the triggering DM while the agent works (VECTOR_REACTIONS)."""
         if not self._reactions_enabled():
             return
+        if getattr(event.source, "chat_type", "dm") == "group":
+            return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
@@ -1034,9 +1257,162 @@ class VectorAdapter(BasePlatformAdapter):
             logger.debug("Vector: send_typing failed: %s", e)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        channel = normalize_channel_id(chat_id)
+        if channel:
+            return {
+                "name": _truncate_npub(channel),
+                "type": "group",
+                "chat_id": channel,
+            }
         npub = normalize_npub(chat_id) or (chat_id or "").strip()
         name = _truncate_npub(npub)
         return {"name": name, "type": "dm", "chat_id": npub}
+
+    async def _ensure_home_community(self) -> None:
+        """Slice 2: create-or-reuse a bot-owned Concord community (no public link)."""
+        if not self._http_client:
+            return
+        name = (os.getenv("VECTOR_COMMUNITY_NAME") or "").strip() or "Hermes"
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/communities",
+                json={"name": name},
+                headers=self._token_headers(),
+                timeout=30.0,
+            )
+        except Exception as e:
+            logger.warning("Vector: create home community failed: %s", e)
+            return
+        if resp.status_code != 200:
+            logger.warning(
+                "Vector: /communities returned %s: %s",
+                resp.status_code,
+                (resp.text or "")[:200],
+            )
+            return
+        try:
+            data = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        channel_id = str(data.get("channel_id") or "")
+        community_id = str(data.get("community_id") or "")
+        created = bool(data.get("created"))
+        if channel_id:
+            _remember_channel(channel_id)
+        if created:
+            logger.info(
+                "Vector: created home community %s channel %s",
+                _truncate_npub(community_id),
+                _truncate_npub(channel_id),
+            )
+        else:
+            logger.info(
+                "Vector: reusing home community %s channel %s",
+                _truncate_npub(community_id),
+                _truncate_npub(channel_id),
+            )
+        if channel_id:
+            await self._notify_joined_channels(
+                community_id,
+                [{"channel_id": channel_id, "name": name}],
+            )
+
+    async def _notify_joined_channels(self, community_id: str, channels: list) -> None:
+        """Log full channel ids and DM VECTOR_HOME_CHANNEL once per channel."""
+        rows = []
+        for row in channels or []:
+            if not isinstance(row, dict):
+                continue
+            cid = normalize_channel_id(str(row.get("channel_id") or ""))
+            if not cid:
+                continue
+            _remember_channel(cid)
+            rows.append(
+                {
+                    "channel_id": cid,
+                    "name": str(row.get("name") or "").strip(),
+                }
+            )
+        if not rows:
+            return
+        new_rows = [
+            row for row in rows if row["channel_id"] not in self._notified_channel_ids
+        ]
+        if not new_rows:
+            return
+        community = (community_id or "").strip() or "(unknown)"
+        for row in new_rows:
+            logger.info(
+                "Vector: joined channel_id=%s name=%s community_id=%s",
+                row["channel_id"],
+                row["name"] or "(unnamed)",
+                community,
+            )
+        home = _home_operator_npub()
+        if home:
+            if not (self._running and self._http_client):
+                logger.debug(
+                    "Vector: not connected; will DM channel_id to VECTOR_HOME_CHANNEL later"
+                )
+                return
+            result = await self.send(home, _format_joined_notice(community_id, new_rows))
+            if not result.success:
+                logger.warning(
+                    "Vector: could not DM VECTOR_HOME_CHANNEL the channel id: %s",
+                    result.error,
+                )
+                return
+        self._notified_channel_ids.update(row["channel_id"] for row in new_rows)
+        _save_notified_channel_ids(self.data_dir, self._notified_channel_ids)
+
+    async def _sync_joined_channels(self) -> None:
+        """Remember channel ids for communities the bot already belongs to."""
+        if not self._http_client:
+            return
+        try:
+            resp = await self._http_client.get(
+                f"{self.bridge_url}/communities",
+                headers=self._token_headers(),
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Vector: list communities failed: %s", e)
+            return
+        if resp.status_code != 200:
+            return
+        try:
+            data = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        rows = data.get("communities")
+        if not isinstance(rows, list):
+            return
+        for community in rows:
+            if not isinstance(community, dict):
+                continue
+            community_id = str(community.get("community_id") or "")
+            channels = community.get("channels")
+            if not isinstance(channels, list):
+                continue
+            channel_rows = []
+            for ch in channels:
+                if not isinstance(ch, dict):
+                    continue
+                cid = str(ch.get("channel_id") or "")
+                _remember_channel(cid)
+                if cid:
+                    channel_rows.append(
+                        {
+                            "channel_id": cid,
+                            "name": str(ch.get("name") or ""),
+                        }
+                    )
+            if channel_rows:
+                await self._notify_joined_channels(community_id, channel_rows)
 
     async def send_image(
         self,
@@ -1297,6 +1673,15 @@ class VectorAdapter(BasePlatformAdapter):
             await self._handle_message_event(data)
         elif event_type == "message_update":
             await self._handle_message_update(data)
+        elif event_type == "community_joined":
+            inner = data.get("data") if isinstance(data.get("data"), dict) else data
+            inner = inner or {}
+            channels = inner.get("channels") if isinstance(inner.get("channels"), list) else []
+            community_id = str(inner.get("community_id") or "")
+            if channels:
+                await self._notify_joined_channels(community_id, channels)
+            elif community_id:
+                await self._sync_joined_channels()
         else:
             logger.debug("Vector SSE: unhandled event type '%s'", event_type)
 
@@ -1309,6 +1694,7 @@ class VectorAdapter(BasePlatformAdapter):
         if msg_data.get("is_mine"):
             return
         if msg_data.get("is_group"):
+            await self._handle_group_message(msg_data)
             return
 
         msg_id = str(msg_data.get("id") or "")
@@ -1404,6 +1790,81 @@ class VectorAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             media_urls=media_urls,
             media_types=media_types,
+        )
+        await self.handle_message(event)
+
+    async def _handle_group_message(self, msg_data: dict) -> None:
+        """Mention-gated Concord channel message → Hermes ``chat_type=group``."""
+        raw_chat = str(msg_data.get("chat_id") or "")
+        channel_id = normalize_channel_id(raw_chat)
+        if not channel_id:
+            return
+        _remember_channel(channel_id)
+        await self._notify_joined_channels(
+            str(msg_data.get("community_id") or ""),
+            [{"channel_id": channel_id, "name": ""}],
+        )
+
+        msg_id = str(msg_data.get("id") or "")
+        if msg_id and self._is_duplicate(msg_id):
+            logger.debug("Vector: dropping duplicate inbound id=%s", msg_id[:16])
+            return
+
+        text = str(msg_data.get("text") or "")
+        if not text.strip():
+            logger.debug("Vector: skip empty/file-only group message id=%s", msg_id[:16])
+            return
+
+        raw_peer = msg_data.get("npub") or ""
+        peer = normalize_npub(raw_peer) or str(raw_peer).strip()
+        if not peer:
+            return
+
+        bot_npub = normalize_npub(self._npub or "") if self._npub else None
+        if bot_npub and peer == bot_npub:
+            return
+
+        reply_to = str(msg_data.get("reply_to") or "")
+        if not _mentions_bot(text, bot_npub, self.bot_name) and not _reply_to_bot(
+            reply_to, self._sent_message_ids
+        ):
+            logger.debug("Vector: drop group message (no mention) id=%s", msg_id[:16])
+            return
+
+        if not _group_sender_is_authorized(peer, channel_id):
+            logger.debug(
+                "Vector: drop group message from unauthorized sender %s",
+                _truncate_npub(peer),
+            )
+            return
+
+        if msg_id:
+            self._record_last_inbound(channel_id, msg_id)
+
+        name = _truncate_npub(peer)
+        community_id = str(msg_data.get("community_id") or "") or None
+        chat_name = _truncate_npub(community_id or channel_id)
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=chat_name,
+            chat_type="group",
+            user_id=peer,
+            user_name=name,
+            message_id=msg_id or None,
+            parent_chat_id=community_id,
+            scope_id=community_id,
+            # Adapter already applied the group people-gate. Hermes has no
+            # group_allowed_users_env hook; this is the Discord-style
+            # "adapter admitted this sender" bit so group-only npubs and
+            # VECTOR_GROUP_ALLOW_ALL members are not dropped at the gateway.
+            role_authorized=True,
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=msg_id or None,
+            reply_to_text=msg_data.get("reply_to_text") or None,
         )
         await self.handle_message(event)
 
@@ -1926,6 +2387,12 @@ def _env_enablement():
             "chat_id": normalize_npub(home) or home,
             "name": os.getenv("VECTOR_HOME_CHANNEL_NAME") or "Home",
         }
+    group_users = (os.getenv("VECTOR_GROUP_ALLOWED_USERS") or "").strip()
+    if group_users:
+        seed["group_allowed_users"] = group_users
+    open_chats = ",".join(sorted(_group_allow_all_chats()))
+    if open_chats:
+        seed["group_allowed_chats"] = open_chats
     bot_name = (os.getenv("VECTOR_BOT_NAME") or "").strip()
     if bot_name:
         seed["bot_name"] = bot_name
@@ -2792,6 +3259,59 @@ def _run_interactive_setup(io) -> None:
         "Enable pairing codes for unknown npubs?", True
     )
 
+    existing_group_users = (io.get_env_value("VECTOR_GROUP_ALLOWED_USERS") or "").strip()
+    io.print_info(
+        "Group-only npubs can @mention the bot in those rooms without DM access. "
+        "People already in VECTOR_ALLOWED_USERS can talk in groups automatically. "
+        "Leave blank to skip."
+    )
+    group_users_raw = (
+        io.prompt(
+            "Group-only npubs (comma-separated)",
+            default=existing_group_users or None,
+        )
+        or ""
+    ).strip()
+    group_users: List[str] = []
+    for part in group_users_raw.split(","):
+        npub = normalize_npub(part.strip())
+        if npub and npub not in group_users:
+            group_users.append(npub)
+        elif part.strip() and not npub:
+            io.print_warning(f"Skipping invalid group-only npub: {part.strip()[:20]}")
+
+    existing_open = (io.get_env_value("VECTOR_GROUP_ALLOW_ALL") or "").strip()
+    io.print_info(
+        "Open channels: any member may @mention or reply to the bot "
+        "(@everyone is ignored). Leave blank unless you want a whole room open."
+    )
+    open_raw = (
+        io.prompt(
+            "Open community channel ids (VECTOR_GROUP_ALLOW_ALL)",
+            default=existing_open or None,
+        )
+        or ""
+    ).strip()
+    open_chats: List[str] = []
+    for part in open_raw.split(","):
+        cid = normalize_channel_id(part)
+        if not part.strip():
+            continue
+        if not cid:
+            io.print_warning(f"Skipping invalid open channel id: {part.strip()[:20]}")
+            continue
+        if cid not in open_chats:
+            open_chats.append(cid)
+
+    create_home = io.prompt_yes_no(
+        "Also create a private home community owned by the bot?", False
+    )
+    community_name = ""
+    if create_home:
+        community_name = (
+            io.prompt("Home community name", default="Hermes") or "Hermes"
+        ).strip() or "Hermes"
+
     extra_args: List[str] = []
     temp_secret: Optional[Path] = None
     bak: Optional[Path] = None
@@ -2864,6 +3384,13 @@ def _run_interactive_setup(io) -> None:
         "VECTOR_ALLOWED_USERS", _merge_allowed_users(operator_npub, existing_allowed)
     )
     io.save_env_value("VECTOR_PAIRING", "on" if pairing_on else "off")
+    if group_users:
+        io.save_env_value("VECTOR_GROUP_ALLOWED_USERS", ",".join(group_users))
+    if open_chats:
+        io.save_env_value("VECTOR_GROUP_ALLOW_ALL", ",".join(open_chats))
+    io.save_env_value("VECTOR_CREATE_COMMUNITY", "on" if create_home else "off")
+    if create_home:
+        io.save_env_value("VECTOR_COMMUNITY_NAME", community_name)
 
     if env_nsec:
         io.print_warning(
@@ -2883,6 +3410,17 @@ def _run_interactive_setup(io) -> None:
     else:
         io.print_success(f"Existing account found! Bot npub: {bot_npub}")
     io.print_info("Share this npub with contacts.")
+    io.print_info(
+        "Communities: invite the bot from a trusted npub; it auto-joins and "
+        "listens. @mention or reply to take a turn. "
+        "VECTOR_GROUP_ALLOWED_USERS is group-only; VECTOR_GROUP_ALLOW_ALL "
+        "opens a listed channel to every member (mention/reply only)."
+    )
+    if create_home:
+        io.print_info(
+            "VECTOR_CREATE_COMMUNITY=on — the gateway will create or reuse a "
+            "private home community after Ready (no public invite link)."
+        )
     io.print_info(
         f"Back up {data_dir / 'identity.nsec'} offline — replacing it is a new bot."
     )
@@ -2916,7 +3454,7 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="VECTOR_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
-        parse_target_ref_fn=_parse_npub_target,
+        parse_target_ref_fn=_parse_target_ref,
         allowed_users_env="VECTOR_ALLOWED_USERS",
         allow_all_env="VECTOR_ALLOW_ALL_USERS",
         max_message_length=MAX_MESSAGE_LENGTH,
@@ -2928,6 +3466,9 @@ def register(ctx) -> None:
             "You are a bot account (your profile is tagged bot: true) with your "
             "own npub. Peers are identified by npub1… bech32 keys. "
             "Markdown is rendered. Keep replies concise. "
-            "v1 supports 1:1 DMs only — not communities."
+            "DMs are 1:1. Community channels are mention-gated: only reply when "
+            "someone @mentions you (npub or display name) or replies to your "
+            "message. @everyone is not a mention. Group chat_id is a 64-char "
+            "hex channel id."
         ),
     )

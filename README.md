@@ -76,7 +76,7 @@ flowchart LR
 
   subgraph HermesGW["Hermes gateway (Python)"]
     Adapter["VectorAdapter<br/>BasePlatformAdapter"]
-    Authz["_is_user_authorized<br/>VECTOR_ALLOWED_USERS + pairing"]
+    Authz["_is_user_authorized<br/>allowlists + pairing"]
     Sessions["SessionManager<br/>agent:main:vector:dm:npub1…"]
     Agent["AIAgent"]
   end
@@ -105,9 +105,9 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
 | `VECTOR_NPUB` | yes | Bot public key (`npub1…`); written by setup |
 | `VECTOR_NSEC` | import only | Setup copies this into `sdk/identity.nsec`; sidecar never reads it. Delete from `.env` after setup. |
 | `VECTOR_MNEMONIC` | import only | 12-word BIP-39 seed (NIP-06) |
-| `VECTOR_ALLOWED_USERS` | recommended | Comma-separated npubs allowed to DM the bot |
+| `VECTOR_ALLOWED_USERS` | recommended | Comma-separated npubs allowed to **DM** the bot. Also grants community turns. Pairing is DM-only. |
 | `VECTOR_ALLOW_ALL_USERS` | no | Dev-only open access (dangerous) |
-| `VECTOR_HOME_CHANNEL` | for cron | Operator npub for cron / notification delivery |
+| `VECTOR_HOME_CHANNEL` | for cron | Operator npub for cron and join notices (channel ids) |
 | `VECTOR_BOT_NAME` | no | Optional **public** display name (Nostr kind-0). Unset/blank = do not publish a name. There is no default of `Hermes` on the wire. |
 | `VECTOR_BOT_ABOUT` | no | Optional **public** about/bio (kind-0 `about`). Unset/blank = do not publish about. |
 | `VECTOR_BOT_AVATAR` | no | Optional **public** avatar (`picture`). Setup copies a jpg/png/webp/gif to `sdk/avatar.<ext>`; sidecar uploads to Blossom. Unset = do not publish a picture. |
@@ -121,6 +121,12 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
 | `VECTOR_MISSED_REACT` | no | `off` to skip ❌ on DMs received while the sidecar was down (default on) |
 | `VECTOR_MISSED_REACT_EMOJI` | no | Override the missed-DM reaction (default ❌) |
 | `VECTOR_REACTIONS` | no | `on` = 👀 while the agent works, then ✅/❌ on the triggering DM (default **off**). Agent `send_message(action=react)` always works. |
+| `VECTOR_GROUP_ALLOWED_USERS` | no | Npubs who may trigger community turns **without** DM access. |
+| `VECTOR_GROUP_ALLOW_ALL` | no | Channel ids (64-hex) where **any member** may @mention or reply. `@everyone` is ignored. No `*`. The Vector app does not show this id — copy it from the bot's DM to `VECTOR_HOME_CHANNEL` (or from `vector-bridge.log`) after join. |
+| `VECTOR_TRUSTED_INVITERS` | no | Npubs whose community invites the bot auto-joins (default: `VECTOR_ALLOWED_USERS`). |
+| `VECTOR_INVITE_POLICY` | no | `whitelist` (default) or `manual`. `public` is refused. |
+| `VECTOR_CREATE_COMMUNITY` | no | `on` = after Ready, create or reuse a bot-owned private community (`sdk/home-community.json`) and **direct-invite** `VECTOR_ALLOWED_USERS`. No public invite link. Does **not** add the channel to `VECTOR_GROUP_ALLOW_ALL`. |
+| `VECTOR_COMMUNITY_NAME` | no | Name used with `VECTOR_CREATE_COMMUNITY` (default `Hermes`). |
 
 `VECTOR_SIDECAR_TOKEN` is generated at spawn time and is **not** a plugin.yaml env var. Never put nsec in the sidecar environment or in the plugin install tree.
 
@@ -146,6 +152,25 @@ There is no `display.platform_tool_progress` key. Without the YAML override the 
 `VECTOR_ALLOWED_USERS` + Hermes pairing codes (`VECTOR_PAIRING` default **on**). Setup requires the operator npub as the first allowlisted user. `VECTOR_ALLOW_ALL_USERS` is dev-only. `hermes pairing approve` writes back into `VECTOR_ALLOWED_USERS`.
 
 `VECTOR_PAIRING=off` drops unauthorized senders in the adapter **before** `handle_message`, so pairing codes are not sent. Leave pairing **on** unless you want a closed allowlist with no CLI approve path.
+
+**Communities:** invite the bot from a trusted npub (`VECTOR_ALLOWED_USERS` / `VECTOR_TRUSTED_INVITERS`) and it auto-joins. It then listens in that room — no channel id in `.env`. A turn still needs an @mention or reply-to-bot (`@everyone` never counts). The sender is allowed if they have DM access (`VECTOR_ALLOWED_USERS`), they are in `VECTOR_GROUP_ALLOWED_USERS` (group-only, no DM), or the channel is in `VECTOR_GROUP_ALLOW_ALL`. Pairing is **not** offered in a channel. `VECTOR_ALLOW_ALL_USERS` is the global dev override (DMs and groups).
+
+## Communities
+
+Concord communities are E2E encrypted group spaces with channels. A **fresh community is private** (direct gift-wrapped invites only). Minting a public invite link is what flips Concord to public mode — this plugin does **not** mint those links.
+
+**Join-first (smallest path):**
+
+1. In the Vector app, create a community and **direct-invite** the bot npub (`VECTOR_NPUB`).
+2. The sidecar auto-accepts only if the inviter is in `VECTOR_TRUSTED_INVITERS` or `VECTOR_ALLOWED_USERS`. Anyone else stays parked (`VECTOR_INVITE_POLICY=manual` parks everyone).
+3. Hermes only runs a turn on **@mention** (`@npub1…`, `nostr:npub1…`, `@VECTOR_BOT_NAME`) or **reply to a bot message**. `@everyone` is ignored.
+4. Who may trigger that turn: `VECTOR_ALLOWED_USERS` (DM list, also groups), `VECTOR_GROUP_ALLOWED_USERS` (group-only, no DMs), or any member if the channel is in `VECTOR_GROUP_ALLOW_ALL`. Session key is `agent:main:vector:group:<channel-hex>`.
+
+The Vector app does not display channel ids. When the bot joins (trusted invite, `VECTOR_CREATE_COMMUNITY`, or connect-time membership sync) it logs the full 64-hex `channel_id` and DMs `VECTOR_HOME_CHANNEL` a copy-pasteable notice. Restart does not re-DM the same id (`sdk/notified-channels.json`). Parked (untrusted) invites stay silent — no DM, no channel id.
+
+**Bot-owned home room:** set `VECTOR_CREATE_COMMUNITY=on`. After Ready the sidecar creates or reuses a private community, persists `sdk/home-community.json` (restart will not create a second one), and direct-invites `VECTOR_ALLOWED_USERS`. No public invite URL, and the new channel is **not** written into `VECTOR_GROUP_ALLOW_ALL`. Direct-invited allowlisted members can already @mention; anyone else needs `VECTOR_GROUP_ALLOWED_USERS` or the channel id in `VECTOR_GROUP_ALLOW_ALL`.
+
+Community files, reactions, and missed-❌ catch-up are not in this slice.
 
 ## Files / attachments
 
@@ -182,7 +207,7 @@ cd bridge && cargo test --locked
 
 Tests load `adapter.py` as a free module and do **not** construct `Platform("vector")` — `_missing_()` only succeeds once the registry has the plugin.
 
-HTTP sidecar tests set `VECTOR_STUB=1` so they bind localhost HTTP **without** `VectorBot::build` (no live relays). Adapter unit tests mock that HTTP sidecar (no live Vector network). Production `connect()` does **not** set `VECTOR_STUB`. Production serve requires `VECTOR_DATA_DIR` with an existing `identity.nsec` (`--setup` already wrote it) and runs `VectorBot` with `InvitePolicy::Manual`. Do not set `VECTOR_STUB` in the gateway.
+HTTP sidecar tests set `VECTOR_STUB=1` so they bind localhost HTTP **without** `VectorBot::build` (no live relays). Adapter unit tests mock that HTTP sidecar (no live Vector network). Production `connect()` does **not** set `VECTOR_STUB`. Production serve requires `VECTOR_DATA_DIR` with an existing `identity.nsec` (`--setup` already wrote it) and runs `VectorBot` with `InvitePolicy::Whitelist` (from `VECTOR_ALLOWED_USERS` / `VECTOR_TRUSTED_INVITERS`) unless `VECTOR_INVITE_POLICY=manual`. Do not set `VECTOR_STUB` in the gateway.
 
 ## Live DM test (manual)
 
@@ -194,6 +219,12 @@ CI does not talk to Vector relays. After the sidecar is built, identity exists, 
 4. The bot reply is `POST /send` `{to: <peer-npub>, body}` with `X-Hermes-Sidecar-Token`.
 
 If inbound is silent: check `~/.hermes/logs/vector-bridge.log`, that `/health` is `ready`, and that the peer npub is allowlisted (not the bot's own npub).
+
+## Live community test (manual)
+
+1. Create a community in the Vector app and direct-invite the bot. Confirm `vector-bridge.log` shows `community invite` (auto-join if you are allowlisted). You should get a DM from the bot with `channel_id: <64-hex>` (needed for `VECTOR_GROUP_ALLOW_ALL`).
+2. In that channel, `@mention` the bot (or reply to a bot message). Hermes session key is `agent:main:vector:group:<channel-hex>`. Unmentioned chatter must not start a turn.
+3. A random npub inviting the bot into another community must stay parked (not on the whitelist) — no join DM.
 
 ## Security notes
 
@@ -218,6 +249,8 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 | Lost the bot / contacts don't recognize it | Back up `sdk/identity.nsec` offline. Replacing that file **is** a new bot (new npub, lost DMs). |
 | Sidecar is a stub / no live DMs | `VECTOR_STUB` must **not** be set in the gateway. Production `connect()` strips it. Only HTTP unit tests set it (binds without `VectorBot::build`). |
 | Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `VECTOR_MISSED_REACT=off` disables. Agent react/unreact and optional 👀/✅/❌ acks: [REACTION.md](REACTION.md). |
+| Group messages ignored | The bot must have **joined** (trusted inviter). Then the sender needs `VECTOR_ALLOWED_USERS`, `VECTOR_GROUP_ALLOWED_USERS`, or the channel in `VECTOR_GROUP_ALLOW_ALL`. Mentions (`@bot npub` / `@VECTOR_BOT_NAME`) or a reply to the bot are required; `@everyone` is ignored. Pairing is not sent in groups. |
+| Bot not joining a community | Inviter npub must be in `VECTOR_TRUSTED_INVITERS` or `VECTOR_ALLOWED_USERS`. `VECTOR_INVITE_POLICY=manual` parks all invites. Check `/health` `pending_invites`. |
 | Cron `deliver=vector` fails | Gateway must be running. Cron reads `~/.hermes/runtime/vector-sidecar.json` (`0600`, port + token). |
 | Gateway / sidecar status | `hermes gateway status`; `~/.hermes/logs/vector-bridge.log`. Logger is `hermes_plugins.vector_platform.adapter`. |
 

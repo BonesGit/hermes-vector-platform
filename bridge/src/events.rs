@@ -129,6 +129,9 @@ pub struct MessageEventData {
     pub at_ms: i64,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// Concord community id when `is_group`. Absent for DMs / when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_id: Option<String>,
 }
 
 impl MessageEventData {
@@ -140,15 +143,12 @@ impl MessageEventData {
     }
 }
 
-/// Map an inbound Vector message to SSE payload. Drops `is_mine` and `is_group`.
-/// Empty text is dropped unless the message carries attachments.
+/// Map an inbound Vector message to SSE payload. Drops `is_mine`. Empty text is
+/// dropped unless the message carries attachments. Community channel messages
+/// (`is_group`) are forwarded; the adapter mention-gates them.
 pub(crate) fn map_incoming(incoming: &IncomingMessage) -> Option<MessageEventData> {
     if incoming.is_mine() {
         eprintln!("[vector-bridge] skip is_mine id={}", incoming.message.id);
-        return None;
-    }
-    if incoming.is_group {
-        eprintln!("[vector-bridge] skip is_group id={}", incoming.message.id);
         return None;
     }
     let has_files = incoming.is_file || !incoming.message.attachments.is_empty();
@@ -172,7 +172,12 @@ pub(crate) fn map_incoming(incoming: &IncomingMessage) -> Option<MessageEventDat
         reply_to_text: incoming.message.replied_to_content.clone(),
         at_ms: incoming.message.at as i64,
         attachments: incoming.message.attachments.clone(),
+        community_id: community_id_of(incoming),
     })
+}
+
+fn community_id_of(incoming: &IncomingMessage) -> Option<String> {
+    incoming.community().map(|c| c.id().to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -227,7 +232,8 @@ pub(crate) async fn handle_bot_event(
     data_dir: Option<&Path>,
 ) {
     match event {
-        BotEvent::Ready { .. } => {
+        BotEvent::Ready { communities } => {
+            eprintln!("[vector-bridge] ready communities={communities}");
             state.mark_ready(bot.npub()).await;
             // Opt-in public kind-0: only publish when the operator set a
             // name, about, avatar, and/or banner. Empty strings do *not*
@@ -256,13 +262,15 @@ pub(crate) async fn handle_bot_event(
         }
         BotEvent::Message(msg) => {
             if let Some(data) = map_incoming(&msg) {
-                if let Some(dir) = data_dir {
-                    crate::missed::note_live(
-                        dir,
-                        &data.chat_id,
-                        data.at_ms.max(0) as u64,
-                        &data.id,
-                    );
+                if !data.is_group {
+                    if let Some(dir) = data_dir {
+                        crate::missed::note_live(
+                            dir,
+                            &data.chat_id,
+                            data.at_ms.max(0) as u64,
+                            &data.id,
+                        );
+                    }
                 }
                 state.events().publish(data.sse_item());
             }
@@ -273,9 +281,86 @@ pub(crate) async fn handle_bot_event(
             }
         }
         BotEvent::Invite { community_id } => {
-            eprintln!("[vector-bridge] invite parked community_id={community_id}");
+            eprintln!(
+                "[vector-bridge] community invite community_id={community_id} \
+                 (auto-join per invite policy)"
+            );
+            // apply_invite_policy is spawned by the SDK, so channels() is often
+            // empty on this tick. Retry briefly; parked invites stay empty.
+            let bot = bot.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                for delay_ms in [200_u64, 800, 2000] {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let channels = list_channel_values(&bot, &community_id).await;
+                    if !channels.is_empty() {
+                        log_joined_channels(&community_id, &channels);
+                        state
+                            .events()
+                            .publish(community_joined_item(&community_id, channels));
+                        return;
+                    }
+                }
+                eprintln!(
+                    "[vector-bridge] community_id={community_id} has no channels \
+                     after join wait (parked, or still joining)"
+                );
+            });
+        }
+        BotEvent::ChannelKeyed {
+            community_id,
+            channel_id,
+            ..
+        } => {
+            eprintln!(
+                "[vector-bridge] channel keyed channel_id={channel_id} \
+                 community_id={community_id}"
+            );
+            let name = bot
+                .community(&community_id)
+                .channels()
+                .await
+                .into_iter()
+                .find(|ch| ch.id() == channel_id)
+                .map(|ch| ch.name().to_string())
+                .unwrap_or_default();
+            state.events().publish(community_joined_item(
+                &community_id,
+                vec![json!({ "channel_id": channel_id, "name": name })],
+            ));
         }
         _ => {}
+    }
+}
+
+fn community_joined_item(community_id: &str, channels: Vec<Value>) -> SseItem {
+    SseItem {
+        id: Some(format!("joined:{community_id}")),
+        payload: json!({
+            "type": "community_joined",
+            "data": {
+                "community_id": community_id,
+                "channels": channels,
+            }
+        })
+        .to_string(),
+    }
+}
+
+async fn list_channel_values(bot: &VectorBot, community_id: &str) -> Vec<Value> {
+    bot.community(community_id)
+        .channels()
+        .await
+        .into_iter()
+        .map(|ch| json!({ "channel_id": ch.id(), "name": ch.name() }))
+        .collect()
+}
+
+fn log_joined_channels(community_id: &str, channels: &[Value]) {
+    for ch in channels {
+        let id = ch.get("channel_id").and_then(Value::as_str).unwrap_or("");
+        let name = ch.get("name").and_then(Value::as_str).unwrap_or("");
+        eprintln!("[vector-bridge] joined channel_id={id} name={name} community_id={community_id}");
     }
 }
 
@@ -284,7 +369,7 @@ pub async fn inject(
     _auth: Auth,
     JsonBody(data): JsonBody<MessageEventData>,
 ) -> Result<Json<Value>, ApiError> {
-    if data.is_group || data.is_mine {
+    if data.is_mine {
         eprintln!("[vector-bridge] dropping inject id={}", data.id);
         return Ok(Json(json!({ "ok": true })));
     }
@@ -324,6 +409,21 @@ mod tests {
     }
 
     #[test]
+    fn community_joined_payload_has_full_channel_id() {
+        let community_id = "cc".repeat(32);
+        let channel_id = "ab".repeat(32);
+        let item = community_joined_item(
+            &community_id,
+            vec![json!({ "channel_id": channel_id, "name": "general" })],
+        );
+        let payload: Value = serde_json::from_str(&item.payload).unwrap();
+        assert_eq!(payload["type"], "community_joined");
+        assert_eq!(payload["data"]["community_id"], community_id);
+        assert_eq!(payload["data"]["channels"][0]["channel_id"], channel_id);
+        assert_eq!(payload["data"]["channels"][0]["name"], "general");
+    }
+
+    #[test]
     fn maps_dm_fields_from_incoming_message() {
         let msg = incoming(
             "deadbeef",
@@ -349,6 +449,7 @@ mod tests {
                 reply_to_text: Some("quoted".into()),
                 at_ms: 1_785_979_414_499,
                 attachments: vec![],
+                community_id: None,
             }
         );
         let payload: Value = serde_json::from_str(&data.sse_item().payload).unwrap();
@@ -377,9 +478,25 @@ mod tests {
     }
 
     #[test]
-    fn skips_group() {
-        let msg = incoming("id1", "channel-id", None, "hi", false, true, false);
-        assert!(map_incoming(&msg).is_none());
+    fn maps_group_channel_message() {
+        let channel = "a".repeat(64);
+        let msg = incoming(
+            "id1",
+            &channel,
+            Some("npub1from"),
+            "hi group",
+            false,
+            true,
+            false,
+        );
+        let data = map_incoming(&msg).expect("mapped");
+        assert!(data.is_group);
+        assert_eq!(data.chat_id, channel);
+        assert_eq!(data.npub, "npub1from");
+        assert_eq!(data.text, "hi group");
+        let payload: Value = serde_json::from_str(&data.sse_item().payload).unwrap();
+        assert_eq!(payload["data"]["is_group"], true);
+        assert_eq!(payload["data"]["chat_id"], channel);
     }
 
     #[test]

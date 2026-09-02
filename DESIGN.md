@@ -65,7 +65,7 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 
 ### Non-goals (v1)
 
-- Communities / Concord channels (SDK supports them; defer).
+- ~~Communities / Concord channels~~ — join-first + mention-gated groups shipped; bot-owned create is opt-in (`VECTOR_CREATE_COMMUNITY`). Public invite links and `InvitePolicy::Public` stay out.
 - Files, voice, custom emoji reactions, message edit/delete, slash-command manifests (`kind:10304`).
 - Tor (`vector_sdk` `tor` feature + `builder.tor()`). Document as v2.
 - Impersonating a human Vector account as the primary mode. Importing an existing nsec is supported for recovery, not as "Hermes logs in as you."
@@ -86,8 +86,8 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 | D1 | **Python adapter + Rust sidecar subprocess**, HTTP/JSON + SSE on `127.0.0.1`, spawn-time `X-Hermes-Sidecar-Token`. | Vector SDK is tokio + process-global; Hermes is Python. Session/Photon already run this topology. PyO3/FFI couples crash domains and fights `vector-core`'s "one identity per process." |
 | D2 | **Plugin has its own nsec/npub.** Setup mints or imports. Public `VECTOR_NPUB` in `.env` at runtime. Secret is **SDK-owned** at `<VECTOR_DATA_DIR>/identity.nsec` (default `plugin-data/vector-platform/sdk/identity.nsec`, mode `0600`). **Runtime** is the only keyless `VectorBot::builder().data_dir(VECTOR_DATA_DIR).build()` (file already exists). `--check` / `--setup` must **not** call `build()` / `load_or_create_identity` — that helper **writes** a new nsec when the file is missing. | `load_or_create_identity` reads/writes `data_dir.join("identity.nsec")` only (`lib.rs` 1758–1771). Using it from `--check` before the create/import prompt would mint identity A and hide the import path. nsec is SDK identity material next to SQLite, **not** a Hermes `secret_scope` secret; `.env` holds `VECTOR_NPUB` only at runtime. |
 | D3 | **DM session key = peer npub.** `chat_id = user_id = npub1…`, `chat_type = "dm"`. Hermes `build_session_key` then isolates each peer automatically. | `IncomingMessage.chat_id` for DMs *is* the sender npub (`vector-sdk` `BotEvent` docs). Same mapping Session uses (Session ID as `chat_id`). |
-| D4 | **Default-deny allowlist at the adapter/gateway layer**, not Vector SDK `whitelist()`. Pairing codes enabled (`VECTOR_PAIRING` default on). | SDK whitelist only gates **community invites** (`InvitePolicy`). DMs would otherwise be open to any npub that can gift-wrap to the bot. Hermes `_is_user_authorized` already default-denies. |
-| D5 | **v1 is DM text + typing + profile (`bot: true`) only.** Communities, files, reactions, slash commands, Tor, and catch-up of DMs missed while the sidecar was down are sequenced later. | Smallest path that satisfies "the plugin has its own npub and can chat with another Vector user." |
+| D4 | **Default-deny allowlist at the adapter/gateway layer**, not Vector SDK `whitelist()`. Pairing codes enabled (`VECTOR_PAIRING` default on). SDK `whitelist()` is used only as **community-invite** policy (`VECTOR_TRUSTED_INVITERS` / `VECTOR_ALLOWED_USERS`). | SDK whitelist only gates **community invites** (`InvitePolicy`). DMs would otherwise be open to any npub that can gift-wrap to the bot. Hermes `_is_user_authorized` already default-denies. |
+| D5 | **v1 is DM text + typing + profile (`bot: true`) plus mention-gated Concord channels.** Public invite links, `InvitePolicy::Public`, community files/reactions, and catch-up of messages missed while the sidecar was down stay later. | Smallest path that satisfies "the plugin has its own npub and can chat with another Vector user," then a private group room. |
 | D6 | **Sidecar is a first-class crate in this repo** (`bridge/`), depending on crates.io **`vector_sdk = "=0.9.0"`** (crate name uses an underscore; pulls `vector-core` `0.8`). Exact pin — do not take crates.io `0.10.0`. Do not fork Vector. Do **not** use a git dep on `VectorPrivacy/Vector` — that repo has **no root `Cargo.toml`** (workspace is `crates/Cargo.toml`); Cargo git deps will not resolve. Do not use a sibling path `../../Vector/crates/vector-sdk` (operators and CI should not need a Vector checkout). Vector's workspace `[patch.crates-io]` for `nostr` does **not** inherit; consumers get stock `nostr` (vector-core README). There is **no plugin-root Cargo workspace** — the build command is `cd bridge && cargo build --release`, not `cargo build -p vector-bridge` from the repo root. | crates.io `0.9.0` publish SHA `b9aeb8d5` is an ancestor of GitHub `master`. crates.io `0.10.0` (2026-08-26, SHA `7bf7d335`) is **not** on that remote — treat as unpublished source and do not consume it. SDK README still documents `"0.3"`. |
 | D7 | **Bind `127.0.0.1` + header `X-Hermes-Sidecar-Token` on every route including `/health`.** Cron `standalone_sender_fn` reads a 0600 runtime record for port+token (Photon pattern). No `Authorization: Bearer`. Optional unauthenticated `/live` returns `{ok:true}` only. | Session's unauthenticated localhost bind was a real CVE-class bug (CHANGELOG: previously listened on `::`). Photon's header is `X-Hermes-Sidecar-Token` (`plugins/platforms/photon/sidecar/index.mjs`). One string everywhere. |
 | D8 | **Do not use `vector-agent` MCP as the adapter.** | MCP is a tool server (`crates/vector-agent/src/main.rs` + `tools.rs`) that buffers inbound DMs for `get_new_messages`. Hermes gateway needs push (`handle_message`) plus `send()`. Wrong inversion of control. |
@@ -493,7 +493,7 @@ Each peer npub is its own Hermes conversation. That is the correct multi-user ma
 
 **Do not** collapse all Vector DMs into one session. **Do not** use the bot's own npub as `chat_id`.
 
-v2 communities: `chat_id` = 64-char hex channel id (`ChannelKind::Community` detection in `channel_kind_for`), `chat_type` = `"group"`, `user_id` = sender npub, `parent_chat_id` / `scope_id` = community id. Mention-gate like Session (`_should_process_group_message`). Out of scope for v1.
+v2 communities: `chat_id` = 64-char hex channel id (`ChannelKind::Community` detection in `channel_kind_for`), `chat_type` = `"group"`, `user_id` = sender npub, `parent_chat_id` / `scope_id` = community id. Mention-gate like Session (`_mentions_bot` / reply-to-bot; `@everyone` ignored). Membership from a trusted invite is the look-gate (no `VECTOR_GROUP_ALLOWED_CHATS`). Group people-gate is a union: `VECTOR_ALLOWED_USERS` (also DMs), `VECTOR_GROUP_ALLOWED_USERS` (group-only, no DMs), or any member if the channel is in `VECTOR_GROUP_ALLOW_ALL`. Pairing stays DM-only. Channel ids are not shown in the Vector app; on join the sidecar logs the full hex and the adapter DMs `VECTOR_HOME_CHANNEL` once (`sdk/notified-channels.json`). Parked invites stay silent.
 
 `normalize_npub()` (D13) returns `Optional[str]` for the wizard, allowlists, and `VECTOR_HOME_CHANNEL`. It is **not** the platform hook. `PlatformEntry.parse_target_ref_fn` is `(target_ref: str) -> Optional[tuple[str, Optional[str]]]` (`gateway/platform_registry.py`); `tools/send_message_tool.py` rejects a non-tuple with “Target parser … returned an invalid result”. Register the wrapper:
 
@@ -526,7 +526,7 @@ def _parse_npub_target(ref: str) -> Optional[tuple[str, Optional[str]]]:
 1. Sidecar `bot.on_event` (background task; see boot sequence):
    - `BotEvent::Ready { communities }` → mark HTTP `/health` ready; SSE `ready`.
    - `BotEvent::Message(msg)` → if `msg.is_mine()` skip (prevents reply loops; `echo_bot.rs` does this). If `msg.is_group` skip in v1. If `msg.text()` empty and no attachments, skip. Map fields as in the SSE table (`chat_id`, `message.npub`, `message.id`, `message.replied_to_content`, `message.at`).
-   - Other variants: ignore in v1 (log `Invite` so the operator knows someone tried to drag the bot into a community — default `InvitePolicy::Manual` parks them).
+   - Other variants: ignore in v1 except `Invite` (SDK apply_invite_policy already ran; log community_id).
 2. Adapter `_dispatch_sse_event` → `_handle_message_event`. Dedupe on `data.id`. If `VECTOR_PAIRING=off` and sender npub is not allowlisted, **drop here** (before `handle_message`) so Hermes pairing codes are not sent.
 3. `MessageEvent(text=..., message_type=TEXT, source=build_source(...), message_id=id, reply_to_text=reply_to_text)`.
 4. `await self.handle_message(event)` (base adapter → gateway).
@@ -558,7 +558,7 @@ Unlike Session, Vector **supports edit** (`Channel::edit`). Per D12, v1 **setup 
 | Files | `send_file` / `save_attachment` / Blossom AES-GCM | no | v1.1 — cache via `cache_document_from_bytes` |
 | Reactions | `Channel::react` / `react_custom` / core `delete_own_reaction` | yes (DM unicode + optional NIP-30 URL; unreact via `/react` `remove`) | communities |
 | Edits / deletes | `edit` / `delete` | no | v1.1 — enables tool-progress edits |
-| Communities | `community()`, `InvitePolicy` | ignore inbound | v2 + SDK `.whitelist(allowed_npubs)` |
+| Communities | `community()`, `InvitePolicy` | join-first whitelist + mention-gated group text/typing; optional `create_community_v2` | public invite links, slash commands, moderation |
 | Slash commands | `bot.command(...)` kind 10304 | no | v2 — either native Vector commands that proxy into Hermes, or ignore and let users type naturally |
 
 Markdown: Vector's GUI renders markdown (`README.md` "Rich Message Composer"). `platform_hint` should **allow** markdown (opposite of Session's "plain text only").
@@ -617,11 +617,11 @@ Enforcement layers (in order, matching `authz_mixin._is_user_authorized`):
 
 Adapter **pre-filters** before `handle_message` when `VECTOR_PAIRING=off` (optional env, default on): unauthorized npubs are dropped at the adapter and **pairing codes are not sent**. When pairing is on (default), unknown npubs reach the gateway so `_is_user_authorized` can issue a code. Recommendation: leave pairing **on** so the operator can approve from CLI without editing `.env` by hand. Wizard surfaces this knob.
 
-SDK `InvitePolicy`: **Manual** (default). v1 must not auto-join communities. Log `BotEvent::Invite` so gateway logs show parked invites. v2: `.whitelist(VECTOR_ALLOWED_USERS)` if communities ship.
+SDK `InvitePolicy`: default **Whitelist** of `VECTOR_TRUSTED_INVITERS` falling back to `VECTOR_ALLOWED_USERS`. `VECTOR_INVITE_POLICY=manual` parks every invite (the old v1 default). Never `.public()`.
 
 Bot profile: always `bot: true` via `update_bot_profile` so Vector clients badge it (`VectorBot::update_profile` docs: "If you're building a human client, use vector_core's update_profile directly instead"). This is load-bearing for the product requirement.
 
-Home channel: `VECTOR_HOME_CHANNEL` = operator npub. Cron `deliver=vector` + `cron_deliver_env_var="VECTOR_HOME_CHANNEL"` + `standalone_sender_fn` hitting `/send` with the runtime token.
+Home channel: `VECTOR_HOME_CHANNEL` = operator npub. Cron `deliver=vector` + `cron_deliver_env_var="VECTOR_HOME_CHANNEL"` + `standalone_sender_fn` hitting `/send` with the runtime token. The same npub receives a one-shot DM when the bot joins a Concord channel (full `channel_id` for `VECTOR_GROUP_ALLOW_ALL`; the Vector app does not show it).
 
 ### What v1 ships vs later (question 7)
 
@@ -645,9 +645,9 @@ Home channel: `VECTOR_HOME_CHANNEL` = operator npub. Cron `deliver=vector` + `cr
 
 **v2 — communities and Vector-native UX**
 
-- Concord channels with `InvitePolicy::Whitelist(allowed_npubs)`.
-- Mention gating; group allowlists (`VECTOR_GROUP_ALLOWED_CHATS` analog).
-- Optional `bot.command(...)` manifests that map `/ask` onto a Hermes turn (kind 10304, `nip-bot-commands.md`). This is Vector UX sugar; Hermes slash commands on the agent side already work as ordinary text.
+- Concord channels: `InvitePolicy::Whitelist`, mention gating, sender union (`VECTOR_ALLOWED_USERS` / `VECTOR_GROUP_ALLOWED_USERS` / `VECTOR_GROUP_ALLOW_ALL`) — **shipped**. Trusted join is enough to listen.
+- Optional bot-owned private community (`VECTOR_CREATE_COMMUNITY`) — **shipped** (no public invite link).
+- Optional `bot.command(...)` manifests that map `/ask` onto a Hermes turn (kind 10304). Still later.
 - Tor: `vector_sdk = { features = ["tor"] }` + `.tor()`; never connect clearnet first (SDK guarantee).
 
 **v3 — consider PyO3** only if the extra process is a proven problem.
@@ -656,7 +656,11 @@ Home channel: `VECTOR_HOME_CHANNEL` = operator npub. Cron `deliver=vector` + `cr
 
 ## API / Interface Changes
 
-No Hermes core API changes. The plugin uses existing extension points.
+No Hermes core API changes. The plugin uses existing extension points:
+`allowed_users_env`, `extra.group_allowed_chats` (open Concord channel ids —
+Hermes' name for `VECTOR_GROUP_ALLOW_ALL`), and `SessionSource.role_authorized`
+on group turns the adapter already admitted (`VECTOR_GROUP_ALLOWED_USERS` has
+no registry hook).
 
 ### `plugin.yaml`
 
@@ -695,7 +699,7 @@ optional_env:
     prompt: "Allow all users?"
     password: false
   - name: VECTOR_HOME_CHANNEL
-    description: "Operator npub for cron / notification delivery"
+    description: "Operator npub for cron / join notices (channel ids)"
     prompt: "Home npub"
     password: false
   - name: VECTOR_BOT_NAME
@@ -766,7 +770,7 @@ def register(ctx) -> None:
             "You are a bot account (your profile is tagged bot: true) with your "
             "own npub. Peers are identified by npub1… bech32 keys. "
             "Markdown is rendered. Keep replies concise. "
-            "v1 supports 1:1 DMs only — not communities."
+            "DMs are 1:1; community channels are mention-gated."
         ),
     )
 ```
@@ -798,7 +802,7 @@ let listener = tokio::net::TcpListener::bind((host, port)).await?;
 
 let data_dir = std::env::var("VECTOR_DATA_DIR")?; // == sdk dir containing identity.nsec
 let bot = VectorBot::builder()
-    .data_dir(&data_dir) // InvitePolicy::Manual; no .nsec() — SDK loads identity.nsec
+    .invite_policy(/* Whitelist(VECTOR_ALLOWED_USERS) unless VECTOR_INVITE_POLICY=manual */)
     .build()
     .await?; // failure → process exit non-zero
 
@@ -815,7 +819,8 @@ tokio::spawn(async move {
                     // SSE from IncomingMessage fields — see mapping table
                     let _ = (msg.chat_id, msg.message.npub, msg.message.id, msg.text());
                 }
-                BotEvent::Invite { community_id } => { /* log only in v1 */ }
+                BotEvent::Invite { community_id } => { /* log; SSE community_joined after channels() */ }
+                BotEvent::ChannelKeyed { community_id, channel_id, .. } => { /* SSE community_joined */ }
                 _ => {}
             }
         })
@@ -836,6 +841,7 @@ None in Hermes core. Plugin-local:
 | Artifact | Format | Migration |
 | --- | --- | --- |
 | `sdk/identity.nsec` (`VECTOR_DATA_DIR`) | raw `nsec1…` text, `0600` | none; replacing the file **is** a new bot (new npub, lost DMs) |
+| `sdk/notified-channels.json` | JSON array of 64-hex channel ids already DMed/logged to the operator | additive; delete to re-DM join notices |
 | Vector SDK SQLite under the same `sdk/` | owned by `vector-core::db` | Vector's own migrations; do not touch. Deleting SQLite does not rotate the key. |
 | `~/.hermes/.env` keys | `VECTOR_*` | additive |
 | `runtime/vector-sidecar.json` | `{port, token, pid, npub}` ephemeral | deleted on stop; never a source of truth for identity |
@@ -891,7 +897,7 @@ Operators will ask. **Out of scope.** `vector-core` is one identity per process 
 | Two gateways, one nsec (split brain / colliding sends) | **High** | `_acquire_platform_lock(scope="vector-npub", identity=npub)`. |
 | Sidecar token stolen from env of a same-user process | **Medium** | Acceptable on single-user hosts (same as Session mnemonic in env). Token is per-spawn, not long-lived. |
 | Operator imports personal nsec | **High** (UX) | Setup warning; profile forced `bot: true`. |
-| Community invite spam | **Low** in v1 | `InvitePolicy::Manual`; ignore group messages. |
+| Community invite spam | **Low** | `InvitePolicy::Whitelist` of allowlisted inviters; `manual` parks all. Group turns require membership + mention + sender union (`VECTOR_ALLOWED_USERS` / `VECTOR_GROUP_ALLOWED_USERS` / `VECTOR_GROUP_ALLOW_ALL`). |
 | Gift-wrap metadata on public relays | **Inherent** | NIP-17/NIP-59 is Vector's model; we do not add extra metadata beyond what the SDK publishes. Do not put secrets in profile `about`. |
 | SSRF via sidecar fetching attachments (v1.1) | **Medium** | Use SDK `download_attachment` only; never have Python fetch Blossom URLs directly. |
 
@@ -1128,11 +1134,11 @@ Incremental, independently reviewable PRs against `/home/anthony/projects/hermes
 - **Depends on:** PR 6
 - **Description:** Map attachments through Vector Blossom APIs; Hermes cache helpers. Only then consider flipping `display.platforms.vector.tool_progress` (D12).
 
-### PR 8 (later, not v1) — Communities + invite whitelist
+### PR 8 — Communities + invite whitelist (landed)
 
 - **Title:** `feat: Concord community channels with InvitePolicy::Whitelist`
-- **Files:** sidecar invite policy from env; adapter group allowlists + mention gating
+- **Files:** sidecar invite policy from env; SSE group messages; `bot.channel` send/typing; adapter group allowlists + mention gating; optional `POST /communities` home room
 - **Depends on:** PR 6
-- **Description:** Only then turn on `.whitelist(VECTOR_ALLOWED_USERS)` so the bot cannot be invited into random communities.
+- **Description:** Auto-join only from allowlisted inviters. Mention-gated group turns after join. Senders: `VECTOR_ALLOWED_USERS` union `VECTOR_GROUP_ALLOWED_USERS`, or any member on `VECTOR_GROUP_ALLOW_ALL`. Bot-owned private community is opt-in (`VECTOR_CREATE_COMMUNITY`). No public invite links.
 
 Each of PRs 1–6 should be mergeable with tests green; PR 4 is the first that can actually chat, PR 5 is the first that is safe to leave running (setup writes the operator npub into `VECTOR_ALLOWED_USERS` / `VECTOR_HOME_CHANNEL`; Hermes already default-denies without that).

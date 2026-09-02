@@ -22,6 +22,7 @@ Required env vars / config.extra keys:
     VECTOR_TRUSTED_INVITERS      Optional inviter npubs (default: ALLOWED_USERS)
     VECTOR_INVITE_POLICY         manual | whitelist (default whitelist)
     VECTOR_CREATE_COMMUNITY      on = bot-owned home community after Ready
+    VECTOR_SLASH_COMMANDS        off = do not publish Vector / picker commands
 """
 
 from __future__ import annotations
@@ -71,10 +72,12 @@ _DEFAULT_BRIDGE_BIN = _BRIDGE_DIR / "target" / "release" / "vector-bridge"
 
 DEFAULT_BRIDGE_PORT = 8096
 DEFAULT_BRIDGE_HOST = "127.0.0.1"
-# Must stay under GatewayRunner._PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT (30s).
-# Operators who raise VECTOR_STARTUP_TIMEOUT must also raise
-# HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT above it.
-DEFAULT_STARTUP_TIMEOUT = 25
+# VectorBot::build is usually ~1s; slash kind-10304 used to run *before*
+# Ready and take 20–40s. /health is now ready after build, but Hermes still
+# wraps connect() in HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT (default 30).
+# Keep VECTOR_STARTUP_TIMEOUT below that floor unless the operator raised it.
+DEFAULT_STARTUP_TIMEOUT = 60
+HERMES_CONNECT_TIMEOUT_FLOOR = 90
 MAX_MESSAGE_LENGTH = 4000
 AVATAR_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MIN_RUSTC = (1, 75)
@@ -98,6 +101,25 @@ INBOX_NAME_MAX = 180
 DOWNLOAD_TIMEOUT = 120.0
 SEND_FILE_TIMEOUT = 120.0
 DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+
+
+def _ensure_hermes_connect_timeout_floor() -> None:
+    """Slash-manifest / Vector login can exceed Hermes' 30s default wrap.
+
+    Must run from ``register()``, not only ``connect()``: Hermes reads
+    ``HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT`` *before* wrapping
+    ``connect()``, so setting it inside ``connect()`` misses the first
+    attempt. Only fills the env when unset so an operator override wins.
+    """
+    if os.getenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip():
+        return
+    os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] = str(
+        HERMES_CONNECT_TIMEOUT_FLOOR
+    )
+    logger.info(
+        "Vector: HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT unset; flooring to %ss",
+        HERMES_CONNECT_TIMEOUT_FLOOR,
+    )
 
 
 def resolve_bridge_bin() -> Path:
@@ -554,6 +576,44 @@ def _group_allow_all_chats() -> set:
     return _channel_ids_from_env("VECTOR_GROUP_ALLOW_ALL")
 
 
+# Keep in sync with bridge/src/commands.rs HERMES_SLASH_COMMANDS.
+# Vector picker names plus the Hermes first tokens (`/approve session` → approve).
+_VECTOR_SLASH_COMMANDS = frozenset(
+    {
+        "approve",
+        "approve-session",
+        "approve-always",
+        "approve-all",
+        "approve-all-session",
+        "approve-all-always",
+        "deny",
+        "deny-all",
+    }
+)
+
+
+def _group_slash_command(text: str, *, is_command: bool = False) -> bool:
+    """True when a group message is a registered Hermes slash command.
+
+    Native Vector picker invocations are forwarded with ``is_command``. Typed
+    ``/approve`` / ``/deny`` (and the rest of the published set) also bypass
+    the mention gate so an approval prompt is answerable in-channel. The
+    people-gate still applies.
+    """
+    if is_command:
+        return True
+    token = (text or "").strip().split(None, 1)
+    if not token:
+        return False
+    first = token[0]
+    if not first.startswith("/"):
+        return False
+    name = first[1:].split("@", 1)[0].lower()
+    if not name or "/" in name:
+        return False
+    return name in _VECTOR_SLASH_COMMANDS
+
+
 def _mentions_bot(text: str, bot_npub: Optional[str], bot_name: Optional[str] = None) -> bool:
     """True if ``text`` @mentions the bot npub or display name. Not ``@everyone``."""
     body = text or ""
@@ -776,7 +836,9 @@ class VectorAdapter(BasePlatformAdapter):
         ).strip()
         self.bot_banner: Optional[Path] = Path(raw_banner).expanduser() if raw_banner else None
         self.startup_timeout: int = int(
-            extra.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            os.getenv("VECTOR_STARTUP_TIMEOUT")
+            or extra.get("startup_timeout")
+            or DEFAULT_STARTUP_TIMEOUT
         )
         self._npub: Optional[str] = extra.get("npub") or (os.getenv("VECTOR_NPUB") or "").strip() or None
         self.data_dir: Path = Path(extra.get("data_dir") or resolve_data_dir())
@@ -814,6 +876,7 @@ class VectorAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        _ensure_hermes_connect_timeout_floor()
         npub = self._npub or "unknown"
         if not self._acquire_platform_lock(
             scope="vector-npub",
@@ -1825,8 +1888,11 @@ class VectorAdapter(BasePlatformAdapter):
             return
 
         reply_to = str(msg_data.get("reply_to") or "")
-        if not _mentions_bot(text, bot_npub, self.bot_name) and not _reply_to_bot(
-            reply_to, self._sent_message_ids
+        is_command = bool(msg_data.get("is_command"))
+        if (
+            not _mentions_bot(text, bot_npub, self.bot_name)
+            and not _reply_to_bot(reply_to, self._sent_message_ids)
+            and not _group_slash_command(text, is_command=is_command)
         ):
             logger.debug("Vector: drop group message (no mention) id=%s", msg_id[:16])
             return
@@ -3435,6 +3501,7 @@ def interactive_setup() -> None:
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+    _ensure_hermes_connect_timeout_floor()
     ctx.register_redaction_patterns([r"nsec1[a-z0-9]{20,}"])
     ctx.register_platform(
         name="vector",
@@ -3467,8 +3534,9 @@ def register(ctx) -> None:
             "own npub. Peers are identified by npub1… bech32 keys. "
             "Markdown is rendered. Keep replies concise. "
             "DMs are 1:1. Community channels are mention-gated: only reply when "
-            "someone @mentions you (npub or display name) or replies to your "
-            "message. @everyone is not a mention. Group chat_id is a 64-char "
+            "someone @mentions you (npub or display name), replies to your "
+            "message, or sends a Vector slash command (/approve, /approve-session, /deny, …). "
+            "@everyone is not a mention. Group chat_id is a 64-char "
             "hex channel id."
         ),
     )

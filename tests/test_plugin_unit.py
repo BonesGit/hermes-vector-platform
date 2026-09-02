@@ -200,6 +200,36 @@ class TestMentionsBot:
         assert not vector_adapter._mentions_bot("hello there", NPUB, "Hermes")
 
 
+class TestGroupSlashCommand:
+    def test_approve_variants(self):
+        assert vector_adapter._group_slash_command("/approve")
+        assert vector_adapter._group_slash_command("/approve session")
+        assert vector_adapter._group_slash_command("/approve all always")
+        assert vector_adapter._group_slash_command("/APPROVE")
+        assert vector_adapter._group_slash_command("/approve-session")
+        assert vector_adapter._group_slash_command("/approve-all-always")
+        assert vector_adapter._group_slash_command("/deny")
+        assert vector_adapter._group_slash_command("/deny all too risky")
+        assert vector_adapter._group_slash_command("/deny-all")
+
+    def test_non_approval_commands_are_not_bypasses(self):
+        assert not vector_adapter._group_slash_command("/yolo")
+        assert not vector_adapter._group_slash_command("/memory approve")
+        assert not vector_adapter._group_slash_command("/skills pending")
+        assert not vector_adapter._group_slash_command("/help")
+        assert not vector_adapter._group_slash_command("/reset now")
+
+    def test_is_command_flag_bypasses_name_check(self):
+        assert vector_adapter._group_slash_command("/unknown", is_command=True)
+        assert vector_adapter._group_slash_command("not a slash", is_command=True)
+
+    def test_unknown_and_paths_are_not_commands(self):
+        assert not vector_adapter._group_slash_command("just chatting")
+        assert not vector_adapter._group_slash_command("/not-a-hermes-cmd")
+        assert not vector_adapter._group_slash_command("/path/to/file")
+        assert not vector_adapter._group_slash_command("")
+
+
 class TestKnownChannels:
     def test_remember_is_required(self):
         vector_adapter._known_channel_ids.clear()
@@ -358,6 +388,20 @@ class TestEnvEnablement:
         assert "group_allow_all" not in seed
 
 
+class TestHermesConnectTimeoutFloor:
+    def test_sets_when_unset(self, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", raising=False)
+        vector_adapter._ensure_hermes_connect_timeout_floor()
+        assert os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] == str(
+            vector_adapter.HERMES_CONNECT_TIMEOUT_FLOOR
+        )
+
+    def test_does_not_override_operator(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "15")
+        vector_adapter._ensure_hermes_connect_timeout_floor()
+        assert os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] == "15"
+
+
 class TestInstallBotAvatar:
     def test_copies_png_to_data_dir(self, tmp_path):
         src = tmp_path / "face.PNG"
@@ -432,7 +476,8 @@ class TestRequirements:
 
 
 class TestRegister:
-    def test_register_calls_ctx(self):
+    def test_register_calls_ctx(self, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", raising=False)
         ctx = MagicMock()
         vector_adapter.register(ctx)
         ctx.register_redaction_patterns.assert_called_once()
@@ -463,6 +508,13 @@ class TestRegister:
         sample = kwargs["parse_target_ref_fn"](HEX_PUBKEY)
         assert sample == (NPUB, None)
         assert not isinstance(sample, str)
+
+    def test_register_floors_hermes_connect_timeout(self, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", raising=False)
+        vector_adapter.register(MagicMock())
+        assert os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] == str(
+            vector_adapter.HERMES_CONNECT_TIMEOUT_FLOOR
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1103,135 @@ class TestInboundMapping:
                     msg_id="g-quiet",
                     is_group=True,
                     chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert captured == []
+
+    def test_group_approve_without_mention_dispatches(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "/approve session",
+                    msg_id="g-approve",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].text == "/approve session"
+        assert captured[0].source.chat_type == "group"
+        assert captured[0].source.role_authorized is True
+
+    def test_group_deny_and_memory_without_mention(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        for text, msg_id in (
+            ("/deny too broad", "g-deny-slash"),
+            ("/approve-session", "g-approve-session"),
+            ("/approve-all-always", "g-approve-all-always"),
+            ("/deny-all", "g-deny-all"),
+        ):
+            captured.clear()
+            asyncio.run(
+                adapter._handle_message_event(
+                    _message_event(
+                        PEER_NPUB,
+                        text,
+                        msg_id=msg_id,
+                        is_group=True,
+                        chat_id=CHANNEL_ID,
+                    )
+                )
+            )
+            assert len(captured) == 1, text
+            assert captured[0].text == text
+
+    def test_group_unknown_slash_still_needs_mention(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "/shrug",
+                    msg_id="g-shrug",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                )
+            )
+        )
+        assert captured == []
+
+    def test_group_is_command_flag_without_mention(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "/approve always",
+                    msg_id="g-flag",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    is_command=True,
+                )
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].text == "/approve always"
+
+    def test_group_unauthorized_slash_still_dropped(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=NPUB
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "/approve",
+                    msg_id="g-unauth-approve",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    is_command=True,
                 )
             )
         )

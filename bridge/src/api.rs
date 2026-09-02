@@ -123,12 +123,19 @@ impl AppState {
 
     pub async fn mark_ready(&self, npub: impl Into<String>) {
         let npub = npub.into();
-        {
+        let first = {
             let mut health = self.0.health.write().await;
-            health.ready = true;
-            health.npub = Some(npub.clone());
+            if health.ready {
+                false
+            } else {
+                health.ready = true;
+                health.npub = Some(npub.clone());
+                true
+            }
+        };
+        if first {
+            self.0.events.publish(ready_item(&npub));
         }
-        self.0.events.publish(ready_item(&npub));
     }
 
     pub async fn is_ready(&self) -> bool {

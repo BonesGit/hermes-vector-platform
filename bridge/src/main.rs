@@ -5,6 +5,7 @@
 //! `VECTOR_STUB=1` keeps the HTTP stub (no live relays) for tests.
 
 mod api;
+mod commands;
 mod events;
 mod missed;
 mod profile;
@@ -363,6 +364,16 @@ fn spawn_vector_bot(state: AppState, data_dir: PathBuf, stop_tx: watch::Sender<S
         {
             Ok(bot) => {
                 state.set_bot(bot.clone()).await;
+                // /health ready as soon as the bot identity is loaded. Do not
+                // wait for BotEvent::Ready: if slash commands are registered
+                // before on_event, prepare_listen publishes kind-10304 to
+                // discovery relays first (20–40s) and used to overrun the
+                // connect timeout so Hermes killed a live sidecar.
+                state.mark_ready(bot.npub()).await;
+                eprintln!("[vector-bridge] bot online");
+                // Do **not** register slash commands here. SDK try_command
+                // reads a live RwLock, so BotEvent::Ready can attach handlers
+                // after listen starts; the picker publishes in the background.
                 // Unset name/about/avatar/banner = do not publish a public kind-0 card.
                 let bot_name = std::env::var("VECTOR_BOT_NAME")
                     .map(|s| s.trim().to_string())

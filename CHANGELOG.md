@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Sidecar `/health` is `ready` as soon as `VectorBot::build` succeeds, not
+  after `BotEvent::Ready`. Slash commands register on Ready and the
+  kind-10304 picker manifest publishes in the background. Previously
+  `prepare_listen` published the manifest *before* Ready (20–40s to six
+  relays), which overran the 25s connect timeout and killed a live sidecar.
+- Default `VECTOR_STARTUP_TIMEOUT` is 60s. `register()` floors
+  `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` to 90s when that env is unset
+  (Hermes reads the wrap *before* `connect()`, so flooring inside
+  `connect()` missed the first attempt).
+
 ### Added
 
 - Concord **communities** (join-first + optional bot-owned home room). Sidecar
@@ -29,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sdk/home-community.json`, and direct-invites allowlisted npubs. No public
   invite links. Trusted join is enough to listen — there is no
   `VECTOR_GROUP_ALLOWED_CHATS` look-gate.
+- Vector **slash commands** (kind 10304): argument-free picker entries for
+  Hermes approvals only. `/approve` `/approve-session` `/approve-always`
+  `/approve-all` `/approve-all-session` `/approve-all-always` `/deny`
+  `/deny-all` rewrite to the Hermes text (`/approve session`, …) and
+  SSE-forward (`is_command: true`). Groups admit those without an @mention;
+  the people-gate still applies. `VECTOR_SLASH_COMMANDS=off` skips the
+  public manifest. Concord admin is **not** on this surface.
 - Optional public bot profile (Vector `update_profile` / kind-0 `name`,
   `about`, `picture`, `banner`): `VECTOR_BOT_NAME`, `VECTOR_BOT_ABOUT`,
   `VECTOR_BOT_AVATAR`, `VECTOR_BOT_BANNER`. Setup copies images to

@@ -119,6 +119,10 @@ pub struct MessageEventData {
     pub is_mine: bool,
     #[serde(default)]
     pub is_file: bool,
+    /// Set when the sidecar's Vector slash-command handler forwarded this
+    /// invocation. Adapter mention-gates skip it; people-gate still applies.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_command: bool,
     #[serde(default)]
     pub text: String,
     #[serde(default)]
@@ -134,8 +138,12 @@ pub struct MessageEventData {
     pub community_id: Option<String>,
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 impl MessageEventData {
-    fn sse_item(&self) -> SseItem {
+    pub(crate) fn sse_item(&self) -> SseItem {
         SseItem {
             id: Some(self.id.clone()),
             payload: json!({ "type": "message", "data": self }).to_string(),
@@ -167,6 +175,7 @@ pub(crate) fn map_incoming(incoming: &IncomingMessage) -> Option<MessageEventDat
         is_group: incoming.is_group,
         is_mine: incoming.is_mine(),
         is_file: has_files,
+        is_command: false,
         text: incoming.text().to_string(),
         reply_to: incoming.message.replied_to.clone(),
         reply_to_text: incoming.message.replied_to_content.clone(),
@@ -234,6 +243,8 @@ pub(crate) async fn handle_bot_event(
     match event {
         BotEvent::Ready { communities } => {
             eprintln!("[vector-bridge] ready communities={communities}");
+            crate::commands::register_hermes_commands(bot, state);
+            crate::commands::spawn_manifest_publish();
             state.mark_ready(bot.npub()).await;
             // Opt-in public kind-0: only publish when the operator set a
             // name, about, avatar, and/or banner. Empty strings do *not*
@@ -444,6 +455,7 @@ mod tests {
                 is_group: false,
                 is_mine: false,
                 is_file: false,
+                is_command: false,
                 text: "hello".into(),
                 reply_to: "parent-id".into(),
                 reply_to_text: Some("quoted".into()),
@@ -461,6 +473,7 @@ mod tests {
         assert_eq!(payload["data"]["reply_to"], "parent-id");
         assert_eq!(payload["data"]["reply_to_text"], "quoted");
         assert_eq!(payload["data"]["at_ms"], 1_785_979_414_499u64);
+        assert!(payload["data"].get("is_command").is_none());
     }
 
     #[test]

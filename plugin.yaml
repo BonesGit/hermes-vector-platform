@@ -68,7 +68,7 @@ optional_env:
     prompt: "Bridge binary"
     password: false
   - name: VECTOR_STARTUP_TIMEOUT
-    description: "Seconds to wait for sidecar /health status=ready (default 25; keep below HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, default 30)"
+    description: "Seconds to wait for sidecar /health status=ready (default 60). Plugin also floors HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT to 90 if unset."
     prompt: "Startup timeout"
     password: false
   - name: VECTOR_PAIRING
@@ -110,4 +110,8 @@ optional_env:
   - name: VECTOR_COMMUNITY_NAME
     description: "Name for VECTOR_CREATE_COMMUNITY (default Hermes)"
     prompt: "Home community name"
+    password: false
+  - name: VECTOR_SLASH_COMMANDS
+    description: "off = do not publish Vector / picker commands (kind 10304). Default on. Typed /approve still works in DMs."
+    prompt: "Publish Vector slash commands? (on/off)"
     password: false

@@ -66,7 +66,8 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 ### Non-goals (v1)
 
 - ~~Communities / Concord channels~~ — join-first + mention-gated groups shipped; bot-owned create is opt-in (`VECTOR_CREATE_COMMUNITY`). Public invite links and `InvitePolicy::Public` stay out.
-- Files, voice, custom emoji reactions, message edit/delete, slash-command manifests (`kind:10304`).
+- Files, voice, custom emoji reactions, message edit/delete.
+- ~~Slash-command manifests (`kind:10304`)~~ — argument-free Vector picker for Hermes `/approve` / `/deny` modes only (`approve-session` → `/approve session`, …). Concord admin is **not** on this surface (see `ADMIN_PLAN.md`).
 - Tor (`vector_sdk` `tor` feature + `builder.tor()`). Document as v2.
 - Impersonating a human Vector account as the primary mode. Importing an existing nsec is supported for recovery, not as "Hermes logs in as you."
 - In-tree Hermes platform (`Platform.VECTOR` enum member, `toolsets.py` edits). Plugin auto-toolset `hermes-vector` already covers this (`toolsets.py` `resolve_toolset`, `hermes-<name>` branch).
@@ -314,7 +315,7 @@ Rules:
 2. Bind `VECTOR_BRIDGE_HOST:VECTOR_BRIDGE_PORT` **before** `VectorBot::build`. Serve `{status:"starting"}` on authenticated `/health` (npub omitted until login).
 3. Run `build().await` on a task. Login failure → non-zero exit (Python `_handle_bridge_exit` / retryable fatal).
 4. Spawn `on_event` as a **background** task. When `listen()` returns, shut down the axum server and exit the process. Do not leave a zombie HTTP listener.
-5. Flip `/health` to `{status:"ready", npub}` only on `BotEvent::Ready`.
+5. Flip `/health` to `{status:"ready", npub}` as soon as `VectorBot::build` succeeds (nsec loaded, send is possible). Do **not** register Vector slash commands before `on_event`: SDK `prepare_listen` would publish kind-10304 to discovery relays *before* Ready (20–40s) and overrun Hermes' 30s connect wrap. Register + background-publish from `BotEvent::Ready`. Profile + missed-react stay on Ready. The adapter floors `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` to 90s when unset.
 6. **`update_profile` is sidecar-boot and opt-in** (D14): called only when `VECTOR_BOT_NAME`, `VECTOR_BOT_ABOUT`, `VECTOR_BOT_AVATAR`, and/or `VECTOR_BOT_BANNER` is set. SDK still tags `bot: true` when we do publish. Python `POST /profile` is optional; do not call it from `connect()` (avoids a race with Ready).
 7. Stdin EOF (`VECTOR_SIDECAR_WATCH_STDIN=1`) triggers the same graceful shutdown as `listen()` return.
 
@@ -558,8 +559,8 @@ Unlike Session, Vector **supports edit** (`Channel::edit`). Per D12, v1 **setup 
 | Files | `send_file` / `save_attachment` / Blossom AES-GCM | no | v1.1 — cache via `cache_document_from_bytes` |
 | Reactions | `Channel::react` / `react_custom` / core `delete_own_reaction` | yes (DM unicode + optional NIP-30 URL; unreact via `/react` `remove`) | communities |
 | Edits / deletes | `edit` / `delete` | no | v1.1 — enables tool-progress edits |
-| Communities | `community()`, `InvitePolicy` | join-first whitelist + mention-gated group text/typing; optional `create_community_v2` | public invite links, slash commands, moderation |
-| Slash commands | `bot.command(...)` kind 10304 | no | v2 — either native Vector commands that proxy into Hermes, or ignore and let users type naturally |
+| Communities | `community()`, `InvitePolicy` | join-first whitelist + mention-gated group text/typing; optional `create_community_v2` | public invite links, Concord moderation |
+| Slash commands | `bot.command(...)` kind 10304 | Approve/deny picker only (`approve-session` → `/approve session`); SSE-forwarded | remaining Hermes/skill commands |
 
 Markdown: Vector's GUI renders markdown (`README.md` "Rich Message Composer"). `platform_hint` should **allow** markdown (opposite of Session's "plain text only").
 
@@ -588,7 +589,7 @@ stateDiagram-v2
 1. `check_fn`: `VECTOR_NPUB` set, `vector-bridge` binary exists. **No cargo build here** (status displays call `check_fn`; see `PlatformEntry.check_fn` docs).
 2. `ensure_deps_fn`: **do not register a compiler.** If used at all, return False + `install_hint` ("run `hermes gateway setup` / `cargo build --release` in `bridge/`"). Session does not compile at `create_adapter()`; neither do we (D10).
 3. Port liveness probe (Session `bridge_port_is_listening`); fail with retryable fatal if occupied after ~2s. If the occupant is a previous `vector-bridge`, kill it (Photon `_kill_orphan_sidecar`).
-4. Generate sidecar token; spawn process group **with stdin pipe** + `VECTOR_SIDECAR_WATCH_STDIN=1`; poll authenticated `/health` up to `VECTOR_STARTUP_TIMEOUT` (default **30s** — Vector login connects relays; Session used 15s for a local lib). `{status:"starting"}` is success-so-far; `{status:"ready"}` is connect-complete. Process exit during this window is retryable fatal.
+4. Generate sidecar token; spawn process group **with stdin pipe** + `VECTOR_SIDECAR_WATCH_STDIN=1`; poll authenticated `/health` up to `VECTOR_STARTUP_TIMEOUT` (default **60s**). `{status:"starting"}` is success-so-far; `{status:"ready"}` is connect-complete (`/health` flips ready after `VectorBot::build`, not after slash-manifest publish). Process exit during this window is retryable fatal. The adapter floors `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` to 90s from `register()` when unset (Hermes captures that wrap *before* `connect()`).
 5. Do **not** `POST /profile` from `connect()` — sidecar already published `VECTOR_BOT_NAME` on Ready.
 6. Start SSE task + health monitor (`GET /health` every 30s, token header).
 7. Write runtime record; `_mark_connected()`.
@@ -647,7 +648,7 @@ Home channel: `VECTOR_HOME_CHANNEL` = operator npub. Cron `deliver=vector` + `cr
 
 - Concord channels: `InvitePolicy::Whitelist`, mention gating, sender union (`VECTOR_ALLOWED_USERS` / `VECTOR_GROUP_ALLOWED_USERS` / `VECTOR_GROUP_ALLOW_ALL`) — **shipped**. Trusted join is enough to listen.
 - Optional bot-owned private community (`VECTOR_CREATE_COMMUNITY`) — **shipped** (no public invite link).
-- Optional `bot.command(...)` manifests that map `/ask` onto a Hermes turn (kind 10304). Still later.
+- `bot.command(...)` kind-10304 picker for Hermes `/approve` / `/deny` modes only — **shipped**. Remaining Hermes/skill commands and Concord admin stay off this surface.
 - Tor: `vector_sdk = { features = ["tor"] }` + `.tor()`; never connect clearnet first (SDK guarantee).
 
 **v3 — consider PyO3** only if the extra process is a proven problem.
@@ -723,7 +724,7 @@ optional_env:
     prompt: "Bridge binary"
     password: false
   - name: VECTOR_STARTUP_TIMEOUT
-    description: "Seconds to wait for sidecar /health status=ready (default 30)"
+    description: "Seconds to wait for sidecar /health status=ready (default 60). Plugin also floors HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT to 90 if unset."
     prompt: "Startup timeout"
     password: false
   - name: VECTOR_PAIRING

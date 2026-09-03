@@ -13,5 +13,6 @@ uv.lock
 .DS_Store
 plugin-data/
 identity.nsec
+identity.mnemonic
 target/
 bridge/target/

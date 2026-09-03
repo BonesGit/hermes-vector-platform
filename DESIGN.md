@@ -9,15 +9,14 @@
 | **Workspace** | `/home/anthony/projects/hermes-vector-platform` |
 | **Hermes install** | `/home/anthony/.hermes/hermes-agent` (also `/home/anthony/projects/hermes-agent`) |
 | **Vector SDK** | crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk) `=0.9.0` (`vector-core` `0.8`). Publish SHA `b9aeb8d5` is on [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector) `master`. crates.io `0.10.0` (SHA `7bf7d335`) is **not** on that remote and is not used. |
-| **Closest prior art** | `/home/anthony/projects/hermes-session-platform` (installed at `~/.hermes/plugins/session-platform`) |
 
 ---
 
 ## Overview
 
-Hermes Agent already talks to people through Telegram, Discord, Session, Signal, and a growing set of *plugin* messaging adapters. Vector is a private encrypted messenger on Nostr (NIP-17 gift-wrapped DMs, Concord communities) with a first-class **Rust bot SDK** (`vector_sdk` `=0.9.0` on crates.io; `VectorBot`). There is **no Python SDK** in the Vector tree (verified: the only "python" hits in Vector are MIME mappings in `crates/vector-core/src/crypto/mod.rs`).
+Hermes Agent already talks to people through Telegram, Discord, Signal, and a growing set of *plugin* messaging adapters. Vector is a private encrypted messenger on Nostr (NIP-17 gift-wrapped DMs, Concord communities) with a first-class **Rust bot SDK** (`vector_sdk` `=0.9.0` on crates.io; `VectorBot`). There is **no Python SDK** in the Vector tree (verified: the only "python" hits in Vector are MIME mappings in `crates/vector-core/src/crypto/mod.rs`).
 
-This document specifies a **user-installable Hermes platform plugin** (`kind: platform`) that gives Hermes **its own Vector identity** — a bot/agent npub that can DM other Vector users. The plugin is a first-class Vector participant, not a human impersonation layer. The recommended architecture is the same production shape as Session and Photon: a **Python `BasePlatformAdapter` that owns a native sidecar process**, except the sidecar is **Rust wrapping `vector-sdk`**, not Node wrapping a desktop library.
+This document specifies a **user-installable Hermes platform plugin** (`kind: platform`) that gives Hermes **its own Vector identity** — a bot/agent npub that can DM other Vector users. The plugin is a first-class Vector participant, not a human impersonation layer. The recommended architecture is a **Python `BasePlatformAdapter` that owns a native sidecar process**, matching bundled Photon: the sidecar here is **Rust wrapping `vector-sdk`**, not Node wrapping a desktop library.
 
 No Hermes core patches are required. Plugin platforms register through `PluginContext.register_platform` → `gateway.platform_registry.PlatformEntry`, and `Platform._missing_()` already accepts plugin names (`gateway/config.py`).
 
@@ -27,7 +26,7 @@ No Hermes core patches are required. Plugin platforms register through `PluginCo
 
 ### Why this exists
 
-The operator wants Hermes reachable from Vector the same way it is reachable from Session: a bot with its own public ID that a human Vector user can DM. Vector's product contract for that is the SDK, not the GUI:
+The operator wants Hermes reachable from Vector: a bot with its own public ID that a human Vector user can DM. Vector's product contract for that is the SDK, not the GUI:
 
 > "Build a bot for Vector — a private, encrypted messenger — in about a dozen lines of Rust." — `crates/vector-sdk/README.md`
 
@@ -39,7 +38,6 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 | --- | --- |
 | Hermes | Empty workspace at `/home/anthony/projects/hermes-vector-platform`. Plugin path is documented in `gateway/platforms/ADDING_A_PLATFORM.md` and `website/docs/developer-guide/adding-platform-adapters.md`. |
 | Vector | Full SDK + `vector-agent` MCP server (`crates/vector-agent/`). MCP is the wrong control plane for a gateway adapter (pull/buffer, not inbound event dispatch). |
-| Analog | `hermes-session-platform`: Python adapter + Node HTTP/SSE bridge wrapping `@bonesgit/session-desktop-library`. Same language-gap problem, already solved in production. |
 | Analog | Bundled Photon plugin (`plugins/platforms/photon/`): Python adapter + Node sidecar over loopback HTTP, **with a spawn-time auth token**. |
 
 ### Pain points this design absorbs
@@ -58,10 +56,10 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 - Ship a standalone plugin the operator installs into `~/.hermes/plugins/vector-platform` (clone of this repo). Zero Hermes core diffs.
 - The plugin **creates or imports a Vector bot identity**. After setup the operator sees a bech32 `npub1…` they can share. That npub is Hermes, not the operator's personal Vector account.
 - Bidirectional **1:1 DMs** between that bot and allowlisted Vector users: inbound Vector → Hermes gateway session → agent turn → outbound Vector.
-- First-run UX via `hermes gateway setup` (`setup_fn` on `PlatformEntry`), analogous to Session's create/restore + "your ID" prompt.
+- First-run UX via `hermes gateway setup` (`setup_fn` on `PlatformEntry`): create/restore plus "your Vector npub".
 - Default-deny inbox: `VECTOR_ALLOWED_USERS` + Hermes pairing codes. `VECTOR_ALLOW_ALL_USERS` is dev-only.
 - Production process hygiene: localhost-only sidecar, spawn-time auth token, scoped platform lock on the bot npub, SIGTERM→SIGKILL teardown, retryable crash recovery.
-- Unit tests that do not require a live Vector network (mirror `hermes-session-platform/tests/test_plugin_unit.py`).
+- Unit tests that do not require a live Vector network.
 
 ### Non-goals (v1)
 
@@ -84,19 +82,19 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 
 | # | Decision | Rationale |
 | --- | --- | --- |
-| D1 | **Python adapter + Rust sidecar subprocess**, HTTP/JSON + SSE on `127.0.0.1`, spawn-time `X-Hermes-Sidecar-Token`. | Vector SDK is tokio + process-global; Hermes is Python. Session/Photon already run this topology. PyO3/FFI couples crash domains and fights `vector-core`'s "one identity per process." |
+| D1 | **Python adapter + Rust sidecar subprocess**, HTTP/JSON + SSE on `127.0.0.1`, spawn-time `X-Hermes-Sidecar-Token`. | Vector SDK is tokio + process-global; Hermes is Python. Photon already runs this topology. PyO3/FFI couples crash domains and fights `vector-core`'s "one identity per process." |
 | D2 | **Plugin has its own nsec/npub.** Setup mints or imports. Public `VECTOR_NPUB` in `.env` at runtime. Secret is **SDK-owned** at `<VECTOR_DATA_DIR>/identity.nsec` (default `plugin-data/vector-platform/sdk/identity.nsec`, mode `0600`). **Runtime** is the only keyless `VectorBot::builder().data_dir(VECTOR_DATA_DIR).build()` (file already exists). `--check` / `--setup` must **not** call `build()` / `load_or_create_identity` — that helper **writes** a new nsec when the file is missing. | `load_or_create_identity` reads/writes `data_dir.join("identity.nsec")` only (`lib.rs` 1758–1771). Using it from `--check` before the create/import prompt would mint identity A and hide the import path. nsec is SDK identity material next to SQLite, **not** a Hermes `secret_scope` secret; `.env` holds `VECTOR_NPUB` only at runtime. |
-| D3 | **DM session key = peer npub.** `chat_id = user_id = npub1…`, `chat_type = "dm"`. Hermes `build_session_key` then isolates each peer automatically. | `IncomingMessage.chat_id` for DMs *is* the sender npub (`vector-sdk` `BotEvent` docs). Same mapping Session uses (Session ID as `chat_id`). |
+| D3 | **DM session key = peer npub.** `chat_id = user_id = npub1…`, `chat_type = "dm"`. Hermes `build_session_key` then isolates each peer automatically. | `IncomingMessage.chat_id` for DMs *is* the sender npub (`vector-sdk` `BotEvent` docs). |
 | D4 | **Default-deny allowlist at the adapter/gateway layer**, not Vector SDK `whitelist()`. Pairing codes enabled (`VECTOR_PAIRING` default on). SDK `whitelist()` is used only as **community-invite** policy (`VECTOR_TRUSTED_INVITERS` / `VECTOR_ALLOWED_USERS`). | SDK whitelist only gates **community invites** (`InvitePolicy`). DMs would otherwise be open to any npub that can gift-wrap to the bot. Hermes `_is_user_authorized` already default-denies. |
 | D5 | **v1 is DM text + typing + profile (`bot: true`) plus mention-gated Concord channels.** Public invite links, `InvitePolicy::Public`, community files/reactions, and catch-up of messages missed while the sidecar was down stay later. | Smallest path that satisfies "the plugin has its own npub and can chat with another Vector user," then a private group room. |
 | D6 | **Sidecar is a first-class crate in this repo** (`bridge/`), depending on crates.io **`vector_sdk = "=0.9.0"`** (crate name uses an underscore; pulls `vector-core` `0.8`). Exact pin — do not take crates.io `0.10.0`. Do not fork Vector. Do **not** use a git dep on `VectorPrivacy/Vector` — that repo has **no root `Cargo.toml`** (workspace is `crates/Cargo.toml`); Cargo git deps will not resolve. Do not use a sibling path `../../Vector/crates/vector-sdk` (operators and CI should not need a Vector checkout). Vector's workspace `[patch.crates-io]` for `nostr` does **not** inherit; consumers get stock `nostr` (vector-core README). There is **no plugin-root Cargo workspace** — the build command is `cd bridge && cargo build --release`, not `cargo build -p vector-bridge` from the repo root. | crates.io `0.9.0` publish SHA `b9aeb8d5` is an ancestor of GitHub `master`. crates.io `0.10.0` (2026-08-26, SHA `7bf7d335`) is **not** on that remote — treat as unpublished source and do not consume it. SDK README still documents `"0.3"`. |
-| D7 | **Bind `127.0.0.1` + header `X-Hermes-Sidecar-Token` on every route including `/health`.** Cron `standalone_sender_fn` reads a 0600 runtime record for port+token (Photon pattern). No `Authorization: Bearer`. Optional unauthenticated `/live` returns `{ok:true}` only. | Session's unauthenticated localhost bind was a real CVE-class bug (CHANGELOG: previously listened on `::`). Photon's header is `X-Hermes-Sidecar-Token` (`plugins/platforms/photon/sidecar/index.mjs`). One string everywhere. |
+| D7 | **Bind `127.0.0.1` + header `X-Hermes-Sidecar-Token` on every route including `/health`.** Cron `standalone_sender_fn` reads a 0600 runtime record for port+token (Photon pattern). No `Authorization: Bearer`. Optional unauthenticated `/live` returns `{ok:true}` only. | Unauthenticated loopback binds have been CVE-class bugs on other sidecars. Photon's header is `X-Hermes-Sidecar-Token` (`plugins/platforms/photon/sidecar/index.mjs`). One string everywhere. |
 | D8 | **Do not use `vector-agent` MCP as the adapter.** | MCP is a tool server (`crates/vector-agent/src/main.rs` + `tools.rs`) that buffers inbound DMs for `get_new_messages`. Hermes gateway needs push (`handle_message`) plus `send()`. Wrong inversion of control. |
-| D9 | **User plugin, not bundled.** `kind: platform` user plugins in `~/.hermes/plugins/` are gated by `plugins.enabled` (`hermes_cli/plugins.py` PluginManifest docs). Install = clone + enable + `hermes gateway setup`. Directory plugins **must** ship `__init__.py` exposing `register(ctx)` (Session pattern). | Session was declined in-tree (PR #6948, third-party product policy). Same shape. |
-| D10 | **v1 builds the sidecar during `hermes gateway setup` (`cargo build --release` in `bridge/`).** No prebuilt binaries. `ensure_deps_fn` does **not** compile; it returns False + install hint. `check_fn` stays side-effect free. | Hermes calls `ensure_deps_fn` from `create_adapter()` at gateway start. A multi-minute `vector_sdk` compile would blow `VECTOR_STARTUP_TIMEOUT` and systemd limits. Session installs Node deps in `interactive_setup`, not `ensure_deps_fn`. This operator has rustc. Prebuilts are v1.1. |
+| D9 | **User plugin, not bundled.** `kind: platform` user plugins in `~/.hermes/plugins/` are gated by `plugins.enabled` (`hermes_cli/plugins.py` PluginManifest docs). Install = clone + enable + `hermes gateway setup`. Directory plugins **must** ship `__init__.py` exposing `register(ctx)`. | Third-party messengers stay out of Hermes core (plugin path is the supported shape). |
+| D10 | **v1 builds the sidecar during `hermes gateway setup` (`cargo build --release` in `bridge/`).** No prebuilt binaries. `ensure_deps_fn` does **not** compile; it returns False + install hint. `check_fn` stays side-effect free. | Hermes calls `ensure_deps_fn` from `create_adapter()` at gateway start. A multi-minute `vector_sdk` compile would blow `VECTOR_STARTUP_TIMEOUT` and systemd limits. Photon installs Node deps in interactive setup, not `ensure_deps_fn`. This operator has rustc. Prebuilts are v1.1. |
 | D11 | **Unattended start. No `VECTOR_PASSWORD` / PIN in v1.** Headless `build()` without `.password()`. | Argon2id is 150MB / 10 iterations (`crypto::hash_pass`). A PIN would block `hermes gateway start`. Encrypted-at-rest nsec is v1.1. |
 | D12 | **Setup writes `display.platforms.vector.tool_progress: off` (and `interim_assistant_messages: false`) into the operator `config.yaml`.** There is no `display.platform_tool_progress` key. Resolution is `display.platforms.<platform>.tool_progress` → global `display.tool_progress` → `_PLATFORM_DEFAULTS` → `_GLOBAL_DEFAULTS["tool_progress"] = "all"` (`gateway/display_config.py`). `"vector"` is absent from `_PLATFORM_DEFAULTS` (adding it is a Hermes-core patch — a non-goal). A user plugin therefore inherits **`all`** unless setup writes the YAML override. Signal/Photon `_TIER_LOW` analog. Flip only when `/edit` ships (v1.1). | Vector *can* edit (`Channel::edit`); v1 has no `/edit` route. Without the override, Hermes posts a new Vector DM per tool event. |
-| D13 | **Normalize npubs with `PublicKey::parse` (Rust sidecar) and `normalize_npub()` (Python, in `adapter.py`).** Python copies Buzz stdlib bech32 (`hex_to_npub` / `npub_to_hex` in `plugins/platforms/buzz/adapter.py`, charset `qpzry9x8gf2tvdw0s3jn54khce6mua7l`, 32-byte payload) plus strip `nostr:` / whitespace. Persist canonical `npub1…`. No Python crypto package. Do not use a loose `npub1[0-9a-z]{58,}` regex. Sidecar `/send` still re-validates with `PublicKey::parse`. **`parse_target_ref_fn` is `_parse_npub_target`**, which wraps `normalize_npub()` and returns `Optional[tuple[str, Optional[str]]]` (`(npub, None)`); never register `normalize_npub` as the hook (Hermes rejects a bare string). | Same approach as `VectorBotBuilder::whitelist` (`PublicKey::parse` + `to_bech32`). Buzz already ships a stdlib codec; Session adds no nostr pip dep. `PlatformEntry.parse_target_ref_fn` is a `(chat_id, thread_id)` tuple (`gateway/platform_registry.py`). |
+| D13 | **Normalize npubs with `PublicKey::parse` (Rust sidecar) and `normalize_npub()` (Python, in `adapter.py`).** Python copies Buzz stdlib bech32 (`hex_to_npub` / `npub_to_hex` in `plugins/platforms/buzz/adapter.py`, charset `qpzry9x8gf2tvdw0s3jn54khce6mua7l`, 32-byte payload) plus strip `nostr:` / whitespace. Persist canonical `npub1…`. No Python crypto package. Do not use a loose `npub1[0-9a-z]{58,}` regex. Sidecar `/send` still re-validates with `PublicKey::parse`. **`parse_target_ref_fn` is `_parse_npub_target`**, which wraps `normalize_npub()` and returns `Optional[tuple[str, Optional[str]]]` (`(npub, None)`); never register `normalize_npub` as the hook (Hermes rejects a bare string). | Same approach as `VectorBotBuilder::whitelist` (`PublicKey::parse` + `to_bech32`). Buzz already ships a stdlib codec. `PlatformEntry.parse_target_ref_fn` is a `(chat_id, thread_id)` tuple (`gateway/platform_registry.py`). |
 | D14 | **Public kind-0 is opt-in.** Sidecar-boot calls `update_profile` **only** when `VECTOR_BOT_NAME`, `VECTOR_BOT_ABOUT`, `VECTOR_BOT_AVATAR`, and/or `VECTOR_BOT_BANNER` is set. Unset/blank = do not publish (no default name `Hermes` on the wire). When publishing: name/about from env; avatar/banner from `upload_image` public Blossom URLs or previously published URLs; `bot: true`. Empty strings passed to the SDK **merge** (they keep prior kind-0 fields); they do not wipe a card already on relays. NIP-24 extras (`display_name`, `website`, `nip05`, `lud16`) are not settable via Vector `update_profile`. Do not use `"Hermes Agent"`. Do not leak hostname or `HERMES_HOME`. | Operator decision 2026-08-28 / 2026-08-30 (opt-in kind-0). Kind-0 is public. |
 | D15 | **v1 uses SDK `state::TRUSTED_RELAYS` only.** No `VECTOR_RELAYS` env or builder override. Relays: `wss://jskitty.com/nostr`, `wss://asia.vectorapp.io/nostr`, `wss://nostr.computingcache.com`, `wss://relay.ditto.pub` (`vector-core/src/state.rs`). | Operator decision 2026-08-28. A custom relay list is a later knob if those endpoints are unreachable. |
 
@@ -183,7 +181,7 @@ sequenceDiagram
     src/events.rs             # single-client SSE from BotEvent
 ```
 
-Install target (operator machine): `~/.hermes/plugins/vector-platform`, matching Session's documented layout.
+Install target (operator machine): `~/.hermes/plugins/vector-platform`.
 
 Durable data (never in the install tree):
 
@@ -191,6 +189,7 @@ Durable data (never in the install tree):
 ~/.hermes/plugin-data/vector-platform/
   sdk/                          # VECTOR_DATA_DIR — VectorBot::data_dir
     identity.nsec               # 0600; written by --setup; runtime build() reads it
+    identity.mnemonic           # 0600; written on create / mnemonic import; backup only
     <sqlite + caches>           # vector-core::db; wipe these, never identity.nsec
 ~/.hermes/runtime/vector-sidecar.json   # {port, token, pid, npub} 0600
 ~/.hermes/logs/vector-bridge.log
@@ -209,19 +208,19 @@ Use `plugin_data_dir("vector-platform") / "sdk"` as `VECTOR_DATA_DIR`. **Excepti
 
 #### Recommendation: Python adapter + Rust sidecar (HTTP/SSE)
 
-This is Session's topology with the native side swapped from Node to Rust, plus Photon's auth token.
+This is Photon's sidecar topology with the native side swapped from Node to Rust.
 
 | Concern | How it is handled |
 | --- | --- |
 | Language | Sidecar is a normal `#[tokio::main]` binary using `VectorBot` exactly as `echo_bot.rs` / `ai_bot.rs` do. |
 | Process-global Vector state | Satisfied: **one bot per sidecar process**, as `vector-sdk` requires. |
 | Crash isolation | A panic in `vector-core` kills the sidecar, not the gateway. Adapter observes `Popen.poll()`, calls `_set_fatal_error(..., retryable=True)`. Gateway queues reconnect (`_queue_retryable_fatal_platform`). |
-| Event loop | Tokio lives in the sidecar. Python asyncio talks HTTP/SSE via `httpx.AsyncClient` (Session pattern in `adapter.py` `_sse_listener`). |
+| Event loop | Tokio lives in the sidecar. Python asyncio talks HTTP/SSE via `httpx.AsyncClient`. |
 | Lifecycle | `connect()` spawns with `stdin=PIPE` + `VECTOR_SIDECAR_WATCH_STDIN=1`; `disconnect()` closes stdin, then SIGTERM process group, then SIGKILL (`os.setsid` / `killpg`). |
-| Cron | `standalone_sender_fn` POSTs to the live sidecar. Cron does **not** spawn its own bot (Session README: "the Hermes gateway must be running"). |
+| Cron | `standalone_sender_fn` POSTs to the live sidecar. Cron does **not** spawn its own bot (the Hermes gateway must be running). |
 | Parent-death | v1 **required**. Copy Photon: adapter holds the stdin pipe; sidecar exits on stdin EOF (`PHOTON_SIDECAR_WATCH_STDIN` in `plugins/platforms/photon/sidecar/index.mjs`). Linux `PR_SET_PDEATHSIG(SIGTERM)` is additional, not the primary mechanism. **No idle-exit timer in v1.** |
 
-Sidecar spawn (conceptual, Session process group + Photon stdin watch):
+Sidecar spawn (conceptual, process group + Photon stdin watch):
 
 ```python
 # adapter.py
@@ -248,7 +247,7 @@ def _spawn_bridge(self) -> subprocess.Popen:
     )
 ```
 
-Default port **8096** (Session uses 8095; Photon uses 8789). Override with `VECTOR_BRIDGE_PORT`. Default host `127.0.0.1` (`VECTOR_BRIDGE_HOST`).
+Default port **8096** (Photon uses 8789). Override with `VECTOR_BRIDGE_PORT`. Default host `127.0.0.1` (`VECTOR_BRIDGE_HOST`).
 
 #### Alternative A — PyO3 extension module (rejected for v1)
 
@@ -259,7 +258,7 @@ Build `vector-sdk` into a `cdylib`, expose `VectorBot` to Python.
   1. `vector-core` process-global state (`crates/vector-core/README.md`: "one account is active per process"). The Hermes gateway process would be able to host **exactly one** Vector identity, and a second profile/plugin could corrupt it via `swap_session`.
   2. Tokio runtime vs asyncio: you still need a background thread and a bridge. PyO3-asyncio is real work and a source of shutdown deadlocks.
   3. A native SIGSEGV / panic unwinding through the CPython ABI takes down the **entire gateway** (Telegram, Discord, cron, …).
-  4. Wheel matrix (manylinux, musl, macOS, aarch64) plus `rust-version = "1.75"` (`vector-sdk/Cargo.toml`). Session avoided this by requiring Node; we can require a single sidecar binary instead of a Python extension.
+  4. Wheel matrix (manylinux, musl, macOS, aarch64) plus `rust-version = "1.75"` (`vector-sdk/Cargo.toml`). A single sidecar binary is simpler than a Python extension.
   5. Vector's `GuardedKey` vault is designed around a dedicated process. Linux `PR_SET_DUMPABLE=0` is applied in the **GUI** crate (`src-tauri/src/lib.rs`), not in `vector-sdk`; a sidecar would still have to set it itself. Embedding the vault in CPython is a threat-model mismatch.
 
 Keep PyO3 as a v3 experiment only if sidecar overhead becomes measurable. For a DM bot it will not.
@@ -278,7 +277,7 @@ No Python Vector SDK exists. Reimplementing NIP-17/NIP-44/NIP-59 + Concord in Py
 
 ### Sidecar HTTP contract
 
-Modeled on `bridge/session-bridge.mjs` (health, SSE `/events`, POST `/send`, typing, `--setup`/`--check`) plus Photon's `X-Hermes-Sidecar-Token`. HTTP server: **axum** (tokio-native, one framework — not a PR-3 debate). JSON via serde. Max request body **64 KiB** (413 above that).
+Modeled on Photon's sidecar (health, SSE `/events`, POST `/send`, typing, `--setup`/`--check`) plus `X-Hermes-Sidecar-Token`. HTTP server: **axum** (tokio-native, one framework — not a PR-3 debate). JSON via serde. Max request body **64 KiB** (413 above that).
 
 #### Boot sequence (required)
 
@@ -345,8 +344,8 @@ v1.1 additions (stub the routes in v1, return `501` `{error, code:"not_implement
 
 #### SSE
 
-- **Single client**, last-writer-wins (Session `currentSseClient`). A second `GET /events` ends the previous stream. Cron does not subscribe.
-- Heartbeat: SSE comment `: ping\n\n` every 30s (Session). Adapter stale-timeout 60s (2× ping).
+- **Single client**, last-writer-wins. A second `GET /events` ends the previous stream. Cron does not subscribe.
+- Heartbeat: SSE comment `: ping\n\n` every 30s. Adapter stale-timeout 60s (2× ping).
 - Each `message` event carries SSE `id: <message.id>` (Vector rumor/event hex). Adapter may send `Last-Event-ID` on reconnect; v1 sidecar **may ignore it** (live-only). Adapter **dedupes inbound by `data.id`** (in-memory LRU, ~1024) so SSE reconnect does not double-dispatch.
 - `is_group: true` events are **dropped in the sidecar** in v1 (debug log). Do not SSE them.
 
@@ -385,20 +384,20 @@ Message mapping from `IncomingMessage` (there is **no** `IncomingMessage.npub` f
 
 Adapter `MessageEvent.reply_to_text` comes from `reply_to_text`. Skip SSE events with `is_mine: true`.
 
-#### Setup modes (mirror Session `session-bridge.mjs`)
+#### Setup modes
 
-`--setup` / `--check` are **short-lived CLI processes**. They do not take `VECTOR_SIDECAR_TOKEN` and do not bind HTTP. They never print nsec. They **must not** call `VectorBot::build()`, `load_or_create_identity` (private; **writes** `identity.nsec` when missing — `crates/vector-sdk/src/lib.rs` 1758–1771), `VectorCore::init`+`login`, or connect relays. Session `--check` is `isRegistered()` with no create; Vector has no equivalent, so we implement the offline analog ourselves.
+`--setup` / `--check` are **short-lived CLI processes**. They do not take `VECTOR_SIDECAR_TOKEN` and do not bind HTTP. They never print nsec. They **must not** call `VectorBot::build()`, `load_or_create_identity` (private; **writes** `identity.nsec` when missing — `crates/vector-sdk/src/lib.rs` 1758–1771), `VectorCore::init`+`login`, or connect relays. `--check` is a read-only file probe with no create.
 
 - `--check` (side-effect free on the secret): if `<VECTOR_DATA_DIR>/identity.nsec` is missing or empty → print `{status: "not_registered"}` and exit 0. Else read the file, parse with `SecretKey::from_bech32` / `Keys::new`, print `{status: "existing", npub}` from `public_key().to_bech32()`, exit. Invalid bech32 → exit non-zero with `{error, code:"invalid_nsec"}` on stderr, **do not rewrite the file**.
 - `--setup` **writes the file itself**, then derives npub the same offline way (no relays):
   - If `identity.nsec` exists and is non-empty → same parse as `--check`, print `{status: "existing", npub}`. Do not mint.
   - Else if `--nsec-file <path>` → copy/validate contents into `identity.nsec` (`restrict_to_owner` 0600), print `{status: "restored", npub}`.
-  - Else if `--mnemonic-file <path>` → `Keys::from_mnemonic`, write the derived nsec to `identity.nsec` (0600), print `{status: "restored", npub}`.
-  - Else → `VectorBot::generate_nsec()` (or `Keys::generate().secret_key().to_bech32()`), write `identity.nsec` (0600), print `{status: "created", npub}`.
+  - Else if `--mnemonic-file <path>` → `Keys::from_mnemonic`, write the derived nsec to `identity.nsec` and the phrase to `identity.mnemonic` (both 0600), print `{status: "restored", npub}`.
+  - Else → generate a 12-word BIP-39 mnemonic (`bip39::Mnemonic::generate(12)`), derive nsec via NIP-06 `Keys::from_mnemonic`, write `identity.nsec` and `identity.mnemonic` (both 0600), print `{status: "created", npub}`. Do not put the mnemonic in stdout JSON (same as nsec).
   - **Never print the nsec to stdout.** Backup path goes to stderr once, matching SDK `eprintln!("[vector-sdk] Created a new bot identity {} (stored at {})…")`.
 - **Never pass nsec/mnemonic via environment into the long-running sidecar.** Setup may read a one-shot file and delete it after restore. If the operator still has `VECTOR_NSEC` in `.env` from a previous attempt, `interactive_setup` copies it to `identity.nsec` via `--nsec-file` then tells them to delete the env var.
 
-**Runtime is the only keyless `build()`:** `VectorBot::builder().data_dir(&vector_data_dir).build().await?` with **no** `.nsec()` — SDK `load_or_create_identity` then sees a file `--setup` already wrote, so it will **not** mint. `InvitePolicy::Manual`. Relay reconnection is internal (`vector-sdk` README: "if the bot loses its connection, it reconnects on its own"). That loop is **not** process-death recovery. Python health monitor pings authenticated `/health` every 30s (Session `HEALTH_CHECK_INTERVAL = 30.0`).
+**Runtime is the only keyless `build()`:** `VectorBot::builder().data_dir(&vector_data_dir).build().await?` with **no** `.nsec()` — SDK `load_or_create_identity` then sees a file `--setup` already wrote, so it will **not** mint. `InvitePolicy::Manual`. Relay reconnection is internal (`vector-sdk` README: "if the bot loses its connection, it reconnects on its own"). That loop is **not** process-death recovery. Python health monitor pings authenticated `/health` every 30s.
 
 Wizard order depends on this: `--check` runs **before** the create/import prompt. If `--check` minted, first-run would always be `existing` and the import path would be dead.
 
@@ -406,13 +405,14 @@ Wizard order depends on this: `--check` runs **before** the create/import prompt
 
 #### Where the nsec is generated
 
-`VectorBot::generate_nsec()` → `VectorCore.generate_nsec()` → `Keys::generate().secret_key().to_bech32()` (`crates/vector-core/src/lib.rs`). Called only from sidecar `--setup` when no identity exists and no import was provided.
+`bip39::Mnemonic::generate(12)` → `Keys::from_mnemonic` (NIP-06) → `secret_key().to_bech32()`. Called only from sidecar `--setup` when no identity exists and no import was provided. Persist `identity.nsec` (runtime) and `identity.mnemonic` (backup) at `0600`. Nsec-only import writes nsec only.
 
 #### Where it is stored
 
 | Location | What | Why |
 | --- | --- | --- |
 | `plugin_data_dir("vector-platform") / "sdk" / "identity.nsec"` | nsec, mode `0600` | **This is `VECTOR_DATA_DIR/identity.nsec`.** `--check` only *reads* it (offline parse). `--setup` *writes* it (generate / copy file). Runtime `load_or_create_identity` then finds it and does not mint. Same `data_dir` everywhere. Survives plugin update/remove. |
+| Same dir `identity.mnemonic` | 12-word BIP-39, mode `0600` | Written on create and mnemonic import. Backup only; runtime does not read it. Nsec-only import omits this file. |
 | Same dir, other files | SQLite + Vector caches | Wipe caches by deleting SQLite/cache files, **never** `identity.nsec`. |
 | `~/.hermes/.env` `VECTOR_NPUB` | public npub | Operator-visible; `requires_env` in `plugin.yaml`; `hermes gateway status`. |
 | `~/.hermes/.env` `VECTOR_NSEC` | **optional, password=true, not read by the sidecar** | Import-only convenience for setup. `interactive_setup` copies it into `identity.nsec` via `--nsec-file`, then the operator should delete it from `.env`. |
@@ -429,20 +429,20 @@ v1.1: `VECTOR_PASSWORD` for encrypted-at-rest keys (`VectorBotBuilder::password`
 
 1. Setup prints it and writes `VECTOR_NPUB`.
 2. `GET /npub` and `/health` return it.
-3. Adapter logs a **truncated** form (`npub1abcd…`) on connect, same as Session (`bot session ID = %s...` with `[:16]`).
+3. Adapter logs a **truncated** form (`npub1abcd…`) on connect.
 4. `hermes gateway status` via `env_enablement_fn` seeding `PlatformConfig.extra["npub"]`.
 
 #### Pairing / first-run UX
 
-`interactive_setup()` registered as `setup_fn` (Session `adapter.py` `interactive_setup`, ~150 lines). Flow:
+`interactive_setup()` registered as `setup_fn`. Flow:
 
 1. Resolve `vector-bridge` binary (`VECTOR_BRIDGE_BIN`, else `bridge/target/release/vector-bridge`). If missing, `cargo build --release` in `bridge/` (requires `rustc >= 1.75`). If cargo is missing, print a clear install hint — do not silently pip-install anything (`check_fn` must stay side-effect free; **build belongs only in `setup_fn`**, never `ensure_deps_fn` / `connect()`).
 2. `--check` against `VECTOR_DATA_DIR` (default `plugin-data/vector-platform/sdk`). This is **read-only**: `not_registered` vs `existing`. It must not mint (see Setup modes).
-3. If `existing`: show the npub; skip create/import unless the operator confirms reconfigure (and understands replacing `identity.nsec` is a new bot). If `not_registered`: prompt create new identity / import nsec / import 12-word mnemonic. Import writes a temp `0600` file and passes `--nsec-file` / `--mnemonic-file`; never puts the secret in the sidecar env.
+3. If `existing`: show the npub; skip create/import unless the operator confirms reconfigure (and understands replacing `identity.nsec` is a new bot). If `not_registered`: prompt create new identity / import nsec / import 12-word mnemonic. Import writes a temp `0600` file and passes `--nsec-file` / `--mnemonic-file`; never puts the secret in the sidecar env. **Create** writes `identity.nsec` and `identity.mnemonic`.
 4. Prompt: bot display name (default `Hermes`).
-5. Prompt: **operator's Vector npub** (hex / `npub1` / `nostr:npub1`, run through `normalize_npub()` — D13) — this becomes `VECTOR_HOME_CHANNEL` and the initial `VECTOR_ALLOWED_USERS` (Session asks for "YOUR Session ID" the same way).
+5. Prompt: **operator's Vector npub** (hex / `npub1` / `nostr:npub1`, run through `normalize_npub()` — D13) — this becomes `VECTOR_HOME_CHANNEL` and the initial `VECTOR_ALLOWED_USERS`.
 6. Prompt pairing policy: keep `VECTOR_PAIRING` on (default) or off (pre-filter unauthorized senders before `handle_message`, so pairing codes are not sent).
-7. Run `--setup` (writes `identity.nsec` if missing; never `build()`). Save `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, `VECTOR_ALLOWED_USERS`, `VECTOR_DATA_DIR`. Do not save nsec to `.env`.
+7. Run `--setup` (writes `identity.nsec` if missing; never `build()`). Save `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, `VECTOR_ALLOWED_USERS`, `VECTOR_DATA_DIR`. Do not save nsec or mnemonic to `.env`. On create, `identity.mnemonic` is written next to the nsec.
 8. Merge into `~/.hermes/config.yaml` (no core diff; D12):
 
 ```yaml
@@ -468,9 +468,9 @@ self._acquire_platform_lock(
 )
 ```
 
-Same intent as Session's lock on `SESSION_BOT_ID` (prevents two gateway profiles using the same nsec).
+Scoped platform lock on the bot npub (prevents two gateway profiles using the same nsec).
 
-### Session mapping (question 3)
+### Hermes session mapping (question 3)
 
 Hermes session keys are built by `build_session_key` in `gateway/session.py`. For `chat_type == "dm"` the key includes `platform`, `chat_id`, and optional `thread_id`.
 
@@ -494,7 +494,7 @@ Each peer npub is its own Hermes conversation. That is the correct multi-user ma
 
 **Do not** collapse all Vector DMs into one session. **Do not** use the bot's own npub as `chat_id`.
 
-v2 communities: `chat_id` = 64-char hex channel id (`ChannelKind::Community` detection in `channel_kind_for`), `chat_type` = `"group"`, `user_id` = sender npub, `parent_chat_id` / `scope_id` = community id. Mention-gate like Session (`_mentions_bot` / reply-to-bot; `@everyone` ignored). Membership from a trusted invite is the look-gate (no `VECTOR_GROUP_ALLOWED_CHATS`). Group people-gate is a union: `VECTOR_ALLOWED_USERS` (also DMs), `VECTOR_GROUP_ALLOWED_USERS` (group-only, no DMs), or any member if the channel is in `VECTOR_GROUP_ALLOW_ALL`. Pairing stays DM-only. Channel ids are not shown in the Vector app; on join the sidecar logs the full hex and the adapter DMs `VECTOR_HOME_CHANNEL` once (`sdk/notified-channels.json`). Parked invites stay silent.
+v2 communities: `chat_id` = 64-char hex channel id (`ChannelKind::Community` detection in `channel_kind_for`), `chat_type` = `"group"`, `user_id` = sender npub, `parent_chat_id` / `scope_id` = community id. Mention-gate (`_mentions_bot` / reply-to-bot; `@everyone` ignored). Membership from a trusted invite is the look-gate (no `VECTOR_GROUP_ALLOWED_CHATS`). Group people-gate is a union: `VECTOR_ALLOWED_USERS` (also DMs), `VECTOR_GROUP_ALLOWED_USERS` (group-only, no DMs), or any member if the channel is in `VECTOR_GROUP_ALLOW_ALL`. Pairing stays DM-only. Channel ids are not shown in the Vector app; on join the sidecar logs the full hex and the adapter DMs `VECTOR_HOME_CHANNEL` once (`sdk/notified-channels.json`). Parked invites stay silent.
 
 `normalize_npub()` (D13) returns `Optional[str]` for the wizard, allowlists, and `VECTOR_HOME_CHANNEL`. It is **not** the platform hook. `PlatformEntry.parse_target_ref_fn` is `(target_ref: str) -> Optional[tuple[str, Optional[str]]]` (`gateway/platform_registry.py`); `tools/send_message_tool.py` rejects a non-tuple with “Target parser … returned an invalid result”. Register the wrapper:
 
@@ -546,7 +546,7 @@ Empty-body file messages in v1: drop with a debug log. Do not crash.
 
 `send_typing(chat_id)` → POST `/typing` → `bot.dm(npub).typing()` (kind 30078, ≤30s expiry; `docs/typing-indicator.md`). Hermes `_keep_typing` heartbeat in `BasePlatformAdapter` already loops this while the agent thinks (`PlatformConfig.typing_indicator` default True).
 
-Unlike Session, Vector **supports edit** (`Channel::edit`). Per D12, v1 **setup writes** `display.platforms.vector.tool_progress: off` (and `interim_assistant_messages: false`) into `config.yaml`. That is the real override (`gateway/display_config.py` `resolve_display_setting`); there is no `display.platform_tool_progress` key and no `_PLATFORM_DEFAULTS["vector"]` entry (adding one is a core patch). Without the YAML, the plugin inherits `_GLOBAL_DEFAULTS["tool_progress"] = "all"` and posts a new Vector DM per tool event. Do not claim progress-edits in v1.
+Vector **supports edit** (`Channel::edit`). Per D12, v1 **setup writes** `display.platforms.vector.tool_progress: off` (and `interim_assistant_messages: false`) into `config.yaml`. That is the real override (`gateway/display_config.py` `resolve_display_setting`); there is no `display.platform_tool_progress` key and no `_PLATFORM_DEFAULTS["vector"]` entry (adding one is a core patch). Without the YAML, the plugin inherits `_GLOBAL_DEFAULTS["tool_progress"] = "all"` and posts a new Vector DM per tool event. Do not claim progress-edits in v1.
 
 #### Media, replies, reactions (v1 vs later)
 
@@ -562,9 +562,9 @@ Unlike Session, Vector **supports edit** (`Channel::edit`). Per D12, v1 **setup 
 | Communities | `community()`, `InvitePolicy` | join-first whitelist + mention-gated group text/typing; optional `create_community_v2` | public invite links, Concord moderation |
 | Slash commands | `bot.command(...)` kind 10304 | `/approve` and `/deny` only (optional args); SSE-forwarded | remaining Hermes/skill commands |
 
-Markdown: Vector's GUI renders markdown (`README.md` "Rich Message Composer"). `platform_hint` should **allow** markdown (opposite of Session's "plain text only").
+Markdown: Vector's GUI renders markdown (`README.md` "Rich Message Composer"). `platform_hint` should **allow** markdown.
 
-Message size: Session caps at 2000. Vector/Nostr rumor size is larger; start with `max_message_length=4000` on `PlatformEntry` (Hermes smart-chunks) and revisit if gift-wraps fail in testing. No hard cap found in `vector-sdk` send path; `vector-core/src/sending.rs` is the NIP-17 pipeline with headless retry.
+Message size: Vector/Nostr rumor size is larger than typical messenger caps; start with `max_message_length=4000` on `PlatformEntry` (Hermes smart-chunks) and revisit if gift-wraps fail in testing. No hard cap found in `vector-sdk` send path; `vector-core/src/sending.rs` is the NIP-17 pipeline with headless retry.
 
 Self-messages: always filter `is_mine` / skip if SSE `npub == VECTOR_NPUB`.
 
@@ -587,8 +587,8 @@ stateDiagram-v2
 **Start** (gateway start / platform enable):
 
 1. `check_fn`: `VECTOR_NPUB` set, `vector-bridge` binary exists. **No cargo build here** (status displays call `check_fn`; see `PlatformEntry.check_fn` docs).
-2. `ensure_deps_fn`: **do not register a compiler.** If used at all, return False + `install_hint` ("run `hermes gateway setup` / `cargo build --release` in `bridge/`"). Session does not compile at `create_adapter()`; neither do we (D10).
-3. Port liveness probe (Session `bridge_port_is_listening`); fail with retryable fatal if occupied after ~2s. If the occupant is a previous `vector-bridge`, kill it (Photon `_kill_orphan_sidecar`).
+2. `ensure_deps_fn`: **do not register a compiler.** If used at all, return False + `install_hint` ("run `hermes gateway setup` / `cargo build --release` in `bridge/`"). Do not compile at `create_adapter()` (D10).
+3. Port liveness probe; fail with retryable fatal if occupied after ~2s. If the occupant is a previous `vector-bridge`, kill it (Photon `_kill_orphan_sidecar`).
 4. Generate sidecar token; spawn process group **with stdin pipe** + `VECTOR_SIDECAR_WATCH_STDIN=1`; poll authenticated `/health` up to `VECTOR_STARTUP_TIMEOUT` (default **60s**). `{status:"starting"}` is success-so-far; `{status:"ready"}` is connect-complete (`/health` flips ready after `VectorBot::build`, not after slash-manifest publish). Process exit during this window is retryable fatal. The adapter floors `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` to 90s from `register()` when unset (Hermes captures that wrap *before* `connect()`).
 5. Do **not** `POST /profile` from `connect()` — sidecar already published `VECTOR_BOT_NAME` on Ready.
 6. Start SSE task + health monitor (`GET /health` every 30s, token header).
@@ -598,7 +598,7 @@ stateDiagram-v2
 
 **Sidecar crash (process death):** `_handle_bridge_exit` → `_set_fatal_error("vector_bridge_exited", msg, retryable=True)` → `_notify_fatal_error`. Gateway reconnect watcher reconstructs the adapter and calls `connect()` again. The new process runs `prepare_listen` → `sync_dms(..., &NoOpEventHandler)` which **ingests SQLite only**. Those DMs are **not** dispatched to Hermes in v1. This is an explicit non-goal (D5). v1.1 may, after `BotEvent::Ready`, walk `Channel::history` for known allowlisted npubs, persist last-seen event ids, and SSE-emit unseen ones (dedup by rumor id). **Do not** claim `sync_dms` feeds `on_event`.
 
-**SSE drop with live process:** exponential backoff 2s → 60s + jitter (Session `SSE_RETRY_DELAY_*`). Stale timeout 60s (2× `: ping` interval). Sidecar `on_event` keeps running; events sent to a dropped SSE client are lost unless the adapter's `Last-Event-ID` / LRU covers them. v1 relies on LRU dedup + peer retry, not history walk.
+**SSE drop with live process:** exponential backoff 2s → 60s + jitter. Stale timeout 60s (2× `: ping` interval). Sidecar `on_event` keeps running; events sent to a dropped SSE client are lost unless the adapter's `Last-Event-ID` / LRU covers them. v1 relies on LRU dedup + peer retry, not history walk.
 
 **Gateway process crash:** sidecar must exit because the adapter holds stdin (`VECTOR_SIDECAR_WATCH_STDIN=1`, Photon). Additional: Linux `prctl(PR_SET_PDEATHSIG, SIGTERM)`. **No idle-exit timer in v1** — an idle timer that ignores in-flight SSE would kill a live sidecar, and one that keys off `/health` without auth would never see Python's pings if `/health` were public. Parent-death is the v1 required mechanism.
 
@@ -606,7 +606,7 @@ stateDiagram-v2
 
 ### Trust / allowlist (question 6)
 
-**Default: deny.** An agent with tools behind a public-key messenger is a prompt-injection and abuse surface. Vector DMs can be sent by anyone who knows the bot npub (gift wraps do not require a prior contact request the way Session does — Session has `accept-contact`; Vector does not expose an equivalent in the SDK).
+**Default: deny.** An agent with tools behind a public-key messenger is a prompt-injection and abuse surface. Vector DMs can be sent by anyone who knows the bot npub (gift wraps do not require a prior contact request; Vector does not expose an accept-contact equivalent in the SDK).
 
 Enforcement layers (in order, matching `authz_mixin._is_user_authorized`):
 
@@ -675,7 +675,7 @@ description: >
   Spawns a local Rust sidecar wrapping vector-sdk and relays
   DMs over HTTP/SSE. The plugin is a first-class Vector bot
   identity (its own nsec/npub), not an impersonation of a human.
-author: TBD
+author: Hermes Vector Platform contributors
 requires_env:
   - name: VECTOR_NPUB
     description: "Bot public key (npub1…); written by hermes gateway setup"
@@ -870,7 +870,7 @@ See Alternative D. MCP tools (`SendDmRequest.to_npub`, buffered `on_dm_received`
 
 ### 4. In-tree Hermes platform
 
-Would require the 16-step checklist in `ADDING_A_PLATFORM.md` (enum, `run.py` factory, cron maps, docs, …). Session was declined as a core platform for third-party-product policy. Plugin path is the supported shape and already covers authz, pairing, cron, toolsets, setup wizard.
+Would require the 16-step checklist in `ADDING_A_PLATFORM.md` (enum, `run.py` factory, cron maps, docs, …). Plugin path is the supported shape and already covers authz, pairing, cron, toolsets, setup wizard.
 
 ### 5. Open inbox (no allowlist)
 
@@ -893,10 +893,10 @@ Operators will ask. **Out of scope.** `vector-core` is one identity per process 
 | Threat | Severity | Mitigation |
 | --- | --- | --- |
 | nsec exfiltration via logs / SSE payloads / crash dumps | **Critical** | Never put nsec on argv, in sidecar env, or in SSE. Register `nsec1[a-z0-9]{20,}` via `ctx.register_redaction_patterns` (Hermes `agent.redact`; adapter-local redaction is not enough for gateway logs). Sidecar **does** get `GuardedKey`. Sidecar **must set** `prctl(PR_SET_DUMPABLE, 0)` itself on Linux release — that is GUI-only in Vector (`src-tauri/src/lib.rs`), not inherited from `vector-sdk`. Identity file `0600`. `.env` holds `VECTOR_NPUB` only at runtime. |
-| Unauthenticated sidecar on LAN | **Critical** | Bind `127.0.0.1`; `X-Hermes-Sidecar-Token` on every route except `/live`; runtime record `0600`. Session already burned bind-all `::`. `/health` returns npub and is authenticated. |
+| Unauthenticated sidecar on LAN | **Critical** | Bind `127.0.0.1`; `X-Hermes-Sidecar-Token` on every route except `/live`; runtime record `0600`. `/health` returns npub and is authenticated. |
 | Random npubs prompt-injecting the agent | **High** | Default-deny allowlist + pairing. Adapter-level drop of `is_group` in v1. |
 | Two gateways, one nsec (split brain / colliding sends) | **High** | `_acquire_platform_lock(scope="vector-npub", identity=npub)`. |
-| Sidecar token stolen from env of a same-user process | **Medium** | Acceptable on single-user hosts (same as Session mnemonic in env). Token is per-spawn, not long-lived. |
+| Sidecar token stolen from env of a same-user process | **Medium** | Acceptable on single-user hosts. Token is per-spawn, not long-lived. |
 | Operator imports personal nsec | **High** (UX) | Setup warning; profile forced `bot: true`. |
 | Community invite spam | **Low** | `InvitePolicy::Whitelist` of allowlisted inviters; `manual` parks all. Group turns require membership + mention + sender union (`VECTOR_ALLOWED_USERS` / `VECTOR_GROUP_ALLOWED_USERS` / `VECTOR_GROUP_ALLOW_ALL`). |
 | Gift-wrap metadata on public relays | **Inherent** | NIP-17/NIP-59 is Vector's model; we do not add extra metadata beyond what the SDK publishes. Do not put secrets in profile `about`. |
@@ -921,14 +921,14 @@ Operators will ask. **Out of scope.** `vector-core` is one identity per process 
 
 | Signal | Where |
 | --- | --- |
-| Adapter logs | logger `hermes_plugins.vector_platform.adapter` (match Session's `hermes_plugins.session_platform.adapter` so operators can grep "still on old code?") |
-| Sidecar logs | `~/.hermes/logs/vector-bridge.log` (stdout/stderr redirected; **not PIPE** — Session comment: avoids OS pipe-buffer deadlock) |
+| Adapter logs | logger `hermes_plugins.vector_platform.adapter` |
+| Sidecar logs | `~/.hermes/logs/vector-bridge.log` (stdout/stderr redirected; **not PIPE** — avoids OS pipe-buffer deadlock) |
 | Identity | log truncated npub on connect; never nsec |
 | Health | Authenticated `/health` + 30s Python ping; SSE `: ping` every 30s |
 | Ready | SSE `ready` + `BotEvent::Ready`; `VectorBot::subscription_ready()` can back `/health` if we need a community-aware flag later |
 | Crash | `_set_fatal_error` with `retryable=True`; gateway reconnect watcher logs attempts |
 | Metrics (v1.1) | counters: inbound_accepted, inbound_denied, send_ok, send_fail, sidecar_restarts. Not required for v1. |
-| Operator checks | README troubleshooting + `hermes gateway status`. **Do not claim `hermes doctor`:** Session's `session_doctor_checks` is dead code — nothing in `hermes_cli/doctor.py` / `PluginContext` calls it; there is no `register_doctor` hook. Optional later: `ctx.register_cli_command` for `hermes vector status`. |
+| Operator checks | README troubleshooting + `hermes gateway status`. **Do not claim `hermes doctor`:** nothing in `hermes_cli/doctor.py` / `PluginContext` calls a plugin doctor hook. Optional later: `ctx.register_cli_command` for `hermes vector status`. |
 
 Do not emit Vector relay URLs containing auth, nsecs, or full env dumps.
 
@@ -1015,7 +1015,7 @@ Still deferred:
 | SDK API drift (README `"0.3"` vs crates.io `0.9`) | Medium | Exact-pin `vector_sdk = "=0.9.0"` (git-known publish); `cargo test --locked` in CI. Reject crates.io versions whose vcs SHA is not on Vector `master`. |
 | Relay outage looks like "Hermes is down" | Low | SDK reconnects **relays** while the process is up; `/health` stays ready. DMs that arrived while the **sidecar process** was down are **not** dispatched in v1 (peer retries). Do not document process-down DMs as store-and-forward into Hermes. |
 | Two npubs from split identity paths | Critical (closed) | One `VECTOR_DATA_DIR`; SDK owns `identity.nsec` inside it (D2). |
-| Operator allowlists nobody and wonders why pairing codes appear | Low | Setup **requires** the operator npub as first allowed user (Session does this). |
+| Operator allowlists nobody and wonders why pairing codes appear | Low | Setup **requires** the operator npub as first allowed user. |
 | Gift-wrap backdating (NIP-59 0–2 day tweak in `sending.rs`) confuses timestamps | Low | Use Vector `Message.at` (ms) as-is; do not invent clocks. |
 
 ---
@@ -1043,14 +1043,6 @@ Still deferred:
 - `/home/anthony/.hermes/hermes-agent/hermes_cli/plugins.py` — `register_redaction_patterns`, `register_cli_command`, directory plugins need `__init__.py`
 - `/home/anthony/.hermes/hermes-agent/plugins/platforms/irc/` — minimal Python-only plugin
 - `/home/anthony/.hermes/hermes-agent/pyproject.toml` — bundled `**/plugin.yaml` discovery (does not apply to user plugins)
-
-### Session prior art (read)
-
-- `/home/anthony/projects/hermes-session-platform/__init__.py` — `register` re-export
-- `/home/anthony/projects/hermes-session-platform/plugin.yaml`
-- `/home/anthony/projects/hermes-session-platform/adapter.py` — spawn, SSE, setup, `register()`, allowlists
-- `/home/anthony/projects/hermes-session-platform/bridge/session-bridge.mjs` — `--setup`/`--check`, `/health` `/events` `/send`
-- `/home/anthony/projects/hermes-session-platform/README.md`, `CHANGELOG.md`, `tests/test_plugin_unit.py`
 
 ### Vector (read)
 
@@ -1082,9 +1074,9 @@ Incremental, independently reviewable PRs against `/home/anthony/projects/hermes
 ### PR 1 — Plugin skeleton and Hermes registration
 
 - **Title:** `feat: plugin skeleton (plugin.yaml, __init__.py, adapter stub, register())`
-- **Files:** `plugin.yaml` (including HOST / TIMEOUT / PAIRING optional_env), `pyproject.toml` (no nostr extra), `__init__.py` (Session re-export of `adapter.register`), `adapter.py` (class + `register(ctx)` with `allowed_users_env="VECTOR_ALLOWED_USERS"`, `allow_all_env`, `cron_deliver_env_var`, `register_redaction_patterns`, `normalize_npub` / `_parse_npub_target` / Buzz `hex_to_npub`+`npub_to_hex`, env helpers, `check_fn`/`validate_config`/`_env_enablement` — no `ensure_deps_fn` compiler), `README.md` (install + architecture diagram), `LICENSE`, `.gitignore`, `tests/test_plugin_unit.py`
+- **Files:** `plugin.yaml` (including HOST / TIMEOUT / PAIRING optional_env), `pyproject.toml` (no nostr extra), `__init__.py` (re-export of `adapter.register`), `adapter.py` (class + `register(ctx)` with `allowed_users_env="VECTOR_ALLOWED_USERS"`, `allow_all_env`, `cron_deliver_env_var`, `register_redaction_patterns`, `normalize_npub` / `_parse_npub_target` / Buzz `hex_to_npub`+`npub_to_hex`, env helpers, `check_fn`/`validate_config`/`_env_enablement` — no `ensure_deps_fn` compiler), `README.md` (install + architecture diagram), `LICENSE`, `.gitignore`, `tests/test_plugin_unit.py`
 - **Depends on:** none
-- **Description:** Make `hermes plugins enable vector-platform` discover a platform named `vector`. No network, no sidecar yet. Unit tests load `adapter.py` as a free module (Session `test_plugin_unit.py`); **do not** construct `Platform("vector")` — `_missing_()` only succeeds once the registry has the plugin. Authz env names are on `PlatformEntry` from day one so pairing write-back works as soon as setup writes allowlists. Tests cover `normalize_npub` (hex, `npub1`, `nostr:npub1`, whitespace, illegal charset) and `_parse_npub_target` (returns `(npub, None)` or `None`, never a bare string).
+- **Description:** Make `hermes plugins enable vector-platform` discover a platform named `vector`. No network, no sidecar yet. Unit tests load `adapter.py` as a free module; **do not** construct `Platform("vector")` — `_missing_()` only succeeds once the registry has the plugin. Authz env names are on `PlatformEntry` from day one so pairing write-back works as soon as setup writes allowlists. Tests cover `normalize_npub` (hex, `npub1`, `nostr:npub1`, whitespace, illegal charset) and `_parse_npub_target` (returns `(npub, None)` or `None`, never a bare string).
 
 ### PR 2 — Rust sidecar crate: identity CLI + CI
 
@@ -1112,7 +1104,7 @@ Incremental, independently reviewable PRs against `/home/anthony/projects/hermes
 - **Title:** `feat: VectorAdapter spawn/SSE/send wired to the sidecar`
 - **Files:** `adapter.py` (spawn with stdin pipe, port probe, lock, SSE, health, send, typing, `get_chat_info`, fatal-retryable exit, inbound LRU dedup), `tests/test_plugin_unit.py`
 - **Depends on:** PR 3b
-- **Description:** End-to-end with a mocked HTTP sidecar in unit tests. Live test documented in README (allowlisted peer npub). Session mapping: `chat_id = user_id = peer npub`. Header `X-Hermes-Sidecar-Token` everywhere (including `standalone_sender_fn` later).
+- **Description:** End-to-end with a mocked HTTP sidecar in unit tests. Live test documented in README (allowlisted peer npub). Hermes mapping: `chat_id = user_id = peer npub`. Header `X-Hermes-Sidecar-Token` everywhere (including `standalone_sender_fn` later).
 
 ### PR 5 — Setup wizard, allowlist, pairing, cron
 

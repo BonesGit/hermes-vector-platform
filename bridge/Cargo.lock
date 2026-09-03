@@ -2406,6 +2406,7 @@ name = "vector-bridge"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bip39",
  "futures-util",
  "libc",
  "nostr",

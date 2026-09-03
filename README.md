@@ -9,10 +9,20 @@ The plugin is a **first-class Vector bot identity** (its own nsec/npub), not an 
 
 > **User plugin, not in-tree Hermes.** Install into `~/.hermes/plugins/vector-platform` and enable it. Platform name is `vector` (toolset `hermes-vector`). Plugin name is `vector-platform`.
 
+## Prerequisites
+
+- Hermes Agent with the platform plugin registry (current `main`)
+- Rust **≥ 1.75** (`cargo`, `rustc`). The sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk) `=0.9.0` (the last publish whose git SHA is on [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector) `master`). No local Vector checkout.
+- **Your** Vector npub (hex / `npub1` / `nostr:npub1`) to allowlist during setup
+
+The bot identity is created or imported by `hermes gateway setup`. You do not need one before install.
+
 ## Install
 
+Clone this repository into the Hermes plugins directory:
+
 ```bash
-git clone <this-repo> ~/.hermes/plugins/vector-platform
+git clone https://github.com/BonesGit/hermes-vector-platform ~/.hermes/plugins/vector-platform
 hermes plugins enable vector-platform
 hermes gateway setup    # builds vector-bridge, create/import identity
 hermes gateway restart
@@ -24,7 +34,16 @@ Confirm discovery:
 hermes plugins list
 ```
 
-### Setup
+### pip (optional)
+
+```bash
+pip install -e /path/to/hermes-vector-platform
+hermes plugins enable vector-platform
+```
+
+Entry point group: `hermes_agent.plugins` → `vector-platform = adapter:register`.
+
+## Setup
 
 ```bash
 hermes gateway setup
@@ -36,27 +55,23 @@ Setup will:
 
 1. Resolve `vector-bridge` (`VECTOR_BRIDGE_BIN` or `bridge/target/release/vector-bridge`). If missing, `cd bridge && cargo build --release` (Rust ≥ 1.75). Build happens **only** in setup, never at `hermes gateway start`.
 2. Run `--check` (read-only) against `VECTOR_DATA_DIR` (default `plugin-data/vector-platform/sdk`).
-3. Create a new nsec, or import via a temp `0600` `--nsec-file` / `--mnemonic-file` (never put the secret in the sidecar env).
+3. Create a new identity, or import an existing one (nsec **or** 12-word mnemonic). Secrets go through a temp `0600` file, never the sidecar env. **Do not** save nsec or mnemonic to `.env`.
 4. Require **your** Vector npub (`hex` / `npub1` / `nostr:npub1`) as `VECTOR_HOME_CHANNEL` and the first `VECTOR_ALLOWED_USERS` entry.
-5. Save `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, `VECTOR_ALLOWED_USERS`, `VECTOR_DATA_DIR`, and optional public `VECTOR_BOT_NAME` / `VECTOR_BOT_ABOUT` / `VECTOR_BOT_AVATAR` / `VECTOR_BOT_BANNER`. **Do not** save nsec to `.env`.
+5. Save `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, `VECTOR_ALLOWED_USERS`, `VECTOR_DATA_DIR`, and optional public `VECTOR_BOT_NAME` / `VECTOR_BOT_ABOUT` / `VECTOR_BOT_AVATAR` / `VECTOR_BOT_BANNER`.
 6. Merge `display.platforms.vector` into `~/.hermes/config.yaml` (see below).
 
-Share the bot npub with contacts. Back up `sdk/identity.nsec` offline — replacing it **is** a new bot. Restart the gateway.
+Share the bot npub with contacts. Restart the gateway.
 
-### Option B — pip entry point
+### Identity files
 
-```bash
-pip install -e /path/to/hermes-vector-platform
-hermes plugins enable vector-platform
-```
+Both live under `VECTOR_DATA_DIR` (default `~/.hermes/plugin-data/vector-platform/sdk/`), mode `0600`. Replacing `identity.nsec` **is** a new bot.
 
-Entry point group: `hermes_agent.plugins` → `vector-platform = adapter:register`.
+| File | When it is written | Needed to run? |
+|------|--------------------|----------------|
+| `identity.nsec` | **Create** and **import** (from nsec or from mnemonic). | **Yes.** The sidecar loads this on every start and will not mint a replacement. Delete it and the bot will not start until you re-run setup and import from a backup. |
+| `identity.mnemonic` | **Create**, and **mnemonic import** (the phrase is copied here). Nsec-only import cannot invent a seed, so this file is omitted. | **No.** Runtime never reads it. After you have an offline copy you can delete it; the bot keeps working as long as `identity.nsec` stays. |
 
-## Prerequisites
-
-- Hermes Agent with the platform plugin registry (current `main`)
-- Rust **≥ 1.75** (`cargo`, `rustc`). The sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk) `=0.9.0` (the last publish whose git SHA is on [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector) `master`). No local Vector checkout.
-- A Vector bot identity created or imported by `hermes gateway setup` (writes `sdk/identity.nsec`, mode `0600`)
+On import you enter **either** the nsec or the mnemonic — not both. Mnemonic import writes both files; nsec import writes only `identity.nsec`.
 
 ## Architecture
 
@@ -88,14 +103,6 @@ flowchart LR
   Agent -->|send / typing| Adapter
 ```
 
-```
-Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
-                              ↕ HTTP/SSE 127.0.0.1:8096
-                         VectorAdapter (this plugin)
-                              ↕
-                         Hermes gateway / AIAgent
-```
-
 `VectorAdapter.connect()` generates a spawn-time `X-Hermes-Sidecar-Token`, starts `vector-bridge` with `stdin=PIPE` + `VECTOR_SIDECAR_WATCH_STDIN=1` (parent-death), polls authenticated `GET /health` until `status=ready`, then subscribes to `GET /events` (SSE). DMs map as `chat_id = user_id = peer npub`.
 
 ## Environment variables
@@ -104,7 +111,7 @@ Vector app  ↔  Relays  ↔  vector-bridge (Rust / vector-sdk)
 |----------|----------|---------|
 | `VECTOR_NPUB` | yes | Bot public key (`npub1…`); written by setup |
 | `VECTOR_NSEC` | import only | Setup copies this into `sdk/identity.nsec`; sidecar never reads it. Delete from `.env` after setup. |
-| `VECTOR_MNEMONIC` | import only | 12-word BIP-39 seed (NIP-06) |
+| `VECTOR_MNEMONIC` | import only | 12-word BIP-39 seed (NIP-06). Setup derive-imports into `sdk/identity.nsec` + `sdk/identity.mnemonic`, then you should delete this from `.env`. |
 | `VECTOR_ALLOWED_USERS` | recommended | Comma-separated npubs allowed to **DM** the bot. Also grants community turns. Pairing is DM-only. |
 | `VECTOR_ALLOW_ALL_USERS` | no | Dev-only open access (dangerous) |
 | `VECTOR_HOME_CHANNEL` | for cron | Operator npub for cron and join notices (channel ids) |
@@ -146,7 +153,7 @@ display:
       busy_ack_detail: false
 ```
 
-There is no `display.platform_tool_progress` key. Without the YAML override the plugin inherits Hermes' global `tool_progress: all` and would post a new Vector DM per tool event. Markdown **is** rendered — opposite of Session. Setup still writes this block when you decline “Reconfigure Vector?” so a pre-existing `VECTOR_NPUB` gets the D12 override.
+There is no `display.platform_tool_progress` key. Without the YAML override the plugin inherits Hermes' global `tool_progress: all` and would post a new Vector DM per tool event. Vector **does** render markdown. Setup still writes this block when you decline “Reconfigure Vector?” so a pre-existing `VECTOR_NPUB` gets the same override.
 
 ## Default-deny inbox
 
@@ -165,7 +172,7 @@ Concord communities are E2E encrypted group spaces with channels. A **fresh comm
 1. In the Vector app, create a community and **direct-invite** the bot npub (`VECTOR_NPUB`).
 2. The sidecar auto-accepts only if the inviter is in `VECTOR_TRUSTED_INVITERS` or `VECTOR_ALLOWED_USERS`. Anyone else stays parked (`VECTOR_INVITE_POLICY=manual` parks everyone).
 3. Hermes only runs a turn on **@mention** (`@npub1…`, `nostr:npub1…`, `@VECTOR_BOT_NAME`), **reply to a bot message**, or a **registered slash command** (`/approve`, `/deny`, …). `@everyone` is ignored.
-4. Who may trigger that turn: `VECTOR_ALLOWED_USERS` (DM list, also groups), `VECTOR_GROUP_ALLOWED_USERS` (group-only, no DMs), or any member if the channel is in `VECTOR_GROUP_ALLOW_ALL`. Session key is `agent:main:vector:group:<channel-hex>`.
+4. Who may trigger that turn: `VECTOR_ALLOWED_USERS` (DM list, also groups), `VECTOR_GROUP_ALLOWED_USERS` (group-only, no DMs), or any member if the channel is in `VECTOR_GROUP_ALLOW_ALL`. Hermes session key is `agent:main:vector:group:<channel-hex>`.
 
 The Vector app does not display channel ids. When the bot joins (trusted invite, `VECTOR_CREATE_COMMUNITY`, or connect-time membership sync) it logs the full 64-hex `channel_id` and DMs `VECTOR_HOME_CHANNEL` a copy-pasteable notice. Restart does not re-DM the same id (`sdk/notified-channels.json`). Parked (untrusted) invites stay silent — no DM, no channel id.
 
@@ -248,11 +255,11 @@ If inbound is silent: check `~/.hermes/logs/vector-bridge.log`, that `/health` i
 ## Security notes
 
 - Sidecar binds **127.0.0.1** by default; every route except `/live` requires `X-Hermes-Sidecar-Token`
-- nsec lives at `<VECTOR_DATA_DIR>/identity.nsec` (`0600`), never in `.env` at runtime
+- nsec lives at `<VECTOR_DATA_DIR>/identity.nsec` (`0600`), never in `.env` at runtime. That file **is** required to start. `identity.mnemonic` is an optional backup (create / mnemonic import only) and is not read at runtime.
 - `nsec1…` is registered as a Hermes redaction pattern; adapter logs truncate npub (`npub1abcd…`)
 - Runtime record `~/.hermes/runtime/vector-sidecar.json` is `0600` and deleted on disconnect
 - Keep `VECTOR_ALLOWED_USERS` tight on personal bots
-- Back up `sdk/identity.nsec` offline; replacing it **is** a new bot
+- Back up `identity.nsec` (required) and `identity.mnemonic` (if present) offline; replacing the nsec **is** a new bot
 
 ## Troubleshooting
 
@@ -263,11 +270,11 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 | Plugin not listed | `hermes plugins enable vector-platform` then `hermes plugins list` |
 | Invalid npub / allowlist ignored | hex, `npub1…`, or `nostr:npub1`. Bech32 charset is `qpzry9x8gf2tvdw0s3jn54khce6mua7l` — no `1`, `b`, `i`, `o` in the payload. `normalize_npub()` is the source of truth (not a loose regex). |
 | `vector-bridge` binary not found | `VECTOR_BRIDGE_BIN` or `bridge/target/release/vector-bridge`. Run `hermes gateway setup` (`cd bridge && cargo build --release`). `hermes gateway start` does **not** compile Rust. |
-| Identity missing / “will not mint” | `VECTOR_DATA_DIR` (default `~/.hermes/plugin-data/vector-platform/sdk`). `identity.nsec` must already exist from setup. Start never mints. |
+| Identity missing / “will not mint” | `identity.nsec` is missing from `VECTOR_DATA_DIR` (default `~/.hermes/plugin-data/vector-platform/sdk`). Restore it or re-run setup and import. Start never mints. Deleting `identity.mnemonic` does **not** cause this. |
 | Port 8096 in use | `ss -ltnp \| rg 8096` or set `VECTOR_BRIDGE_PORT`. A leftover `vector-bridge` is reaped on connect; a foreign process is a retryable fatal. |
-| Lost the bot / contacts don't recognize it | Back up `sdk/identity.nsec` offline. Replacing that file **is** a new bot (new npub, lost DMs). |
+| Lost the bot / contacts don't recognize it | Restoring needs `identity.nsec` **or** `identity.mnemonic`. Replacing the nsec **is** a new bot (new npub, lost DMs). Identities minted before mnemonic-on-create, or imported from nsec only, have no seed file. |
 | Sidecar is a stub / no live DMs | `VECTOR_STUB` must **not** be set in the gateway. Production `connect()` strips it. Only HTTP unit tests set it (binds without `VectorBot::build`). |
-| Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `VECTOR_MISSED_REACT=off` disables. Agent react/unreact and optional 👀/✅/❌ acks: [REACTION.md](REACTION.md). |
+| Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `VECTOR_MISSED_REACT=off` disables. Agent react/unreact and optional 👀/✅/❌ acks: see `VECTOR_REACTIONS` above. |
 | Group messages ignored | The bot must have **joined** (trusted inviter). Then the sender needs `VECTOR_ALLOWED_USERS`, `VECTOR_GROUP_ALLOWED_USERS`, or the channel in `VECTOR_GROUP_ALLOW_ALL`. Mentions (`@bot npub` / `@VECTOR_BOT_NAME`), a reply to the bot, or a registered slash command (`/approve`, `/deny`, …) are required; `@everyone` is ignored. Pairing is not sent in groups. |
 | Slash `/approve` missing from the Vector picker | Sidecar must be rebuilt after this feature (`hermes gateway setup` / `cargo build --release` in `bridge/`). `VECTOR_SLASH_COMMANDS` must not be `off`. Kind-10304 publishes in the background after `BotEvent::Ready` (does not block gateway start). Type `/` in a chat with the bot. Typed `/approve` in a DM works even without the picker. |
 | Bot not joining a community | Inviter npub must be in `VECTOR_TRUSTED_INVITERS` or `VECTOR_ALLOWED_USERS`. `VECTOR_INVITE_POLICY=manual` parks all invites. Check `/health` `pending_invites`. |

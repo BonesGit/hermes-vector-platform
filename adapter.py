@@ -3,10 +3,10 @@
 Registers the ``vector`` platform, npub helpers, and a ``BasePlatformAdapter``
 that owns a Rust ``vector-bridge`` sidecar over loopback HTTP/SSE.
 
-Vector users are identified by a bech32 ``npub1…`` public key. Session mapping
-is ``chat_id = user_id = peer npub``, ``chat_type = "dm"`` for DMs, and
-``chat_id = channel hex``, ``chat_type = "group"``, ``user_id = sender npub``
-for Concord channels.
+Vector users are identified by a bech32 ``npub1…`` public key. Hermes maps
+DMs as ``chat_id = user_id = peer npub``, ``chat_type = "dm"``, and Concord
+channels as ``chat_id = channel hex``, ``chat_type = "group"``,
+``user_id = sender npub``.
 
 Required env vars / config.extra keys:
     VECTOR_NPUB                  Bot public key (npub1…)
@@ -2606,23 +2606,41 @@ def _shred_unlink(path: Path) -> None:
             pass
 
 
-def _backup_identity_nsec(data_dir: Path) -> Optional[Path]:
-    """Rename ``identity.nsec`` → ``identity.nsec.bak``. None if missing."""
-    src = Path(data_dir) / "identity.nsec"
+def _backup_identity_file(data_dir: Path, name: str) -> Optional[Path]:
+    """Rename ``name`` → ``name.bak``. None if missing."""
+    src = Path(data_dir) / name
     if not src.is_file():
         return None
-    bak = Path(data_dir) / "identity.nsec.bak"
+    bak = Path(data_dir) / f"{name}.bak"
     if bak.exists():
         bak.unlink()
     src.replace(bak)
     return bak
 
 
-def _restore_identity_nsec(data_dir: Path, bak: Optional[Path]) -> None:
-    """Put the backup back if ``--setup`` failed after the rename."""
+def _backup_identity_nsec(data_dir: Path) -> Optional[Path]:
+    """Rename ``identity.nsec`` → ``identity.nsec.bak``. None if missing."""
+    return _backup_identity_file(data_dir, "identity.nsec")
+
+
+def _backup_identity(data_dir: Path) -> List[Path]:
+    """Move nsec and mnemonic aside so a failed replace can put them back."""
+    baks: List[Path] = []
+    for name in ("identity.nsec", "identity.mnemonic"):
+        bak = _backup_identity_file(data_dir, name)
+        if bak is not None:
+            baks.append(bak)
+    return baks
+
+
+def _restore_identity_backup(bak: Optional[Path]) -> None:
+    """Rename ``foo.bak`` → ``foo`` next to it."""
     if bak is None or not bak.is_file():
         return
-    src = Path(data_dir) / "identity.nsec"
+    name = bak.name
+    if not name.endswith(".bak"):
+        return
+    src = bak.with_name(name[: -len(".bak")])
     try:
         if src.exists():
             src.unlink()
@@ -2631,7 +2649,12 @@ def _restore_identity_nsec(data_dir: Path, bak: Optional[Path]) -> None:
     try:
         bak.replace(src)
     except OSError as e:
-        logger.warning("Vector: failed to restore identity.nsec from backup: %s", e)
+        logger.warning("Vector: failed to restore %s from backup: %s", src.name, e)
+
+
+def _restore_identity_nsec(data_dir: Path, bak: Optional[Path]) -> None:
+    """Put the backup back if ``--setup`` failed after the rename."""
+    _restore_identity_backup(bak)
 
 
 def _discard_identity_backup(bak: Optional[Path]) -> None:
@@ -2641,6 +2664,11 @@ def _discard_identity_backup(bak: Optional[Path]) -> None:
         bak.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _discard_identity_backups(baks: List[Path]) -> None:
+    for bak in baks:
+        _discard_identity_backup(bak)
 
 
 def _identity_nsec_locally_unreadable(data_dir: Path) -> bool:
@@ -2658,20 +2686,21 @@ def _identity_nsec_locally_unreadable(data_dir: Path) -> bool:
 
 
 def _adopt_stale_identity_backup(data_dir: Path, io) -> None:
-    """If a previous setup left only ``identity.nsec.bak``, put it back."""
-    src = Path(data_dir) / "identity.nsec"
-    bak = Path(data_dir) / "identity.nsec.bak"
-    try:
-        src_ok = src.is_file() and src.stat().st_size > 0
-    except OSError:
-        src_ok = False
-    if src_ok or not bak.is_file():
-        return
-    io.print_warning(
-        "Found identity.nsec.bak but no identity.nsec "
-        "(previous setup may have been interrupted). Restoring the backup."
-    )
-    _restore_identity_nsec(data_dir, bak)
+    """If a previous setup left only ``*.bak`` identity files, put them back."""
+    for name in ("identity.nsec", "identity.mnemonic"):
+        src = Path(data_dir) / name
+        bak = Path(data_dir) / f"{name}.bak"
+        try:
+            src_ok = src.is_file() and src.stat().st_size > 0
+        except OSError:
+            src_ok = False
+        if src_ok or not bak.is_file():
+            continue
+        io.print_warning(
+            f"Found {name}.bak but no {name} "
+            "(previous setup may have been interrupted). Restoring the backup."
+        )
+        _restore_identity_backup(bak)
 
 
 def _normalize_identity_choice(raw: str) -> Optional[str]:
@@ -3367,7 +3396,7 @@ def _run_interactive_setup(io) -> None:
 
     extra_args: List[str] = []
     temp_secret: Optional[Path] = None
-    bak: Optional[Path] = None
+    baks: List[Path] = []
     setup_ok = False
     setup_data: Optional[Dict[str, Any]] = None
     setup_code = 1
@@ -3375,7 +3404,7 @@ def _run_interactive_setup(io) -> None:
     try:
         if wipe_identity:
             try:
-                bak = _backup_identity_nsec(data_dir)
+                baks = _backup_identity(data_dir)
             except OSError as e:
                 io.print_error(f"Could not replace identity.nsec: {e}")
                 return
@@ -3403,11 +3432,12 @@ def _run_interactive_setup(io) -> None:
     finally:
         if temp_secret is not None:
             _shred_unlink(temp_secret)
-        # Ctrl+C / errors after the rename must put identity.nsec back.
+        # Ctrl+C / errors after the rename must put identity files back.
         if setup_ok:
-            _discard_identity_backup(bak)
+            _discard_identity_backups(baks)
         else:
-            _restore_identity_nsec(data_dir, bak)
+            for bak in baks:
+                _restore_identity_backup(bak)
 
     bot_npub = ((setup_data or {}).get("npub") or "").strip()
     status = (setup_data or {}).get("status") or ""
@@ -3474,8 +3504,14 @@ def _run_interactive_setup(io) -> None:
             "VECTOR_CREATE_COMMUNITY=on — the gateway will create or reuse a "
             "private home community after Ready (no public invite link)."
         )
+    backup_bits = [str(data_dir / "identity.nsec")]
+    mnemonic_path = data_dir / "identity.mnemonic"
+    if mnemonic_path.is_file():
+        backup_bits.append(str(mnemonic_path))
     io.print_info(
-        f"Back up {data_dir / 'identity.nsec'} offline — replacing it is a new bot."
+        "Back up "
+        + " and ".join(backup_bits)
+        + " offline — replacing them is a new bot."
     )
     io.print_success("Vector configured!")
     io.print_info("Restart the gateway: hermes gateway restart")

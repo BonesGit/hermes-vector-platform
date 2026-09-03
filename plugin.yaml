@@ -7,7 +7,7 @@ description: >
   Spawns a local Rust sidecar wrapping vector-sdk and relays
   DMs over HTTP/SSE. The plugin is a first-class Vector bot
   identity (its own nsec/npub), not an impersonation of a human.
-author: TBD
+author: Hermes Vector Platform contributors
 requires_env:
   - name: VECTOR_NPUB
     description: "Bot public key (npub1…); written by hermes gateway setup"
@@ -20,8 +20,8 @@ optional_env:
     prompt: "Vector nsec (import)"
     password: true
   - name: VECTOR_MNEMONIC
-    description: "12-word BIP-39 seed (NIP-06 import)"
-    prompt: "Mnemonic"
+    description: "Import-only 12-word BIP-39 seed (NIP-06). Setup copies it to sdk/identity.nsec + sdk/identity.mnemonic; then delete this. Create writes identity.mnemonic itself."
+    prompt: "12-word mnemonic (NIP-06 import)"
     password: true
   - name: VECTOR_ALLOWED_USERS
     description: "Comma-separated npubs allowed to DM the bot. Also grants community turns (union). Pairing is DM-only."

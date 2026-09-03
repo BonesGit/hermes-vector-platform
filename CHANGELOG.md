@@ -7,20 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Sidecar `/health` is `ready` as soon as `VectorBot::build` succeeds, not
-  after `BotEvent::Ready`. Slash commands register on Ready and the
-  kind-10304 picker manifest publishes in the background. Previously
-  `prepare_listen` published the manifest *before* Ready (20–40s to six
-  relays), which overran the 25s connect timeout and killed a live sidecar.
-- Default `VECTOR_STARTUP_TIMEOUT` is 60s. `register()` floors
-  `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` to 90s when that env is unset
-  (Hermes reads the wrap *before* `connect()`, so flooring inside
-  `connect()` missed the first attempt).
-
 ### Added
 
+- Identity **create** mints a NIP-06 12-word BIP-39 mnemonic and writes it
+  next to the nsec as `sdk/identity.mnemonic` (`0600`). Mnemonic import
+  copies the phrase there too. Nsec-only import cannot invent a seed.
+  Neither secret is written to `.env`. Identities minted before this, or
+  imported from nsec only, have no seed file.
 - Concord **communities** (join-first + optional bot-owned home room). Sidecar
   forwards `is_group` SSE, sends/typing via `bot.channel(id)`, and auto-accepts
   community invites only from `VECTOR_TRUSTED_INVITERS` /
@@ -50,9 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional public bot profile (Vector `update_profile` / kind-0 `name`,
   `about`, `picture`, `banner`): `VECTOR_BOT_NAME`, `VECTOR_BOT_ABOUT`,
   `VECTOR_BOT_AVATAR`, `VECTOR_BOT_BANNER`. Setup copies images to
-  `sdk/avatar.<ext>` / `sdk/banner.<ext>`. On Ready the sidecar publishes
-  **only if at least one is set**. Blank/unset = no profile publish (no
-  default name of `Hermes` on the wire). `POST /profile` accepts
+  `sdk/avatar.<ext>` / `sdk/banner.<ext>`. Name/about/images stay optional
+  (no default name of `Hermes`). When slash commands are on (default), a
+  kind-0 with `bot: true` is published so Vector can badge the bot; that
+  card is also copied to public discovery indexers. `VECTOR_SLASH_COMMANDS=off`
+  and no name/about/image = no profile. `POST /profile` accepts
   `name` / `about` / `avatar_path` / `banner_path`.
 - Missed DMs while the sidecar was down are **not** sent to the agent. After
   Ready, allowlisted chats get an ❌ reaction on those messages (`POST /react`,
@@ -68,11 +63,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Vector's `/` picker stayed empty even with slash commands on: kind-10304
+  reached public discovery relays, but kind-0 `bot: true` only first-ACK'd
+  on auth-required Vector write relays. The sidecar now copies kind-0 to
+  the same discovery indexers when slash is on (name still optional).
+- Sidecar `/health` is `ready` as soon as `VectorBot::build` succeeds, not
+  after `BotEvent::Ready`. Slash commands register on Ready and the
+  kind-10304 picker manifest publishes in the background. Previously
+  `prepare_listen` published the manifest *before* Ready (20–40s to six
+  relays), which overran the 25s connect timeout and killed a live sidecar.
+- Default `VECTOR_STARTUP_TIMEOUT` is 60s. `register()` floors
+  `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` to 90s when that env is unset
+  (Hermes reads the wrap *before* `connect()`, so flooring inside
+  `connect()` missed the first attempt).
 - Sequential file-only Vector DMs accumulate in `_pending_inbox` until the
   next text from that peer; previously each file replaced the last.
 
 ### Changed
 
+- README: prerequisites before install; setup documents `identity.mnemonic`;
+  removed Session-plugin comparisons and the broken `REACTION.md` link.
 - Removed ``VECTOR_GROUP_ALLOWED_CHATS``. A trusted invite auto-join is
   enough for the bot to listen; mention/people gates still apply.
 

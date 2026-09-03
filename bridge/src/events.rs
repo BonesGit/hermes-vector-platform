@@ -246,14 +246,16 @@ pub(crate) async fn handle_bot_event(
             crate::commands::register_hermes_commands(bot, state);
             crate::commands::spawn_manifest_publish();
             state.mark_ready(bot.npub()).await;
-            // Opt-in public kind-0: only publish when the operator set a
-            // name, about, avatar, and/or banner. Empty strings do *not*
-            // wipe a prior kind-0 (SDK merge); skipping is the private path.
-            if !bot_name.trim().is_empty()
-                || !bot_about.trim().is_empty()
-                || avatar_path.is_some()
-                || banner_path.is_some()
-            {
+            // Public kind-0: slash picker needs bot: true on discovery
+            // relays. Name/about/images stay optional (no default "Hermes").
+            // Empty strings do *not* wipe a prior kind-0 (SDK merge).
+            if crate::profile::should_publish_own_profile(
+                crate::commands::slash_commands_enabled(),
+                bot_name,
+                bot_about,
+                avatar_path,
+                banner_path,
+            ) {
                 crate::profile::apply_own_profile(
                     bot,
                     bot_name,

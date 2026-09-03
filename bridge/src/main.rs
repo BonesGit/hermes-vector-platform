@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use bip39::Mnemonic;
 use nostr::nips::nip06::FromMnemonic;
 use serde_json::json;
 use tokio::sync::watch;
@@ -26,6 +27,7 @@ use vector_sdk::{InvitePolicy, VectorBot};
 use crate::api::{router, stub_npub, AppState};
 
 const IDENTITY_FILE: &str = "identity.nsec";
+const MNEMONIC_FILE: &str = "identity.mnemonic";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8096;
 const DEFAULT_SSE_PING: Duration = Duration::from_secs(30);
@@ -167,6 +169,10 @@ fn identity_path(data_dir: &Path) -> PathBuf {
     data_dir.join(IDENTITY_FILE)
 }
 
+fn mnemonic_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(MNEMONIC_FILE)
+}
+
 /// Missing or empty file → `None`. Does not create the path.
 fn read_nsec(path: &Path) -> Result<Option<String>, CliError> {
     match fs::read_to_string(path) {
@@ -198,6 +204,11 @@ fn write_identity(path: &Path, nsec: &str) -> Result<(), CliError> {
         }
     }
     write_restricted(path, nsec.as_bytes())
+}
+
+fn write_mnemonic(path: &Path, phrase: &str) -> Result<(), CliError> {
+    let body = format!("{}\n", phrase.trim());
+    write_restricted(path, body.as_bytes())
 }
 
 #[cfg(unix)]
@@ -251,27 +262,44 @@ fn cmd_setup(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let (nsec, status) = if let Some(src) = nsec_file {
-        (load_nsec_file(&src)?, "restored")
+    let (nsec, status, mnemonic) = if let Some(src) = nsec_file {
+        (load_nsec_file(&src)?, "restored", None)
     } else if let Some(src) = mnemonic_file {
-        (nsec_from_mnemonic_file(&src)?, "restored")
+        let (nsec, phrase) = nsec_from_mnemonic_file(&src)?;
+        (nsec, "restored", Some(phrase))
     } else {
-        let nsec = VectorBot::generate_nsec().map_err(|e| CliError::Other(e.to_string()))?;
-        (nsec, "created")
+        let (phrase, nsec) = generate_mnemonic_nsec()?;
+        (nsec, "created", Some(phrase))
     };
 
     let npub = npub_from_nsec(&nsec)?;
     write_identity(&path, &nsec)?;
+    if let Some(phrase) = mnemonic {
+        write_mnemonic(&mnemonic_path(data_dir), &phrase)?;
+    }
     if status == "created" {
         eprintln!(
-            "[vector-bridge] Created a new bot identity {} (stored at {}). \
-             Back it up — that file is the bot.",
+            "[vector-bridge] Created a new bot identity {} (nsec {}, mnemonic {}). \
+             Back those files up — they are the bot.",
             npub,
-            path.display()
+            path.display(),
+            mnemonic_path(data_dir).display()
         );
     }
     print_json(json!({ "status": status, "npub": npub }));
     Ok(ExitCode::SUCCESS)
+}
+
+/// Mint a NIP-06 identity: random 12-word BIP-39 English mnemonic → nsec.
+fn generate_mnemonic_nsec() -> Result<(String, String), CliError> {
+    let mnemonic = Mnemonic::generate(12).map_err(|e| CliError::Other(e.to_string()))?;
+    let phrase = mnemonic.to_string();
+    let keys = Keys::from_mnemonic(&phrase, None).map_err(|_| CliError::InvalidMnemonic)?;
+    let nsec = keys
+        .secret_key()
+        .to_bech32()
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    Ok((phrase, nsec))
 }
 
 fn load_nsec_file(src: &Path) -> Result<String, CliError> {
@@ -285,16 +313,18 @@ fn load_nsec_file(src: &Path) -> Result<String, CliError> {
     Ok(nsec)
 }
 
-fn nsec_from_mnemonic_file(src: &Path) -> Result<String, CliError> {
+fn nsec_from_mnemonic_file(src: &Path) -> Result<(String, String), CliError> {
     let contents = fs::read_to_string(src).map_err(|err| CliError::io(src, err))?;
     let mnemonic = contents.trim();
     if mnemonic.is_empty() {
         return Err(CliError::InvalidMnemonic);
     }
     let keys = Keys::from_mnemonic(mnemonic, None).map_err(|_| CliError::InvalidMnemonic)?;
-    keys.secret_key()
+    let nsec = keys
+        .secret_key()
         .to_bech32()
-        .map_err(|e| CliError::Other(e.to_string()))
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    Ok((nsec, mnemonic.to_string()))
 }
 
 fn print_json(value: serde_json::Value) {

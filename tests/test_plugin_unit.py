@@ -2404,6 +2404,25 @@ class TestWizardHelpers:
         assert nsec.read_text() == "nsec1original\n"
         assert not bak.exists()
 
+    def test_backup_identity_includes_mnemonic(self, tmp_path):
+        nsec = tmp_path / "identity.nsec"
+        mnemonic = tmp_path / "identity.mnemonic"
+        nsec.write_text("nsec1original\n")
+        mnemonic.write_text("abandon " * 11 + "about\n")
+        baks = vector_adapter._backup_identity(tmp_path)
+        assert not nsec.exists()
+        assert not mnemonic.exists()
+        assert {p.name for p in baks} == {
+            "identity.nsec.bak",
+            "identity.mnemonic.bak",
+        }
+        for bak in baks:
+            vector_adapter._restore_identity_backup(bak)
+        assert nsec.read_text() == "nsec1original\n"
+        assert mnemonic.read_text() == "abandon " * 11 + "about\n"
+        assert not (tmp_path / "identity.nsec.bak").exists()
+        assert not (tmp_path / "identity.mnemonic.bak").exists()
+
     def test_ensure_bridge_binary_skips_cargo_when_present(self, monkeypatch, tmp_path):
         fake = tmp_path / "vector-bridge"
         fake.write_text("")
@@ -2495,6 +2514,12 @@ class TestInteractiveSetup:
             if "--setup" in args:
                 assert "--nsec-file" not in args
                 assert "--mnemonic-file" not in args
+                sdk = tmp_path / "sdk"
+                sdk.mkdir(parents=True, exist_ok=True)
+                (sdk / "identity.mnemonic").write_text(
+                    "abandon abandon abandon abandon abandon abandon "
+                    "abandon abandon abandon abandon abandon about\n"
+                )
                 return {"status": "created", "npub": NPUB}, 0, ""
             return None, 1, "unexpected"
 
@@ -2516,12 +2541,14 @@ class TestInteractiveSetup:
         assert io.saved["VECTOR_BOT_NAME"] == "Hermes"
         assert io.saved["VECTOR_BOT_ABOUT"] == ""
         assert "VECTOR_NSEC" not in io.saved
+        assert "VECTOR_MNEMONIC" not in io.saved
         assert cli_calls[0] == ["--check"]
         assert cli_calls[1] == ["--setup"]
         cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "off"
         assert cfg["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
         assert any("Share this npub" in m for m in io.logs["info"])
+        assert any("identity.mnemonic" in m for m in io.logs["info"])
 
     def test_setup_copies_avatar_into_data_dir(self, monkeypatch, tmp_path):
         fake_bin = tmp_path / "vector-bridge"

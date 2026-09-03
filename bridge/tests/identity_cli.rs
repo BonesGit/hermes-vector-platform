@@ -1,4 +1,5 @@
-//! Offline identity CLI: --check never mints; --setup writes identity.nsec.
+//! Offline identity CLI: --check never mints; --setup writes identity.nsec
+//! (and identity.mnemonic when a seed exists).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,16 @@ fn identity_path(dir: &Path) -> std::path::PathBuf {
     dir.join("identity.nsec")
 }
 
+fn mnemonic_file(dir: &Path) -> std::path::PathBuf {
+    dir.join("identity.mnemonic")
+}
+
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
 #[test]
 fn check_empty_dir_is_not_registered() {
     let dir = TempDir::new().unwrap();
@@ -95,17 +106,23 @@ fn setup_then_check_same_npub() {
     assert_eq!(created_json["status"], "created");
     let npub = created_json["npub"].as_str().expect("npub");
     assert!(npub.starts_with("npub1"), "npub={npub}");
+    assert!(
+        created_json.get("mnemonic").is_none(),
+        "mnemonic belongs in identity.mnemonic, not stdout JSON"
+    );
 
     assert!(identity_path(dir.path()).exists());
+    let mnemonic = fs::read_to_string(mnemonic_file(dir.path())).unwrap();
+    let mnemonic = mnemonic.trim().to_string();
+    assert_eq!(
+        mnemonic.split_whitespace().count(),
+        12,
+        "mnemonic={mnemonic}"
+    );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(identity_path(dir.path()))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
+        assert_eq!(mode_of(&identity_path(dir.path())), 0o600);
+        assert_eq!(mode_of(&mnemonic_file(dir.path())), 0o600);
     }
 
     let checked = run(dir.path(), &["--check"]);
@@ -121,6 +138,27 @@ fn setup_then_check_same_npub() {
     let again_json = stdout_json(&again);
     assert_eq!(again_json["status"], "existing");
     assert_eq!(again_json["npub"], npub);
+    assert!(again_json.get("mnemonic").is_none());
+
+    // The on-disk mnemonic must derive the same npub (NIP-06).
+    let restore_dir = TempDir::new().unwrap();
+    let seed = restore_dir.path().join("seed.txt");
+    fs::write(&seed, mnemonic).unwrap();
+    let restore_data = restore_dir.path().join("sdk");
+    fs::create_dir(&restore_data).unwrap();
+    let restored = run(
+        &restore_data,
+        &["--setup", "--mnemonic-file", seed.to_str().unwrap()],
+    );
+    assert!(
+        restored.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let restored_json = stdout_json(&restored);
+    assert_eq!(restored_json["status"], "restored");
+    assert_eq!(restored_json["npub"], npub);
+    assert!(restored_json.get("mnemonic").is_none());
 }
 
 #[test]
@@ -145,6 +183,11 @@ fn setup_restores_from_nsec_file() {
     let body = stdout_json(&restored);
     assert_eq!(body["status"], "restored");
     assert_eq!(body["npub"], npub);
+    assert!(body.get("mnemonic").is_none());
+    assert!(
+        !mnemonic_file(dest.path()).exists(),
+        "nsec import cannot invent a mnemonic"
+    );
 }
 
 #[test]
@@ -180,6 +223,16 @@ fn setup_restores_from_mnemonic_file() {
         body["npub"],
         "npub1az708q3kd9zy6z6f44zav5ygvdwelkzspf6mtusttx47lft2z38sghk0w7"
     );
+    assert!(body.get("mnemonic").is_none());
+    let stored = fs::read_to_string(mnemonic_file(&data)).unwrap();
+    assert_eq!(
+        stored.trim(),
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(mode_of(&mnemonic_file(&data)), 0o600);
+    }
 }
 
 #[test]
@@ -196,6 +249,7 @@ fn setup_invalid_nsec_file_does_not_create_identity() {
     let err: Value = serde_json::from_str(stderr.trim()).expect("stderr json");
     assert_eq!(err["code"], "invalid_nsec");
     assert!(!identity_path(&data).exists());
+    assert!(!mnemonic_file(&data).exists());
     assert_no_nsec_on_stdout(&out);
 }
 
@@ -216,6 +270,7 @@ fn setup_invalid_mnemonic_file_does_not_create_identity() {
     let err: Value = serde_json::from_str(stderr.trim()).expect("stderr json");
     assert_eq!(err["code"], "invalid_mnemonic");
     assert!(!identity_path(&data).exists());
+    assert!(!mnemonic_file(&data).exists());
     assert_no_nsec_on_stdout(&out);
 }
 

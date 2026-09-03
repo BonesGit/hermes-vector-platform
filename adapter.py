@@ -577,28 +577,15 @@ def _group_allow_all_chats() -> set:
 
 
 # Keep in sync with bridge/src/commands.rs HERMES_SLASH_COMMANDS.
-# Vector picker names plus the Hermes first tokens (`/approve session` → approve).
-_VECTOR_SLASH_COMMANDS = frozenset(
-    {
-        "approve",
-        "approve-session",
-        "approve-always",
-        "approve-all",
-        "approve-all-session",
-        "approve-all-always",
-        "deny",
-        "deny-all",
-    }
-)
+_VECTOR_SLASH_COMMANDS = frozenset({"approve", "deny"})
 
 
 def _group_slash_command(text: str, *, is_command: bool = False) -> bool:
     """True when a group message is a registered Hermes slash command.
 
     Native Vector picker invocations are forwarded with ``is_command``. Typed
-    ``/approve`` / ``/deny`` (and the rest of the published set) also bypass
-    the mention gate so an approval prompt is answerable in-channel. The
-    people-gate still applies.
+    ``/approve`` / ``/deny`` also bypass the mention gate so an approval prompt
+    is answerable in-channel. The people-gate still applies.
     """
     if is_command:
         return True
@@ -3535,7 +3522,7 @@ def register(ctx) -> None:
             "Markdown is rendered. Keep replies concise. "
             "DMs are 1:1. Community channels are mention-gated: only reply when "
             "someone @mentions you (npub or display name), replies to your "
-            "message, or sends a Vector slash command (/approve, /approve-session, /deny, …). "
+            "message, or sends a Vector slash command (/approve, /deny). "
             "@everyone is not a mention. Group chat_id is a 64-char "
             "hex channel id."
         ),

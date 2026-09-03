@@ -1,9 +1,11 @@
-//! Hermes approve/deny on Vector's kind-10304 picker.
+//! Hermes `/approve` and `/deny` on Vector's kind-10304 picker.
 //!
-//! Vector's SDK consumes a matched `/command` before `BotEvent::Message`.
-//! Each picker entry is argument-free; we rewrite it to the Hermes text
-//! (`/approve-session` → `/approve session`) and SSE-forward that.
+//! Vector's SDK consumes a matched `/command` before `BotEvent::Message`, so
+//! we register these two commands and SSE-forward the original invocation
+//! text. A trailing optional string swallows the rest of the line
+//! (`/approve all session` stays one arg).
 
+use vector_sdk::vector_core::bot_interface::{self, ArgSpec, ArgType, BotManifest, CommandSpec};
 use vector_sdk::{IncomingMessage, VectorBot};
 
 use crate::api::AppState;
@@ -14,50 +16,23 @@ use crate::events::map_incoming;
 struct SlashSpec {
     name: &'static str,
     description: &'static str,
-    /// Text Hermes' slash handlers expect.
-    hermes: &'static str,
+    /// Trailing optional string: `(arg_name, arg_description)`.
+    tail: Option<(&'static str, &'static str)>,
 }
 
 const HERMES_SLASH_COMMANDS: &[SlashSpec] = &[
     SlashSpec {
         name: "approve",
-        description: "Approve the oldest pending command once",
-        hermes: "/approve",
-    },
-    SlashSpec {
-        name: "approve-session",
-        description: "Approve oldest and remember for this session",
-        hermes: "/approve session",
-    },
-    SlashSpec {
-        name: "approve-always",
-        description: "Approve oldest and add to the permanent allowlist",
-        hermes: "/approve always",
-    },
-    SlashSpec {
-        name: "approve-all",
-        description: "Approve every pending command once",
-        hermes: "/approve all",
-    },
-    SlashSpec {
-        name: "approve-all-session",
-        description: "Approve every pending command for this session",
-        hermes: "/approve all session",
-    },
-    SlashSpec {
-        name: "approve-all-always",
-        description: "Approve every pending command permanently",
-        hermes: "/approve all always",
+        description: "Approve a pending dangerous command",
+        tail: Some((
+            "args",
+            "once (default), session, always, all, all session, all always",
+        )),
     },
     SlashSpec {
         name: "deny",
-        description: "Deny the oldest pending command",
-        hermes: "/deny",
-    },
-    SlashSpec {
-        name: "deny-all",
-        description: "Deny every pending command",
-        hermes: "/deny all",
+        description: "Deny a pending dangerous command",
+        tail: Some(("reason", "all, and/or a reason relayed to the agent")),
     },
 ];
 
@@ -104,21 +79,35 @@ pub(crate) fn spawn_manifest_publish() {
     });
 }
 
+fn command_specs() -> Vec<CommandSpec> {
+    HERMES_SLASH_COMMANDS
+        .iter()
+        .map(|spec| CommandSpec {
+            name: spec.name.to_string(),
+            description: spec.description.to_string(),
+            args: spec
+                .tail
+                .map(|(name, description)| {
+                    vec![ArgSpec {
+                        name: name.to_string(),
+                        arg_type: ArgType::String,
+                        description: description.to_string(),
+                        required: false,
+                        choices: Vec::new(),
+                    }]
+                })
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
 async fn publish_interface_manifest() -> Result<(), String> {
-    use vector_sdk::vector_core::bot_interface::{self, BotManifest, CommandSpec};
     use vector_sdk::vector_core::state::{self, MY_SECRET_KEY};
     use vector_sdk::DISCOVERY_RELAYS;
 
     let manifest = BotManifest {
         v: 1,
-        commands: HERMES_SLASH_COMMANDS
-            .iter()
-            .map(|spec| CommandSpec {
-                name: spec.name.to_string(),
-                description: spec.description.to_string(),
-                args: Vec::new(),
-            })
-            .collect(),
+        commands: command_specs(),
     };
     manifest.validate()?;
     let keys = MY_SECRET_KEY
@@ -151,47 +140,32 @@ async fn publish_interface_manifest() -> Result<(), String> {
 }
 
 fn attach(bot: &VectorBot, spec: &SlashSpec, state: AppState) {
-    let name = spec.name;
-    let hermes = spec.hermes;
-    bot.command(spec.name, spec.description).run(move |ctx| {
+    let builder = bot.command(spec.name, spec.description);
+    match spec.tail {
+        Some((name, description)) => {
+            finish(builder.string(name, description, false), state);
+        }
+        None => finish(builder, state),
+    }
+}
+
+fn finish(builder: vector_sdk::CommandBuilder, state: AppState) {
+    builder.run(move |ctx| {
         let state = state.clone();
         async move {
-            forward_slash(&state, &ctx.msg, name, hermes);
+            forward_slash(&state, &ctx.msg);
         }
     });
 }
 
-fn hermes_text(vector_name: &str, hermes: &str, incoming: &IncomingMessage) -> String {
-    let raw = incoming.text().trim();
-    let first = raw
-        .trim_start_matches('/')
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    // Bare `/approve` and `/deny` keep typed extras (`/approve session`).
-    // Hyphenated picker names always rewrite (`/approve-session` → `/approve session`).
-    if first.eq_ignore_ascii_case(vector_name) && !vector_name.contains('-') {
-        raw.to_string()
-    } else {
-        hermes.to_string()
-    }
-}
-
-pub(crate) fn forward_slash(
-    state: &AppState,
-    incoming: &IncomingMessage,
-    vector_name: &str,
-    hermes: &str,
-) {
+pub(crate) fn forward_slash(state: &AppState, incoming: &IncomingMessage) {
     let Some(mut data) = map_incoming(incoming) else {
         return;
     };
     data.is_command = true;
-    data.text = hermes_text(vector_name, hermes, incoming);
     eprintln!(
-        "[vector-bridge] slash {} → {} id={} group={}",
+        "[vector-bridge] slash {} id={} group={}",
         incoming.text().trim(),
-        data.text,
         data.id,
         data.is_group
     );
@@ -238,38 +212,37 @@ mod tests {
             );
             assert!(!spec.name.is_empty() && spec.name.len() <= 32);
             assert!(spec.description.len() <= 200);
-            assert!(
-                spec.hermes.starts_with("/approve") || spec.hermes.starts_with("/deny"),
-                "unexpected hermes text {}",
-                spec.hermes
-            );
+            if let Some((name, desc)) = spec.tail {
+                assert!(name.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'-'
+                    || b == b'_'));
+                assert!(desc.len() <= 200);
+            }
         }
         let names: Vec<_> = HERMES_SLASH_COMMANDS.iter().map(|s| s.name).collect();
-        assert_eq!(
-            names,
-            [
-                "approve",
-                "approve-session",
-                "approve-always",
-                "approve-all",
-                "approve-all-session",
-                "approve-all-always",
-                "deny",
-                "deny-all",
-            ]
-        );
+        assert_eq!(names, ["approve", "deny"]);
+        assert!(HERMES_SLASH_COMMANDS.iter().all(|s| s.tail.is_some()));
     }
 
     #[test]
-    fn slash_forward_rewrites_picker_name_to_hermes_text() {
+    fn manifest_with_optional_string_args_validates() {
+        let manifest = BotManifest {
+            v: 1,
+            commands: command_specs(),
+        };
+        manifest.validate().expect("manifest");
+        assert_eq!(manifest.commands.len(), 2);
+        assert_eq!(manifest.commands[0].args.len(), 1);
+        assert!(!manifest.commands[0].args[0].required);
+        assert_eq!(manifest.commands[0].args[0].arg_type, ArgType::String);
+    }
+
+    #[test]
+    fn slash_forward_keeps_typed_args() {
         let state = AppState::new("tok".into(), Duration::from_secs(30));
         let mut rx = state.events().connect();
-        forward_slash(
-            &state,
-            &incoming("/approve-session", false),
-            "approve-session",
-            "/approve session",
-        );
+        forward_slash(&state, &incoming("/approve session", false));
         let item = rx.try_recv().expect("sse item");
         let payload: Value = serde_json::from_str(&item.payload).unwrap();
         assert_eq!(payload["type"], "message");
@@ -283,38 +256,13 @@ mod tests {
     fn slash_forward_keeps_group_chat_id() {
         let state = AppState::new("tok".into(), Duration::from_secs(30));
         let mut rx = state.events().connect();
-        forward_slash(
-            &state,
-            &incoming("/deny-all", true),
-            "deny-all",
-            "/deny all",
-        );
+        forward_slash(&state, &incoming("/deny all", true));
         let item = rx.try_recv().expect("sse item");
         let payload: Value = serde_json::from_str(&item.payload).unwrap();
         assert_eq!(payload["data"]["is_command"], true);
         assert_eq!(payload["data"]["is_group"], true);
         assert_eq!(payload["data"]["chat_id"], "a".repeat(64));
         assert_eq!(payload["data"]["text"], "/deny all");
-    }
-
-    #[test]
-    fn typed_approve_extras_are_kept() {
-        assert_eq!(
-            hermes_text("approve", "/approve", &incoming("/approve session", false)),
-            "/approve session"
-        );
-        assert_eq!(
-            hermes_text("deny", "/deny", &incoming("/deny all because no", false)),
-            "/deny all because no"
-        );
-        assert_eq!(
-            hermes_text(
-                "approve-always",
-                "/approve always",
-                &incoming("/approve-always", false)
-            ),
-            "/approve always"
-        );
     }
 
     #[test]

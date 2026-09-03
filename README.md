@@ -176,20 +176,14 @@ Community files, reactions, and missed-❌ catch-up are not in this slice.
 ## Slash commands
 
 The sidecar publishes a Vector **kind 10304** command manifest so the app `/`
-picker lists **approve/deny only** — each mode is its own command, no
-arguments. The sidecar rewrites picker names to Hermes text
-(`/approve-session` → `/approve session`) and SSE-forwards them.
+picker lists **`/approve` and `/deny` only**. Optional args are a trailing
+string (`/approve session`, `/approve all always`, `/deny all`). The sidecar
+SSE-forwards the original text to Hermes.
 
-| Command | Hermes equivalent |
-|---------|-------------------|
-| `/approve` | `/approve` (oldest, once) |
-| `/approve-session` | `/approve session` |
-| `/approve-always` | `/approve always` |
-| `/approve-all` | `/approve all` |
-| `/approve-all-session` | `/approve all session` |
-| `/approve-all-always` | `/approve all always` |
-| `/deny` | `/deny` (oldest) |
-| `/deny-all` | `/deny all` |
+| Command | Arguments |
+|---------|-----------|
+| `/approve` | `once` (default), `session`, `always`, `all`, `all session`, `all always` |
+| `/deny` | optional `all` and/or a reason |
 
 In a Concord channel these do **not** need an @mention (the people-gate still
 applies). Chatter that is not a registered command stays mention-gated.

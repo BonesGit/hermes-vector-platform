@@ -67,7 +67,7 @@ The operator wants Hermes reachable from Vector the same way it is reachable fro
 
 - ~~Communities / Concord channels~~ — join-first + mention-gated groups shipped; bot-owned create is opt-in (`VECTOR_CREATE_COMMUNITY`). Public invite links and `InvitePolicy::Public` stay out.
 - Files, voice, custom emoji reactions, message edit/delete.
-- ~~Slash-command manifests (`kind:10304`)~~ — argument-free Vector picker for Hermes `/approve` / `/deny` modes only (`approve-session` → `/approve session`, …). Concord admin is **not** on this surface (see `ADMIN_PLAN.md`).
+- ~~Slash-command manifests (`kind:10304`)~~ — Vector picker for Hermes `/approve` and `/deny` only (optional args). Concord admin is **not** on this surface (see `ADMIN_PLAN.md`).
 - Tor (`vector_sdk` `tor` feature + `builder.tor()`). Document as v2.
 - Impersonating a human Vector account as the primary mode. Importing an existing nsec is supported for recovery, not as "Hermes logs in as you."
 - In-tree Hermes platform (`Platform.VECTOR` enum member, `toolsets.py` edits). Plugin auto-toolset `hermes-vector` already covers this (`toolsets.py` `resolve_toolset`, `hermes-<name>` branch).
@@ -560,7 +560,7 @@ Unlike Session, Vector **supports edit** (`Channel::edit`). Per D12, v1 **setup 
 | Reactions | `Channel::react` / `react_custom` / core `delete_own_reaction` | yes (DM unicode + optional NIP-30 URL; unreact via `/react` `remove`) | communities |
 | Edits / deletes | `edit` / `delete` | no | v1.1 — enables tool-progress edits |
 | Communities | `community()`, `InvitePolicy` | join-first whitelist + mention-gated group text/typing; optional `create_community_v2` | public invite links, Concord moderation |
-| Slash commands | `bot.command(...)` kind 10304 | Approve/deny picker only (`approve-session` → `/approve session`); SSE-forwarded | remaining Hermes/skill commands |
+| Slash commands | `bot.command(...)` kind 10304 | `/approve` and `/deny` only (optional args); SSE-forwarded | remaining Hermes/skill commands |
 
 Markdown: Vector's GUI renders markdown (`README.md` "Rich Message Composer"). `platform_hint` should **allow** markdown (opposite of Session's "plain text only").
 
@@ -648,7 +648,7 @@ Home channel: `VECTOR_HOME_CHANNEL` = operator npub. Cron `deliver=vector` + `cr
 
 - Concord channels: `InvitePolicy::Whitelist`, mention gating, sender union (`VECTOR_ALLOWED_USERS` / `VECTOR_GROUP_ALLOWED_USERS` / `VECTOR_GROUP_ALLOW_ALL`) — **shipped**. Trusted join is enough to listen.
 - Optional bot-owned private community (`VECTOR_CREATE_COMMUNITY`) — **shipped** (no public invite link).
-- `bot.command(...)` kind-10304 picker for Hermes `/approve` / `/deny` modes only — **shipped**. Remaining Hermes/skill commands and Concord admin stay off this surface.
+- `bot.command(...)` kind-10304 picker for Hermes `/approve` and `/deny` only — **shipped**. Remaining Hermes/skill commands and Concord admin stay off this surface.
 - Tor: `vector_sdk = { features = ["tor"] }` + `.tor()`; never connect clearnet first (SDK guarantee).
 
 **v3 — consider PyO3** only if the extra process is a proven problem.

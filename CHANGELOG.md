@@ -41,11 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sdk/home-community.json`, and direct-invites allowlisted npubs. No public
   invite links. Trusted join is enough to listen — there is no
   `VECTOR_GROUP_ALLOWED_CHATS` look-gate.
-- Vector **slash commands** (kind 10304): argument-free picker entries for
-  Hermes approvals only. `/approve` `/approve-session` `/approve-always`
-  `/approve-all` `/approve-all-session` `/approve-all-always` `/deny`
-  `/deny-all` rewrite to the Hermes text (`/approve session`, …) and
-  SSE-forward (`is_command: true`). Groups admit those without an @mention;
+- Vector **slash commands** (kind 10304): `/approve` and `/deny` only, with
+  optional args (`session`, `always`, `all`, `all session`, `all always`,
+  deny reason). Matched picker invocations SSE-forward as the original
+  `/…` text (`is_command: true`). Groups admit those without an @mention;
   the people-gate still applies. `VECTOR_SLASH_COMMANDS=off` skips the
   public manifest. Concord admin is **not** on this surface.
 - Optional public bot profile (Vector `update_profile` / kind-0 `name`,

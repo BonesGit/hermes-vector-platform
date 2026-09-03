@@ -206,11 +206,8 @@ class TestGroupSlashCommand:
         assert vector_adapter._group_slash_command("/approve session")
         assert vector_adapter._group_slash_command("/approve all always")
         assert vector_adapter._group_slash_command("/APPROVE")
-        assert vector_adapter._group_slash_command("/approve-session")
-        assert vector_adapter._group_slash_command("/approve-all-always")
         assert vector_adapter._group_slash_command("/deny")
         assert vector_adapter._group_slash_command("/deny all too risky")
-        assert vector_adapter._group_slash_command("/deny-all")
 
     def test_non_approval_commands_are_not_bypasses(self):
         assert not vector_adapter._group_slash_command("/yolo")
@@ -218,6 +215,8 @@ class TestGroupSlashCommand:
         assert not vector_adapter._group_slash_command("/skills pending")
         assert not vector_adapter._group_slash_command("/help")
         assert not vector_adapter._group_slash_command("/reset now")
+        assert not vector_adapter._group_slash_command("/approve-session")
+        assert not vector_adapter._group_slash_command("/deny-all")
 
     def test_is_command_flag_bypasses_name_check(self):
         assert vector_adapter._group_slash_command("/unknown", is_command=True)
@@ -1134,7 +1133,7 @@ class TestInboundMapping:
         assert captured[0].source.chat_type == "group"
         assert captured[0].source.role_authorized is True
 
-    def test_group_deny_and_memory_without_mention(self, monkeypatch, tmp_path):
+    def test_group_deny_and_approve_args_without_mention(self, monkeypatch, tmp_path):
         adapter = _make_adapter(
             monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
         )
@@ -1146,9 +1145,9 @@ class TestInboundMapping:
         adapter.handle_message = capture  # type: ignore[method-assign]
         for text, msg_id in (
             ("/deny too broad", "g-deny-slash"),
-            ("/approve-session", "g-approve-session"),
-            ("/approve-all-always", "g-approve-all-always"),
-            ("/deny-all", "g-deny-all"),
+            ("/approve always", "g-approve-always"),
+            ("/approve all session", "g-approve-all-session"),
+            ("/deny all", "g-deny-all"),
         ):
             captured.clear()
             asyncio.run(

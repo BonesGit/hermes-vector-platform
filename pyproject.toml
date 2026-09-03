@@ -14,6 +14,11 @@ dependencies = [
   # Runtime deps come from Hermes itself (httpx, gateway.*).
 ]
 
+[project.urls]
+Homepage = "https://github.com/BonesGit/hermes-vector-platform"
+Repository = "https://github.com/BonesGit/hermes-vector-platform"
+Changelog = "https://github.com/BonesGit/hermes-vector-platform/blob/master/CHANGELOG.md"
+
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 

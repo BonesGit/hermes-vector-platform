@@ -82,8 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `DESIGN.md` is local-only (gitignored); operator docs live in the README.
-- README: prerequisites before install; setup documents `identity.mnemonic`;
-  removed Session-plugin comparisons and the broken `REACTION.md` link.
+- README: prerequisites before install; pip install notes that Rust is still
+  required; community files / reactions / missed-❌ are documented as DM-only.
 - Removed ``VECTOR_GROUP_ALLOWED_CHATS``. A trusted invite auto-join is
   enough for the bot to listen; mention/people gates still apply.
 
@@ -149,7 +149,7 @@ missed while the sidecar was down is **not** in v1 — the peer retries.
 ### Install
 
 ```bash
-git clone <this-repo> ~/.hermes/plugins/vector-platform
+git clone https://github.com/BonesGit/hermes-vector-platform ~/.hermes/plugins/vector-platform
 hermes plugins enable vector-platform
 hermes gateway setup    # builds vector-bridge, create/import identity
 hermes gateway restart

@@ -36,6 +36,8 @@ hermes plugins list
 
 ### pip (optional)
 
+Same tree still needs Rust — `pip install -e` does not ship a prebuilt sidecar.
+
 ```bash
 pip install -e /path/to/hermes-vector-platform
 hermes plugins enable vector-platform
@@ -140,7 +142,7 @@ flowchart LR
 
 ## Display / tool progress
 
-Vector can edit messages, but v1 has no `/edit` route. Setup merges only the `display.platforms.vector` mapping (comment-preserving when `ruamel.yaml` is available; otherwise a full dump of `config.yaml`):
+Vector can edit messages, but this plugin has no `/edit` route yet. Setup merges only the `display.platforms.vector` mapping (comment-preserving when `ruamel.yaml` is available; otherwise a full dump of `config.yaml`):
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -178,7 +180,7 @@ The Vector app does not display channel ids. When the bot joins (trusted invite,
 
 **Bot-owned home room:** set `VECTOR_CREATE_COMMUNITY=on`. After Ready the sidecar creates or reuses a private community, persists `sdk/home-community.json` (restart will not create a second one), and direct-invites `VECTOR_ALLOWED_USERS`. No public invite URL, and the new channel is **not** written into `VECTOR_GROUP_ALLOW_ALL`. Direct-invited allowlisted members can already @mention; anyone else needs `VECTOR_GROUP_ALLOWED_USERS` or the channel id in `VECTOR_GROUP_ALLOW_ALL`.
 
-Community files, reactions, and missed-❌ catch-up are not in this slice.
+Community **file attachments** and **reactions** are DM-only. Missed-❌ catch-up is DM-only. Concord channels are text + slash commands.
 
 ## Slash commands
 
@@ -226,7 +228,7 @@ Uses `VECTOR_HOME_CHANNEL` (via `cron_deliver_env_var`) and `standalone_sender_f
 ## Development
 
 ```bash
-cd hermes-vector-platform
+# from the plugin root
 pytest -q            # needs Hermes on PYTHONPATH, HERMES_AGENT_ROOT, or ~/.hermes/hermes-agent
 cd bridge && cargo test --locked
 ```

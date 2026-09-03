@@ -81,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `DESIGN.md` is local-only (gitignored); operator docs live in the README.
 - README: prerequisites before install; setup documents `identity.mnemonic`;
   removed Session-plugin comparisons and the broken `REACTION.md` link.
 - Removed ``VECTOR_GROUP_ALLOWED_CHATS``. A trusted invite auto-join is

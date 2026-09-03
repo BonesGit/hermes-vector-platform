@@ -14,5 +14,6 @@ uv.lock
 plugin-data/
 identity.nsec
 identity.mnemonic
+DESIGN.md
 target/
 bridge/target/

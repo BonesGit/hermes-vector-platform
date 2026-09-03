@@ -7,7 +7,7 @@ description: >
   Spawns a local Rust sidecar wrapping vector-sdk and relays
   DMs over HTTP/SSE. The plugin is a first-class Vector bot
   identity (its own nsec/npub), not an impersonation of a human.
-author: Hermes Vector Platform contributors
+author: BonesGit
 requires_env:
   - name: VECTOR_NPUB
     description: "Bot public key (npub1…); written by hermes gateway setup"

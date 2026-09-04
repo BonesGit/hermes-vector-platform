@@ -596,6 +596,11 @@ def _group_allow_all_chats() -> set:
 # Keep in sync with bridge/src/commands.rs HERMES_SLASH_COMMANDS.
 _VECTOR_SLASH_COMMANDS = frozenset({"approve", "deny"})
 
+_BLOCK_COMMAND_RE = re.compile(
+    r"^/(block|unblock|blocked)(?:\s+(\S+))?\s*$",
+    re.IGNORECASE,
+)
+
 
 def _group_slash_command(text: str, *, is_command: bool = False) -> bool:
     """True when a group message is a registered Hermes slash command.
@@ -832,6 +837,25 @@ def _sender_is_authorized(peer: str) -> bool:
     return npub in _allowed_npubs()
 
 
+def _can_manage_blocks(peer: str) -> bool:
+    """Who may mute a DM peer: ``VECTOR_HOME_CHANNEL`` only.
+
+    Allowlisted users, pairing-approved senders, and
+    ``VECTOR_ALLOW_ALL_USERS`` do not grant this.
+    """
+    npub = normalize_npub(peer) or (peer or "").strip()
+    home = _home_operator_npub()
+    return bool(npub and home and npub == home)
+
+
+def _parse_block_command(text: str) -> Optional[Tuple[str, str]]:
+    """Typed ``/block`` / ``/unblock`` / ``/blocked`` in a DM. None if not a match."""
+    m = _BLOCK_COMMAND_RE.match((text or "").strip())
+    if not m:
+        return None
+    return m.group(1).lower(), (m.group(2) or "").strip()
+
+
 def _group_sender_is_authorized(peer: str, channel_id: str) -> bool:
     """Who may trigger a community turn.
 
@@ -925,6 +949,8 @@ class VectorAdapter(BasePlatformAdapter):
         self._last_inbound_by_chat: OrderedDict[str, str] = OrderedDict()
         self._sent_message_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_reaction_ids: OrderedDict[str, None] = OrderedDict()
+        self._blocked_npubs: set = set()
+        self._blocked_loaded: bool = False
         # File-only saves waiting to be attached to the next gated text.
         # DMs key by peer npub; groups key by ``{channel_id}:{peer}``.
         self._pending_inbox: Dict[str, List[Tuple[str, str]]] = {}
@@ -1313,6 +1339,100 @@ class VectorAdapter(BasePlatformAdapter):
             logger.error("Vector: exception while editing: %s", e)
             return SendResult(success=False, error=str(e), retryable=False)
 
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Retract a previously sent Vector message (NIP-09 / Concord tombstone).
+
+        Hermes uses this for ephemeral TTL and stream-consumer preview
+        cleanup. Failures are non-fatal — the caller leaves the bubble.
+        """
+        if not self._http_client or not (message_id or "").strip():
+            return False
+        payload: Dict[str, Any] = {
+            "to": _send_target(chat_id),
+            "message_id": message_id.strip(),
+        }
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/delete",
+                json=payload,
+                headers=self._token_headers(),
+                timeout=15.0,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.debug("Vector: delete_message failed: %s", e)
+            return False
+
+    async def block_user(self, npub: str, *, unblock: bool = False) -> bool:
+        """Mute or unmute a DM peer at the Vector layer (not Concord kick/ban)."""
+        target = normalize_npub(npub) or (npub or "").strip()
+        if not self._http_client or not target:
+            return False
+        body: Dict[str, Any] = {"npub": target}
+        if unblock:
+            body["unblock"] = True
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/block",
+                json=body,
+                headers=self._token_headers(),
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Vector: block_user failed: %s", e)
+            return False
+        if resp.status_code != 200:
+            return False
+        if unblock:
+            self._blocked_npubs.discard(target)
+        else:
+            self._blocked_npubs.add(target)
+        self._blocked_loaded = True
+        return True
+
+    async def list_blocked(self) -> List[Dict[str, Any]]:
+        """Blocked DM peers from the sidecar mute list."""
+        await self._refresh_blocked()
+        if not self._http_client:
+            return [{"npub": n, "name": "", "display_name": ""} for n in sorted(self._blocked_npubs)]
+        try:
+            resp = await self._http_client.get(
+                f"{self.bridge_url}/block",
+                headers=self._token_headers(),
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Vector: list_blocked failed: %s", e)
+            return [{"npub": n, "name": "", "display_name": ""} for n in sorted(self._blocked_npubs)]
+        if resp.status_code != 200:
+            return [{"npub": n, "name": "", "display_name": ""} for n in sorted(self._blocked_npubs)]
+        try:
+            data = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return [{"npub": n, "name": "", "display_name": ""} for n in sorted(self._blocked_npubs)]
+        rows = data.get("blocked") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        found: set = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            npub = normalize_npub(str(row.get("npub") or "")) or str(row.get("npub") or "").strip()
+            if not npub:
+                continue
+            found.add(npub)
+            out.append(
+                {
+                    "npub": npub,
+                    "name": str(row.get("name") or ""),
+                    "display_name": str(row.get("display_name") or ""),
+                }
+            )
+        self._blocked_npubs = found
+        self._blocked_loaded = True
+        return out
+
     async def send_reaction(
         self,
         chat_id: str,
@@ -1384,6 +1504,96 @@ class VectorAdapter(BasePlatformAdapter):
         last[key] = message_id
         while len(last) > LAST_INBOUND_CHATS_MAX:
             last.popitem(last=False)
+
+    def _forget_last_inbound(self, chat_id: Optional[str], message_id: Optional[str]) -> None:
+        if not chat_id or not message_id:
+            return
+        key = self._chat_key(chat_id)
+        if self._last_inbound_by_chat.get(key) == message_id:
+            self._last_inbound_by_chat.pop(key, None)
+
+    async def _refresh_blocked(self) -> None:
+        """Load the sidecar mute list into ``_blocked_npubs``."""
+        if not self._http_client:
+            self._blocked_loaded = True
+            return
+        try:
+            resp = await self._http_client.get(
+                f"{self.bridge_url}/block",
+                headers=self._token_headers(),
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Vector: refresh blocked list failed: %s", e)
+            return
+        if resp.status_code != 200:
+            return
+        try:
+            data = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return
+        rows = data.get("blocked") if isinstance(data, dict) else None
+        found: set = set()
+        if isinstance(rows, list):
+            for row in rows:
+                raw = row.get("npub") if isinstance(row, dict) else row
+                npub = normalize_npub(str(raw or "")) or str(raw or "").strip()
+                if npub:
+                    found.add(npub)
+        self._blocked_npubs = found
+        self._blocked_loaded = True
+
+    async def _is_blocked(self, peer: str) -> bool:
+        npub = normalize_npub(peer) or (peer or "").strip()
+        if not npub:
+            return False
+        if not self._blocked_loaded:
+            await self._refresh_blocked()
+        return npub in self._blocked_npubs
+
+    async def _try_block_command(self, peer: str, text: str) -> bool:
+        """Handle typed ``/block`` / ``/unblock`` / ``/blocked`` from the home DM.
+
+        Only ``VECTOR_HOME_CHANNEL`` may issue these. Returns True when the
+        message is consumed (no Hermes turn).
+        """
+        parsed = _parse_block_command(text)
+        if not parsed or not _can_manage_blocks(peer):
+            return False
+        cmd, arg = parsed
+        if cmd == "blocked":
+            rows = await self.list_blocked()
+            if not rows:
+                body = "No blocked users."
+            else:
+                lines = [f"Blocked ({len(rows)}):"]
+                for row in rows:
+                    npub = str(row.get("npub") or "")
+                    label = (
+                        str(row.get("name") or "").strip()
+                        or str(row.get("display_name") or "").strip()
+                    )
+                    shown = _truncate_npub(npub) if npub else npub
+                    lines.append(f"- {shown}" + (f" ({label})" if label else ""))
+                body = "\n".join(lines)
+            await self.send(peer, body)
+            return True
+        target = normalize_npub(arg)
+        if not target:
+            await self.send(peer, f"Usage: /{cmd} <npub>")
+            return True
+        bot = normalize_npub(self._npub or "") if self._npub else None
+        commander = normalize_npub(peer) or peer
+        if (bot and target == bot) or target == commander:
+            await self.send(peer, "Cannot block that npub.")
+            return True
+        ok = await self.block_user(target, unblock=(cmd == "unblock"))
+        if not ok:
+            await self.send(peer, f"Could not {cmd} {_truncate_npub(target)}.")
+            return True
+        verb = "Unblocked" if cmd == "unblock" else "Blocked"
+        await self.send(peer, f"{verb} {_truncate_npub(target)}.")
+        return True
 
     def _record_sent_message(self, message_id: Optional[str]) -> None:
         if not message_id:
@@ -2003,6 +2213,8 @@ class VectorAdapter(BasePlatformAdapter):
             await self._handle_message_event(data)
         elif event_type == "message_update":
             await self._handle_message_update(data)
+        elif event_type == "message_delete":
+            await self._handle_message_delete(data)
         elif event_type == "community_joined":
             inner = data.get("data") if isinstance(data.get("data"), dict) else data
             inner = inner or {}
@@ -2050,12 +2262,24 @@ class VectorAdapter(BasePlatformAdapter):
         if bot_npub and peer == bot_npub:
             return
 
+        if await self._is_blocked(peer):
+            logger.info(
+                "Vector: dropping blocked sender %s",
+                _truncate_npub(peer),
+            )
+            return
+
         # VECTOR_PAIRING=off: drop before handle_message so pairing codes are not sent.
         if not _pairing_enabled() and not _sender_is_authorized(peer):
             logger.info(
                 "Vector: dropping unauthorized sender %s (VECTOR_PAIRING=off)",
                 _truncate_npub(peer),
             )
+            return
+
+        if await self._try_block_command(peer, text):
+            if msg_id:
+                self._record_last_inbound(peer, msg_id)
             return
 
         if msg_id:
@@ -2243,6 +2467,40 @@ class VectorAdapter(BasePlatformAdapter):
             media_types=media_types,
         )
         await self.handle_message(event)
+
+    async def _handle_message_delete(self, msg_data: dict) -> None:
+        """Peer (or we) deleted a bubble. No Hermes turn — forget local pointers."""
+        if (
+            isinstance(msg_data, dict)
+            and msg_data.get("type") == "message_delete"
+            and "data" in msg_data
+        ):
+            msg_data = msg_data["data"]
+        if not isinstance(msg_data, dict):
+            return
+        msg_id = str(msg_data.get("id") or msg_data.get("message_id") or "")
+        chat_id = str(msg_data.get("chat_id") or "")
+        if msg_id:
+            self._is_duplicate(msg_id)
+        self._forget_last_inbound(chat_id, msg_id)
+        if msg_id:
+            pointer = _group_file_pointer_path(msg_id)
+            try:
+                pointer.unlink(missing_ok=True)
+            except OSError:
+                pass
+        channel = normalize_channel_id(chat_id)
+        if channel and msg_id:
+            pending = _group_file_pending_path(channel, msg_id)
+            try:
+                pending.unlink(missing_ok=True)
+            except OSError:
+                pass
+        logger.debug(
+            "Vector: message deleted id=%s chat=%s",
+            (msg_id or "")[:16],
+            _truncate_npub(chat_id) if chat_id else "",
+        )
 
     async def _handle_message_update(self, msg_data: dict) -> None:
         """Peer reaction on a message we sent → ``reaction:added:<emoji>``."""

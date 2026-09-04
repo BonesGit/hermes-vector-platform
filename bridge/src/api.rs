@@ -184,7 +184,8 @@ pub fn router(state: AppState) -> Router {
         .route("/react", post(react))
         .route("/send-file", post(send_file))
         .route("/download-attachment", post(download_attachment))
-        .route("/block", post(not_implemented))
+        .route("/block", post(block_user).get(list_blocked))
+        .route("/delete", post(delete_message))
         .route("/__test/ready", post(test_ready))
         .route("/__test/inject", post(events::inject))
         .layer(DefaultBodyLimit::max(MAX_BODY))
@@ -286,14 +287,6 @@ impl ApiError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: "payload_too_large",
             error: "request body too large",
-        }
-    }
-
-    pub fn not_implemented() -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            code: "not_implemented",
-            error: "not implemented",
         }
     }
 
@@ -791,8 +784,96 @@ async fn download_attachment(
     })))
 }
 
-async fn not_implemented(_auth: Auth) -> ApiError {
-    ApiError::not_implemented()
+#[derive(Deserialize)]
+struct BlockRequest {
+    #[serde(default)]
+    npub: String,
+    #[serde(default)]
+    unblock: bool,
+}
+
+fn blocked_entry(p: &SlimProfile) -> Value {
+    json!({
+        "npub": p.id,
+        "name": p.name,
+        "display_name": p.display_name,
+    })
+}
+
+/// Mute (`VectorBot::block`) or unmute a DM peer. Concord admin kick/ban is
+/// a different surface (`ADMIN_PLAN.md`).
+async fn block_user(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<BlockRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let raw = req.npub.trim();
+    if raw.is_empty() {
+        return Err(ApiError::bad_request("npub is required"));
+    }
+    let npub = parse_npub(raw)?;
+    state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        if same_pubkey(&npub, &bot.npub()) {
+            return Err(ApiError::bad_request("cannot block self"));
+        }
+        let ok = if req.unblock {
+            bot.unblock(&npub).await
+        } else {
+            bot.block(&npub).await
+        };
+        if !req.unblock && !ok {
+            eprintln!("[vector-bridge] block failed npub={npub}");
+            return Err(ApiError::internal());
+        }
+        // Unblock of an unknown npub is false from the SDK — still 200.
+    }
+    Ok(Json(json!({ "ok": true, "npub": npub, "blocked": !req.unblock })))
+}
+
+async fn list_blocked(
+    State(state): State<AppState>,
+    _auth: Auth,
+) -> Result<Json<Value>, ApiError> {
+    state.require_ready().await?;
+    let blocked = if let Some(bot) = state.bot().await {
+        bot.blocked_users()
+            .await
+            .iter()
+            .map(blocked_entry)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Ok(Json(json!({ "blocked": blocked })))
+}
+
+#[derive(Deserialize)]
+struct DeleteRequest {
+    to: String,
+    #[serde(default)]
+    message_id: String,
+}
+
+/// Retract a message this bot previously sent (`Channel::delete`).
+async fn delete_message(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<DeleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let to = parse_send_target(&req.to)?;
+    let message_id = req.message_id.trim();
+    if message_id.is_empty() {
+        return Err(ApiError::bad_request("message_id is required"));
+    }
+    state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        bot.channel(&to).delete(message_id).await.map_err(|err| {
+            eprintln!("[vector-bridge] delete failed: {err}");
+            ApiError::internal()
+        })?;
+    }
+    Ok(Json(json!({ "ok": true, "id": message_id })))
 }
 
 async fn test_ready(State(state): State<AppState>, _auth: Auth) -> Json<Value> {

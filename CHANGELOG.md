@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   card still truncates the npub. Concord rooms use the **community** name
   (Vector's list title). Default channel `general` is omitted; extra rooms
   show `Community · channel`.
+- DM **block list**. Sidecar `POST /block` `{npub, unblock?}` /
+  `GET /block` wrap `VectorBot::block` / `unblock` / `blocked_users`
+  (mute, not Concord kick/ban). Adapter drops muted DMs before pairing or
+  a turn. Only `VECTOR_HOME_CHANNEL` can type `/block <npub>`,
+  `/unblock <npub>`, `/blocked` in that DM (not on the Vector `/` picker;
+  other allowlisted users cannot).
+- Message **delete**. Sidecar `POST /delete` `{to, message_id}` calls
+  `Channel::delete`. Adapter `delete_message` retracts a bot bubble (Hermes
+  ephemeral TTL / stream-preview cleanup). Inbound `BotEvent::Delete` is
+  SSE `message_delete`: forget local pointers, no Hermes turn.
 
 ### Changed
 

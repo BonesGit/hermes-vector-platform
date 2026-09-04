@@ -293,6 +293,12 @@ pub(crate) async fn handle_bot_event(
                 state.events().publish(data.sse_item());
             }
         }
+        BotEvent::Delete {
+            chat_id,
+            message_id,
+        } => {
+            state.events().publish(delete_item(&chat_id, &message_id));
+        }
         BotEvent::Invite { community_id } => {
             eprintln!(
                 "[vector-bridge] community invite community_id={community_id} \
@@ -360,6 +366,20 @@ fn community_joined_item(community_id: &str, name: &str, channels: Vec<Value>) -
                 "community_id": community_id,
                 "name": name,
                 "channels": channels,
+            }
+        })
+        .to_string(),
+    }
+}
+
+pub(crate) fn delete_item(chat_id: &str, message_id: &str) -> SseItem {
+    SseItem {
+        id: Some(format!("delete:{message_id}")),
+        payload: json!({
+            "type": "message_delete",
+            "data": {
+                "id": message_id,
+                "chat_id": chat_id,
             }
         })
         .to_string(),
@@ -454,6 +474,16 @@ mod tests {
         assert_eq!(payload["data"]["name"], "Ada's house");
         assert_eq!(payload["data"]["channels"][0]["channel_id"], channel_id);
         assert_eq!(payload["data"]["channels"][0]["name"], "general");
+    }
+
+    #[test]
+    fn delete_payload_has_chat_and_message_id() {
+        let item = delete_item("npub1peer", "deadbeef");
+        assert_eq!(item.id.as_deref(), Some("delete:deadbeef"));
+        let payload: Value = serde_json::from_str(&item.payload).unwrap();
+        assert_eq!(payload["type"], "message_delete");
+        assert_eq!(payload["data"]["id"], "deadbeef");
+        assert_eq!(payload["data"]["chat_id"], "npub1peer");
     }
 
     #[test]

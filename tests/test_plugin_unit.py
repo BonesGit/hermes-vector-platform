@@ -259,6 +259,37 @@ class TestGroupSlashCommand:
         assert not vector_adapter._group_slash_command("")
 
 
+class TestBlockCommandParse:
+    def test_parse_block_variants(self):
+        assert vector_adapter._parse_block_command("/block npub1abc") == (
+            "block",
+            "npub1abc",
+        )
+        assert vector_adapter._parse_block_command("/BLOCK  npub1abc") == (
+            "block",
+            "npub1abc",
+        )
+        assert vector_adapter._parse_block_command("/unblock npub1abc") == (
+            "unblock",
+            "npub1abc",
+        )
+        assert vector_adapter._parse_block_command("/blocked") == ("blocked", "")
+        assert vector_adapter._parse_block_command("/block") == ("block", "")
+        assert vector_adapter._parse_block_command("block npub1abc") is None
+        assert vector_adapter._parse_block_command("/approve") is None
+
+    def test_can_manage_blocks_home_only(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
+        monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
+        assert not vector_adapter._can_manage_blocks(PEER_NPUB)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
+        assert vector_adapter._can_manage_blocks(NPUB)
+        assert not vector_adapter._can_manage_blocks(PEER_NPUB)
+        monkeypatch.setenv("VECTOR_ALLOW_ALL_USERS", "1")
+        assert not vector_adapter._can_manage_blocks(PEER_NPUB)
+
+
 class TestKnownChannels:
     def test_remember_is_required(self):
         vector_adapter._known_channel_ids.clear()
@@ -653,11 +684,16 @@ class MockSidecar:
         self.edits: list = []
         self.typing: list = []
         self.reacts: list = []
+        self.blocks: list = []
+        self.deletes: list = []
+        self.blocked: list = []
         self.health_headers: list = []
         self.send_headers: list = []
         self.edit_headers: list = []
         self.typing_headers: list = []
         self.react_headers: list = []
+        self.block_headers: list = []
+        self.delete_headers: list = []
         self.events_headers: list = []
         self.inject_queue: list = []
         self.communities: list = []
@@ -730,6 +766,8 @@ class MockSidecar:
                             "website": "",
                         },
                     )
+                if path == "/block":
+                    return self._json(200, {"blocked": sidecar.blocked})
                 if path == "/events":
                     sidecar.events_headers.append(dict(self.headers))
                     self.send_response(200)
@@ -785,6 +823,32 @@ class MockSidecar:
                     sidecar.reacts.append(data)
                     sidecar.react_headers.append(dict(self.headers))
                     return self._json(200, {"ok": True})
+                if path == "/block":
+                    sidecar.blocks.append(data)
+                    sidecar.block_headers.append(dict(self.headers))
+                    npub = data.get("npub") or ""
+                    unblock = bool(data.get("unblock"))
+                    if unblock:
+                        sidecar.blocked = [
+                            row
+                            for row in sidecar.blocked
+                            if (row.get("npub") if isinstance(row, dict) else row)
+                            != npub
+                        ]
+                    elif npub and npub not in [
+                        row.get("npub") if isinstance(row, dict) else row
+                        for row in sidecar.blocked
+                    ]:
+                        sidecar.blocked.append({"npub": npub, "name": "", "display_name": ""})
+                    return self._json(
+                        200, {"ok": True, "npub": npub, "blocked": not unblock}
+                    )
+                if path == "/delete":
+                    sidecar.deletes.append(data)
+                    sidecar.delete_headers.append(dict(self.headers))
+                    return self._json(
+                        200, {"ok": True, "id": data.get("message_id") or ""}
+                    )
                 if path == "/communities":
                     sidecar.communities.append(data)
                     return self._json(
@@ -1249,6 +1313,115 @@ class TestInboundMapping:
         assert src.role_authorized is not True
         assert captured[0].text == "hi"
         assert captured[0].message_id == "m1"
+
+    def test_blocked_sender_is_dropped(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        adapter._blocked_npubs.add(PEER_NPUB)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(_message_event(PEER_NPUB, "spam", msg_id="b1"))
+        )
+        assert captured == []
+
+    def test_message_delete_does_not_start_a_turn(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._record_last_inbound(PEER_NPUB, "deadbeef")
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._dispatch_sse_event(
+                {
+                    "type": "message_delete",
+                    "data": {"id": "deadbeef", "chat_id": PEER_NPUB},
+                }
+            )
+        )
+        assert captured == []
+        assert PEER_NPUB not in adapter._last_inbound_by_chat
+        assert "deadbeef" in adapter._inbound_ids
+
+    def test_operator_block_command_mutes_and_does_not_turn(
+        self, monkeypatch, tmp_path
+    ):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        spam = vector_adapter.hex_to_npub("11" * 32)
+        try:
+            adapter = _make_adapter(
+                monkeypatch,
+                tmp_path,
+                bridge_port=port,
+                npub=NPUB,
+                allowed_users=PEER_NPUB,
+            )
+            monkeypatch.setenv("VECTOR_HOME_CHANNEL", PEER_NPUB)
+            adapter._sidecar_token = token
+            adapter._running = True
+            captured = []
+            sent = []
+
+            async def capture(event):
+                captured.append(event)
+
+            adapter.handle_message = capture  # type: ignore[method-assign]
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    orig_send = adapter.send
+
+                    async def wrap_send(chat_id, content, **kwargs):
+                        sent.append(content)
+                        return await orig_send(chat_id, content, **kwargs)
+
+                    adapter.send = wrap_send  # type: ignore[method-assign]
+                    await adapter._handle_message_event(
+                        _message_event(
+                            PEER_NPUB, f"/block {spam}", msg_id="cmd-block"
+                        )
+                    )
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert captured == []
+            assert sidecar.blocks == [{"npub": spam}]
+            assert spam in adapter._blocked_npubs
+            assert sent and "Blocked" in sent[0]
+        finally:
+            sidecar.stop()
+
+    def test_allowlisted_non_home_block_command_is_a_turn(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        spam = vector_adapter.hex_to_npub("11" * 32)
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, f"/block {spam}", msg_id="cmd-block-no")
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].text == f"/block {spam}"
 
     def test_hex_peer_normalized_to_npub(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)
@@ -2045,6 +2218,66 @@ class TestMockedSidecarHttp:
         assert result.success is False
         assert result.retryable is True
         assert "503" in (result.error or "")
+
+    def test_delete_message_posts_delete(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    assert await adapter.delete_message(PEER_NPUB, "orig-1") is True
+                    assert await adapter.delete_message(CHANNEL_ID, "orig-2") is True
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.deletes == [
+                {"to": PEER_NPUB, "message_id": "orig-1"},
+                {"to": CHANNEL_ID, "message_id": "orig-2"},
+            ]
+            assert sidecar.delete_headers[0].get("X-Hermes-Sidecar-Token") == token
+        finally:
+            sidecar.stop()
+
+    def test_delete_message_empty_id_is_false(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._http_client = object()
+        assert asyncio.run(adapter.delete_message(PEER_NPUB, "")) is False
+
+    def test_block_user_posts_block_and_unblock(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    assert await adapter.block_user(PEER_NPUB) is True
+                    rows = await adapter.list_blocked()
+                    assert rows[0]["npub"] == PEER_NPUB
+                    assert await adapter.block_user(PEER_NPUB, unblock=True) is True
+                    assert await adapter.list_blocked() == []
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.blocks == [
+                {"npub": PEER_NPUB},
+                {"npub": PEER_NPUB, "unblock": True},
+            ]
+            assert sidecar.block_headers[0].get("X-Hermes-Sidecar-Token") == token
+        finally:
+            sidecar.stop()
 
     def test_ensure_home_community_seeds_allowlist(self, monkeypatch, tmp_path):
         token = "a" * 64

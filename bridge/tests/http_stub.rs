@@ -397,13 +397,105 @@ fn payload_over_64kib_is_413() {
 }
 
 #[test]
-fn v1_1_routes_are_501() {
+fn post_block_requires_npub_and_ready() {
     let server = spawn_server(&[]);
-    for path in ["/block"] {
-        let (status, body) = post(&server, path, Some(&server.token), json!({}));
-        assert_eq!(status, 501, "{path} {body}");
-        assert_eq!(body["code"], "not_implemented", "{path}");
-    }
+    let (status, body) = post(&server, "/block", Some(&server.token), json!({}));
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let (status, body) = post(
+        &server,
+        "/block",
+        Some(&server.token),
+        json!({"npub": "npub1abc"}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "invalid_npub");
+
+    let (status, body) = post(
+        &server,
+        "/block",
+        Some(&server.token),
+        json!({"npub": VALID_NPUB}),
+    );
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready");
+
+    let (status, body) = get(&server, "/block", Some(&server.token));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready");
+
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/block",
+        Some(&server.token),
+        json!({"npub": VALID_NPUB}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["npub"], VALID_NPUB);
+    assert_eq!(body["blocked"], true);
+
+    let (status, body) = post(
+        &server,
+        "/block",
+        Some(&server.token),
+        json!({"npub": VALID_NPUB, "unblock": true}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["blocked"], false);
+
+    let (status, body) = get(&server, "/block", Some(&server.token));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["blocked"], json!([]));
+
+    let (status, body) = post(&server, "/block", None, json!({"npub": VALID_NPUB}));
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["code"], "unauthorized");
+}
+
+#[test]
+fn post_delete_requires_target_and_ready() {
+    let server = spawn_server(&[]);
+    let (status, body) = post(
+        &server,
+        "/delete",
+        Some(&server.token),
+        json!({"to": VALID_NPUB, "message_id": "deadbeef"}),
+    );
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready");
+
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/delete",
+        Some(&server.token),
+        json!({"to": VALID_NPUB}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let (status, body) = post(
+        &server,
+        "/delete",
+        Some(&server.token),
+        json!({"to": VALID_NPUB, "message_id": "deadbeef"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["id"], "deadbeef");
+
+    let channel = "a".repeat(64);
+    let (status, body) = post(
+        &server,
+        "/delete",
+        Some(&server.token),
+        json!({"to": channel, "message_id": "cafebabe"}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], "cafebabe");
 }
 
 #[test]

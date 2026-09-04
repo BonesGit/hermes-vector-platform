@@ -212,6 +212,29 @@ applies). Chatter that is not a registered command stays mention-gated.
 DM still reaches Hermes as plain text. This is **not** Concord kick/ban/invite
 — those stay operator tools, not room slash commands.
 
+## Block list and deletes
+
+**Mute a DM peer** (Vector's block list, not a Concord kick/ban). Only from
+the **`VECTOR_HOME_CHANNEL` DM** (your npub talking to the bot), type:
+
+| Command | Effect |
+|---------|--------|
+| `/block <npub>` | Mute that peer. Their DMs are dropped (no pairing, no turn). |
+| `/unblock <npub>` | Unmute. |
+| `/blocked` | List muted npubs. |
+
+These are **not** on the Vector `/` picker. The sidecar also exposes
+`POST /block` `{npub, unblock?}` and `GET /block`. Blocking the bot or
+yourself is refused.
+
+**Retract a bot message:** Hermes calls `delete_message` → `POST /delete`
+`{to, message_id}` → `Channel::delete` (DM or Concord). Used for ephemeral
+TTL and stream-preview cleanup.
+
+**Inbound deletes:** `BotEvent::Delete` is SSE `message_delete`. The adapter
+forgets last-inbound / pending-file pointers for that id and does **not**
+start a Hermes turn.
+
 ## Files / attachments
 
 Inbound files from allowlisted peers are decrypted into:

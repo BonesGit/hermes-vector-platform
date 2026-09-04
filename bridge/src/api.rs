@@ -613,7 +613,7 @@ async fn send_file(
     _auth: Auth,
     JsonBody(req): JsonBody<SendFileRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let npub = parse_npub(&req.to)?;
+    let to = parse_send_target(&req.to)?;
     state.require_ready().await?;
     let path = PathBuf::from(&req.path);
     if !path.is_absolute() || !path.is_file() {
@@ -622,7 +622,7 @@ async fn send_file(
         ));
     }
     if let Some(bot) = state.bot().await {
-        let id = bot.dm(&npub).send_file(&path).await.map_err(|err| {
+        let id = bot.channel(&to).send_file(&path).await.map_err(|err| {
             eprintln!("[vector-bridge] send_file failed: {err}");
             ApiError::internal()
         })?;

@@ -136,6 +136,7 @@ flowchart LR
 | `VECTOR_INVITE_POLICY` | no | `whitelist` (default) or `manual`. `public` is refused. |
 | `VECTOR_CREATE_COMMUNITY` | no | `on` = after Ready, create or reuse a bot-owned private community (`sdk/home-community.json`) and **direct-invite** `VECTOR_ALLOWED_USERS`. No public invite link. Does **not** add the channel to `VECTOR_GROUP_ALLOW_ALL`. |
 | `VECTOR_COMMUNITY_NAME` | no | Name used with `VECTOR_CREATE_COMMUNITY` (default `Hermes`). |
+| `VECTOR_COMMUNITY_DOWNLOAD_ALL` | no | `on` = download every community file on arrival (default **off**). Off = stash metadata only; download when someone replies to that file and @mentions the bot. |
 | `VECTOR_SLASH_COMMANDS` | no | `off` = do not publish the Vector `/` picker manifest (kind 10304). Default **on**. Typed `/approve` still works in DMs. |
 
 `VECTOR_SIDECAR_TOKEN` is generated at spawn time and is **not** a plugin.yaml env var. Never put nsec in the sidecar environment or in the plugin install tree.
@@ -180,7 +181,14 @@ The Vector app does not display channel ids. When the bot joins (trusted invite,
 
 **Bot-owned home room:** set `VECTOR_CREATE_COMMUNITY=on`. After Ready the sidecar creates or reuses a private community, persists `sdk/home-community.json` (restart will not create a second one), and direct-invites `VECTOR_ALLOWED_USERS`. No public invite URL, and the new channel is **not** written into `VECTOR_GROUP_ALLOW_ALL`. Direct-invited allowlisted members can already @mention; anyone else needs `VECTOR_GROUP_ALLOWED_USERS` or the channel id in `VECTOR_GROUP_ALLOW_ALL`.
 
-Community **file attachments** and **reactions** are DM-only. Missed-❌ catch-up is DM-only. Concord channels are text + slash commands.
+Community **reactions** and missed-❌ catch-up stay DM-only. Concord channels
+are text, slash commands, and **file attachments**. The Vector app sends group
+files with no caption and no @mention on that event. Default: the bot stashes
+metadata and **does not download** until someone **replies to that file** and
+@mentions the bot. A mention-only reply stores the file (session breadcrumb, no
+AI turn). Extra text on that reply starts a turn with `media_urls`. Set
+`VECTOR_COMMUNITY_DOWNLOAD_ALL=on` to download every group file on arrival
+(still silent in the room); the same reply+mention flow starts a turn.
 
 ## Slash commands
 
@@ -206,14 +214,17 @@ Inbound files from allowlisted peers are decrypted into:
 
 ```text
 ~/.hermes/plugin-data/vector-platform/files/inbox/{npub}/{YYYY-MM-DD}/
+~/.hermes/plugin-data/vector-platform/files/inbox/{channel-id}/{npub}/{YYYY-MM-DD}/
 ```
 
-A sibling `.meta.json` and an append-only `files/index.jsonl` record original name, size, mime, and Vector event id. **No outbox copies** — files Hermes sends you exist only on Vector.
+(DMs use the peer npub path; community files nest under the 64-hex channel id.) A sibling `.meta.json` and an append-only `files/index.jsonl` record original name, size, mime, and Vector event id. **No outbox copies** — files Hermes sends you exist only on Vector.
 
-- **File, no caption:** saved, Vector ack (`saved notes.pdf`), and a session breadcrumb (so a later “process the pdf I sent” can see the path). The AI turn is **not** started. Sequential files from the same peer accumulate until the next text, which is attached as `media_urls`.
-- **File + text:** saved, then a normal Hermes turn with `media_urls` (images → vision, voice → STT, documents → path note).
+- **File, no caption (DMs):** saved, Vector ack (`saved notes.pdf`), and a session breadcrumb (so a later “process the pdf I sent” can see the path). The AI turn is **not** started. Sequential files from the same peer accumulate until the next text, which is attached as `media_urls`.
+- **File + text (DMs):** saved, then a normal Hermes turn with `media_urls` (images → vision, voice → STT, documents → path note).
 
-Unauthorized senders are not downloaded. Hermes outbound media uses `POST /send-file` (`send_image` / `send_document` / video / voice). Caption is a follow-up text DM (Vector’s SDK `send_file` has no caption field).
+**DMs:** unauthorized senders are not downloaded. File-only DMs are saved, acked, and breadcrumbed (no AI turn) until the next text.
+
+**Communities:** the Vector app cannot @mention on a file send. Default (`VECTOR_COMMUNITY_DOWNLOAD_ALL` off): stash attachment metadata; **download only when a people-gated member replies to that file and @mentions the bot**. Mention-only reply → silent store + session breadcrumb, no turn. Mention + extra text → turn with `media_urls`. `VECTOR_COMMUNITY_DOWNLOAD_ALL=on` downloads every group file on arrival (no room ack); reply+mention still starts the turn. Outbound `send_image` / `send_document` / video / voice already target the channel.
 
 ## Cron delivery
 
@@ -252,7 +263,8 @@ If inbound is silent: check `~/.hermes/logs/vector-bridge.log`, that `/health` i
 
 1. Create a community in the Vector app and direct-invite the bot. Confirm `vector-bridge.log` shows `community invite` (auto-join if you are allowlisted). You should get a DM from the bot with `channel_id: <64-hex>` (needed for `VECTOR_GROUP_ALLOW_ALL`).
 2. In that channel, `@mention` the bot (or reply to a bot message, or `/approve` / `/deny` from the `/` picker). Hermes session key is `agent:main:vector:group:<channel-hex>`. Unmentioned chatter must not start a turn.
-3. A random npub inviting the bot into another community must stay parked (not on the whitelist) — no join DM.
+3. Drop a file in the channel (no mention on that send — Vector has none). Default: it is **not** downloaded yet. Reply to that file bubble and `@mention` the bot: mention-only stores it (no turn); add a question in the reply to start a turn with `media_urls`. `VECTOR_COMMUNITY_DOWNLOAD_ALL=on` saves files on arrival. Ask Hermes to send a file back — it should land in the channel, not a DM.
+4. A random npub inviting the bot into another community must stay parked (not on the whitelist) — no join DM.
 
 ## Security notes
 
@@ -277,7 +289,7 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 | Lost the bot / contacts don't recognize it | Restoring needs `identity.nsec` **or** `identity.mnemonic`. Replacing the nsec **is** a new bot (new npub, lost DMs). Identities minted before mnemonic-on-create, or imported from nsec only, have no seed file. |
 | Sidecar is a stub / no live DMs | `VECTOR_STUB` must **not** be set in the gateway. Production `connect()` strips it. Only HTTP unit tests set it (binds without `VectorBot::build`). |
 | Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `VECTOR_MISSED_REACT=off` disables. Agent react/unreact and optional 👀/✅/❌ acks: see `VECTOR_REACTIONS` above. |
-| Group messages ignored | The bot must have **joined** (trusted inviter). Then the sender needs `VECTOR_ALLOWED_USERS`, `VECTOR_GROUP_ALLOWED_USERS`, or the channel in `VECTOR_GROUP_ALLOW_ALL`. Mentions (`@bot npub` / `@VECTOR_BOT_NAME`), a reply to the bot, or a registered slash command (`/approve`, `/deny`, …) are required; `@everyone` is ignored. Pairing is not sent in groups. |
+| Group messages ignored | The bot must have **joined** (trusted inviter). Then the sender needs `VECTOR_ALLOWED_USERS`, `VECTOR_GROUP_ALLOWED_USERS`, or the channel in `VECTOR_GROUP_ALLOW_ALL`. Mentions (`@bot npub` / `@VECTOR_BOT_NAME`), a reply to the bot, or a registered slash command (`/approve`, `/deny`, …) are required; `@everyone` is ignored. Pairing is not sent in groups. Group files download when you **reply to the file and @mention** the bot (or set `VECTOR_COMMUNITY_DOWNLOAD_ALL=on`). |
 | Slash `/approve` missing from the Vector picker | Sidecar must be rebuilt after this feature (`hermes gateway setup` / `cargo build --release` in `bridge/`). `VECTOR_SLASH_COMMANDS` must not be `off`. Kind-10304 publishes in the background after `BotEvent::Ready` (does not block gateway start). Type `/` in a chat with the bot. Typed `/approve` in a DM works even without the picker. |
 | Bot not joining a community | Inviter npub must be in `VECTOR_TRUSTED_INVITERS` or `VECTOR_ALLOWED_USERS`. `VECTOR_INVITE_POLICY=manual` parks all invites. Check `/health` `pending_invites`. |
 | Cron `deliver=vector` fails | Gateway must be running. Cron reads `~/.hermes/runtime/vector-sidecar.json` (`0600`, port + token). |

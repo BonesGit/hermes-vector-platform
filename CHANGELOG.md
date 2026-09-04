@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Concord **community file attachments** (same Blossom path as DMs). The Vector
+  app sends group files with empty caption (no @mention on that event). Default:
+  stash metadata; download when a people-gated member **replies to that file**
+  and @mentions the bot. Mention-only reply = silent store + session breadcrumb
+  (no turn). Mention + extra text = turn with `media_urls`.
+  `VECTOR_COMMUNITY_DOWNLOAD_ALL=on` downloads every group file on arrival.
+  Inbox: `files/inbox/{channel-id}/{npub}/{date}/`. Outbound `send_image` /
+  `send_document` / video / voice target a 64-hex channel via `POST /send-file`
+  (`bot.channel().send_file`).
 - Identity **create** mints a NIP-06 12-word BIP-39 mnemonic and writes it
   next to the nsec as `sdk/identity.mnemonic` (`0600`). Mnemonic import
   copies the phrase there too. Nsec-only import cannot invent a seed.

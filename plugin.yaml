@@ -111,6 +111,10 @@ optional_env:
     description: "Name for VECTOR_CREATE_COMMUNITY (default Hermes)"
     prompt: "Home community name"
     password: false
+  - name: VECTOR_COMMUNITY_DOWNLOAD_ALL
+    description: "on = download every community file on arrival (default off). Off = download only when someone replies to that file and @mentions the bot."
+    prompt: "Download all community files on arrival? (on/off, default off)"
+    password: false
   - name: VECTOR_SLASH_COMMANDS
     description: "off = do not publish Vector / picker commands (kind 10304). Default on. Typed /approve still works in DMs."
     prompt: "Publish Vector slash commands? (on/off)"

@@ -472,6 +472,17 @@ fn send_file_stub_requires_absolute_file() {
     );
     assert_eq!(status, 200, "{body}");
     assert!(body["id"].as_str().unwrap().len() >= 8);
+
+    let channel = "a".repeat(64);
+    let tmp_ch = tempfile::NamedTempFile::new().unwrap();
+    let (status, body) = post(
+        &server,
+        "/send-file",
+        Some(&server.token),
+        json!({"to": channel, "path": tmp_ch.path().to_string_lossy()}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body["id"].as_str().unwrap().len() >= 8);
 }
 
 #[test]

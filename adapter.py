@@ -22,6 +22,7 @@ Required env vars / config.extra keys:
     VECTOR_TRUSTED_INVITERS      Optional inviter npubs (default: ALLOWED_USERS)
     VECTOR_INVITE_POLICY         manual | whitelist (default whitelist)
     VECTOR_CREATE_COMMUNITY      on = bot-owned home community after Ready
+    VECTOR_COMMUNITY_DOWNLOAD_ALL  on = save every group file on arrival (default off)
     VECTOR_SLASH_COMMANDS        off = do not publish Vector / picker commands
 """
 
@@ -496,6 +497,22 @@ def normalize_channel_id(ref: str) -> Optional[str]:
     return None
 
 
+def _send_target(chat_id: str) -> str:
+    """Sidecar ``to``: 64-hex channel first (do not encode as npub), else npub."""
+    channel = normalize_channel_id(chat_id)
+    if channel:
+        return channel
+    return normalize_npub(chat_id) or (chat_id or "").strip()
+
+
+def _pending_inbox_key(peer: str, channel_id: Optional[str] = None) -> str:
+    """Pending file-only inbox: DM = peer npub; group = ``{channel}:{peer}``."""
+    cid = normalize_channel_id(channel_id or "") if channel_id else None
+    if cid:
+        return f"{cid}:{peer}"
+    return peer
+
+
 def _parse_npub_target(ref: str) -> Optional[tuple[str, Optional[str]]]:
     """DM-only parse: hex / ``npub1`` / ``nostr:npub1`` → ``(npub, None)``."""
     npub = normalize_npub(ref)
@@ -616,6 +633,38 @@ def _mentions_bot(text: str, bot_npub: Optional[str], bot_name: Optional[str] = 
     if name and re.search(rf"@{re.escape(name)}\b", body, re.IGNORECASE):
         return True
     return False
+
+
+def _mention_remainder(
+    text: str, bot_npub: Optional[str], bot_name: Optional[str] = None
+) -> str:
+    """Text with bot @mentions stripped. Empty means mention-only (no extra ask)."""
+    body = text or ""
+    npub = normalize_npub(bot_npub or "") if bot_npub else None
+    if npub:
+        body = body.replace(f"@{npub}", " ")
+        body = body.replace(f"nostr:{npub}", " ")
+        body = re.sub(
+            rf"(?<![A-Za-z0-9]){re.escape(npub)}(?![A-Za-z0-9])", " ", body
+        )
+    name = (bot_name or "").strip()
+    if name:
+        body = re.sub(rf"@{re.escape(name)}\b", " ", body, flags=re.IGNORECASE)
+    return " ".join(body.split())
+
+
+def _community_download_all() -> bool:
+    """VECTOR_COMMUNITY_DOWNLOAD_ALL default off. on = ingest every group file."""
+    return _env_flag("VECTOR_COMMUNITY_DOWNLOAD_ALL") in ("1", "true", "yes", "on")
+
+
+def _group_file_pending_path(channel_id: str, msg_id: str) -> Path:
+    safe_id = _sanitize_filename(msg_id or "event")
+    return resolve_files_root() / "pending" / channel_id / f"{safe_id}.json"
+
+
+def _group_file_pointer_path(msg_id: str) -> Path:
+    return resolve_files_root() / "by-event" / f"{_sanitize_filename(msg_id or 'event')}.json"
 
 
 def _reply_to_bot(reply_to: Optional[str], sent_ids) -> bool:
@@ -842,8 +891,8 @@ class VectorAdapter(BasePlatformAdapter):
         self._last_inbound_by_chat: OrderedDict[str, str] = OrderedDict()
         self._sent_message_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_reaction_ids: OrderedDict[str, None] = OrderedDict()
-        # File-only saves waiting to be attached to the next text from that peer.
-        # Sequential Vector DMs (one file per event) append here until that text.
+        # File-only saves waiting to be attached to the next gated text.
+        # DMs key by peer npub; groups key by ``{channel_id}:{peer}``.
         self._pending_inbox: Dict[str, List[Tuple[str, str]]] = {}
         self._notified_channel_ids: set = _load_notified_channel_ids(self.data_dir)
 
@@ -1568,11 +1617,11 @@ class VectorAdapter(BasePlatformAdapter):
         if not safe:
             logger.warning("Vector: refusing unsafe outbound path")
             return SendResult(success=False, error="unsafe media path", retryable=False)
-        npub = normalize_npub(chat_id) or (chat_id or "").strip()
+        to = _send_target(chat_id)
         try:
             resp = await self._http_client.post(
                 f"{self.bridge_url}/send-file",
-                json={"to": npub, "path": safe},
+                json={"to": to, "path": safe},
                 headers=self._token_headers(),
                 timeout=SEND_FILE_TIMEOUT,
             )
@@ -1594,7 +1643,7 @@ class VectorAdapter(BasePlatformAdapter):
             file_id = data.get("id") or data.get("messageId")
         if caption and str(caption).strip():
             cap = await self.send(
-                chat_id=npub,
+                chat_id=to,
                 content=str(caption).strip(),
                 reply_to=reply_to,
                 metadata=metadata,
@@ -1795,17 +1844,12 @@ class VectorAdapter(BasePlatformAdapter):
                 peer, attachments, msg_id=msg_id, caption=text, at_ms=msg_data.get("at_ms")
             )
 
+        pending_key = _pending_inbox_key(peer)
         if is_file and not text.strip():
             if _sender_is_authorized(peer):
                 await self._ack_file_only(peer, saved)
                 await self._write_inbox_breadcrumb(source, saved)
-                pending = self._pending_inbox.setdefault(peer, [])
-                seen = {p for p, _m in pending}
-                for path, _att, mime in saved:
-                    key = str(path)
-                    if key not in seen:
-                        pending.append((key, mime))
-                        seen.add(key)
+                self._queue_pending_inbox(pending_key, saved)
             elif _pairing_enabled():
                 event = MessageEvent(
                     text="(file attachment)",
@@ -1817,20 +1861,9 @@ class VectorAdapter(BasePlatformAdapter):
                 await self.handle_message(event)
             return
 
-        media_urls: List[str] = []
-        media_types: List[str] = []
-        msg_type = MessageType.TEXT
-        if saved:
-            media_urls = [str(path) for path, _att, _mime in saved]
-            media_types = [mime for _path, _att, mime in saved]
-        elif not is_file:
-            pending = self._pending_inbox.pop(peer, [])
-            media_urls = [p for p, _m in pending]
-            media_types = [m for _p, m in pending]
-        if media_types:
-            msg_type = _message_type_for_mime(media_types[0])
-        if saved:
-            self._pending_inbox.pop(peer, None)
+        media_urls, media_types, msg_type = self._media_for_event(
+            pending_key, saved, is_file=is_file
+        )
 
         event = MessageEvent(
             text=text,
@@ -1844,7 +1877,15 @@ class VectorAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     async def _handle_group_message(self, msg_data: dict) -> None:
-        """Mention-gated Concord channel message → Hermes ``chat_type=group``."""
+        """Mention-gated Concord channel message → Hermes ``chat_type=group``.
+
+        Vector's client sends community files with empty caption (no @mention on
+        the file event). Default: stash metadata only, download when someone
+        replies to that file and @mentions the bot. Mention-only reply = store
+        + session breadcrumb, no turn. Mention + extra text = turn with
+        ``media_urls``. ``VECTOR_COMMUNITY_DOWNLOAD_ALL=on`` downloads on
+        arrival (still silent; the same reply+mention starts a turn).
+        """
         raw_chat = str(msg_data.get("chat_id") or "")
         channel_id = normalize_channel_id(raw_chat)
         if not channel_id:
@@ -1861,8 +1902,14 @@ class VectorAdapter(BasePlatformAdapter):
             return
 
         text = str(msg_data.get("text") or "")
-        if not text.strip():
-            logger.debug("Vector: skip empty/file-only group message id=%s", msg_id[:16])
+        attachments = (
+            msg_data.get("attachments")
+            if isinstance(msg_data.get("attachments"), list)
+            else []
+        )
+        is_file = bool(msg_data.get("is_file") or attachments)
+        if not text.strip() and not is_file:
+            logger.debug("Vector: skip empty group message id=%s", msg_id[:16])
             return
 
         raw_peer = msg_data.get("npub") or ""
@@ -1873,6 +1920,34 @@ class VectorAdapter(BasePlatformAdapter):
         bot_npub = normalize_npub(self._npub or "") if self._npub else None
         if bot_npub and peer == bot_npub:
             return
+
+        community_id = str(msg_data.get("community_id") or "") or None
+        at_ms = msg_data.get("at_ms")
+
+        if is_file and attachments and msg_id:
+            self._stash_group_file_pending(
+                channel_id,
+                msg_id,
+                peer=peer,
+                attachments=attachments,
+                community_id=community_id,
+                at_ms=at_ms,
+            )
+            if _community_download_all():
+                saved = await self._ingest_group_file_event(
+                    channel_id,
+                    msg_id,
+                    caption=text,
+                )
+                if saved:
+                    await self._write_inbox_breadcrumb(
+                        self._group_source(
+                            channel_id, peer, msg_id, community_id
+                        ),
+                        saved,
+                    )
+            if not text.strip():
+                return
 
         reply_to = str(msg_data.get("reply_to") or "")
         is_command = bool(msg_data.get("is_command"))
@@ -1894,30 +1969,44 @@ class VectorAdapter(BasePlatformAdapter):
         if msg_id:
             self._record_last_inbound(channel_id, msg_id)
 
-        name = _truncate_npub(peer)
-        community_id = str(msg_data.get("community_id") or "") or None
-        chat_name = _truncate_npub(community_id or channel_id)
-        source = self.build_source(
-            chat_id=channel_id,
-            chat_name=chat_name,
-            chat_type="group",
-            user_id=peer,
-            user_name=name,
-            message_id=msg_id or None,
-            parent_chat_id=community_id,
-            scope_id=community_id,
-            # Adapter already applied the group people-gate. Hermes has no
-            # group_allowed_users_env hook; this is the Discord-style
-            # "adapter admitted this sender" bit so group-only npubs and
-            # VECTOR_GROUP_ALLOW_ALL members are not dropped at the gateway.
-            role_authorized=True,
+        source = self._group_source(channel_id, peer, msg_id, community_id)
+        reply_to_text = msg_data.get("reply_to_text") or None
+
+        saved: List[Tuple[Path, dict, str]] = []
+        if reply_to:
+            saved = await self._ingest_group_file_event(
+                channel_id, reply_to, caption=text
+            )
+        if is_file and attachments and msg_id:
+            this_saved = await self._ingest_group_file_event(
+                channel_id, msg_id, caption=text
+            )
+            saved.extend(this_saved)
+
+        remainder = _mention_remainder(text, bot_npub, self.bot_name)
+        mention_only = (
+            saved
+            and not remainder
+            and not _group_slash_command(text, is_command=is_command)
+            and not _reply_to_bot(reply_to, self._sent_message_ids)
         )
+        if mention_only:
+            await self._write_inbox_breadcrumb(source, saved)
+            return
+
+        media_urls = [str(path) for path, _att, _mime in saved]
+        media_types = [mime for _path, _att, mime in saved]
+        msg_type = MessageType.TEXT
+        if media_types:
+            msg_type = _message_type_for_mime(media_types[0])
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=msg_type,
             source=source,
             message_id=msg_id or None,
-            reply_to_text=msg_data.get("reply_to_text") or None,
+            reply_to_text=reply_to_text,
+            media_urls=media_urls,
+            media_types=media_types,
         )
         await self.handle_message(event)
 
@@ -1996,6 +2085,175 @@ class VectorAdapter(BasePlatformAdapter):
             seen.popitem(last=False)
         return False
 
+    def _queue_pending_inbox(
+        self, key: str, saved: List[Tuple[Path, dict, str]]
+    ) -> None:
+        pending = self._pending_inbox.setdefault(key, [])
+        seen = {p for p, _m in pending}
+        for path, _att, mime in saved:
+            path_key = str(path)
+            if path_key not in seen:
+                pending.append((path_key, mime))
+                seen.add(path_key)
+
+    def _media_for_event(
+        self,
+        key: str,
+        saved: List[Tuple[Path, dict, str]],
+        *,
+        is_file: bool,
+    ) -> Tuple[List[str], List[str], MessageType]:
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        msg_type = MessageType.TEXT
+        if saved:
+            media_urls = [str(path) for path, _att, _mime in saved]
+            media_types = [mime for _path, _att, mime in saved]
+        elif not is_file:
+            pending = self._pending_inbox.pop(key, [])
+            media_urls = [p for p, _m in pending]
+            media_types = [m for _p, m in pending]
+        if media_types:
+            msg_type = _message_type_for_mime(media_types[0])
+        if saved:
+            self._pending_inbox.pop(key, None)
+        return media_urls, media_types, msg_type
+
+    def _group_source(self, channel_id: str, peer: str, msg_id: str, community_id: Optional[str]):
+        name = _truncate_npub(peer)
+        chat_name = _truncate_npub(community_id or channel_id)
+        return self.build_source(
+            chat_id=channel_id,
+            chat_name=chat_name,
+            chat_type="group",
+            user_id=peer,
+            user_name=name,
+            message_id=msg_id or None,
+            parent_chat_id=community_id,
+            scope_id=community_id,
+            role_authorized=True,
+        )
+
+    def _stash_group_file_pending(
+        self,
+        channel_id: str,
+        msg_id: str,
+        *,
+        peer: str,
+        attachments: List[dict],
+        community_id: Optional[str],
+        at_ms: Any,
+    ) -> None:
+        path = _group_file_pending_path(channel_id, msg_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "channel_id": channel_id,
+                        "msg_id": msg_id,
+                        "peer": peer,
+                        "attachments": attachments,
+                        "community_id": community_id or "",
+                        "at_ms": at_ms,
+                    },
+                    default=str,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.warning("Vector: failed to stash group file metadata id=%s", msg_id[:16])
+
+    def _load_group_file_pointer(
+        self, msg_id: str
+    ) -> List[Tuple[Path, dict, str]]:
+        path = _group_file_pointer_path(msg_id)
+        if not path.is_file():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return []
+        rows = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
+        saved: List[Tuple[Path, dict, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            file_path = Path(str(row.get("path") or ""))
+            if not file_path.is_file():
+                return []
+            mime = str(row.get("mime") or "application/octet-stream")
+            att = {
+                "id": row.get("attachment_id") or "",
+                "name": row.get("name") or file_path.name,
+            }
+            saved.append((file_path, att, mime))
+        return saved
+
+    def _write_group_file_pointer(
+        self, msg_id: str, saved: List[Tuple[Path, dict, str]]
+    ) -> None:
+        if not msg_id or not saved:
+            return
+        path = _group_file_pointer_path(msg_id)
+        payload = {
+            "msg_id": msg_id,
+            "files": [
+                {
+                    "path": str(file_path),
+                    "mime": mime,
+                    "name": att.get("name") or file_path.name,
+                    "attachment_id": att.get("id"),
+                }
+                for file_path, att, mime in saved
+            ],
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            logger.warning("Vector: failed to write by-event pointer for %s", msg_id[:16])
+
+    async def _ingest_group_file_event(
+        self,
+        channel_id: str,
+        event_id: str,
+        *,
+        caption: str,
+    ) -> List[Tuple[Path, dict, str]]:
+        """Return already-saved bytes for ``event_id``, or download from pending metadata."""
+        existing = self._load_group_file_pointer(event_id)
+        if existing:
+            return existing
+        pending_path = _group_file_pending_path(channel_id, event_id)
+        if not pending_path.is_file():
+            return []
+        try:
+            data = json.loads(pending_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        attachments = data.get("attachments")
+        if not isinstance(attachments, list) or not attachments:
+            return []
+        peer = str(data.get("peer") or "")
+        saved = await self._save_inbound_attachments(
+            peer,
+            attachments,
+            msg_id=event_id,
+            caption=caption,
+            at_ms=data.get("at_ms"),
+            channel_id=channel_id,
+            community_id=str(data.get("community_id") or "") or None,
+        )
+        if saved:
+            self._write_group_file_pointer(event_id, saved)
+        return saved
+
     async def _save_inbound_attachments(
         self,
         peer: str,
@@ -2004,8 +2262,10 @@ class VectorAdapter(BasePlatformAdapter):
         msg_id: str,
         caption: str,
         at_ms: Any,
+        channel_id: Optional[str] = None,
+        community_id: Optional[str] = None,
     ) -> List[Tuple[Path, dict, str]]:
-        """Download attachments into files/inbox/{npub}/{YYYY-MM-DD}/."""
+        """Download attachments into files/inbox/{npub|channel/npub}/{YYYY-MM-DD}/."""
         saved: List[Tuple[Path, dict, str]] = []
         max_bytes = _inbound_media_max_bytes()
         try:
@@ -2014,7 +2274,11 @@ class VectorAdapter(BasePlatformAdapter):
             when = datetime.now()
         day = when.strftime("%Y-%m-%d")
         stamp = when.strftime("%H%M%S")
-        inbox = resolve_files_root() / "inbox" / peer / day
+        cid = normalize_channel_id(channel_id or "") if channel_id else None
+        if cid:
+            inbox = resolve_files_root() / "inbox" / cid / peer / day
+        else:
+            inbox = resolve_files_root() / "inbox" / peer / day
         author = peer
         for i, att in enumerate(attachments):
             if not isinstance(att, dict):
@@ -2055,6 +2319,10 @@ class VectorAdapter(BasePlatformAdapter):
                 "caption": caption or "",
                 "saved_at": time.time(),
             }
+            if cid:
+                meta["channel_id"] = cid
+            if community_id:
+                meta["community_id"] = community_id
             try:
                 path.with_name(path.name + ".meta.json").write_text(
                     json.dumps(meta, indent=2) + "\n", encoding="utf-8"
@@ -2112,16 +2380,16 @@ class VectorAdapter(BasePlatformAdapter):
         except OSError:
             logger.warning("Vector: failed to append files/index.jsonl")
 
-    async def _ack_file_only(self, peer: str, saved: List[Tuple[Path, dict, str]]) -> None:
+    async def _ack_file_only(self, chat_id: str, saved: List[Tuple[Path, dict, str]]) -> None:
         if not saved:
-            await self.send(chat_id=peer, content="couldn't save attachment")
+            await self.send(chat_id=chat_id, content="couldn't save attachment")
             return
         names = [path.name.split("-", 1)[-1] if "-" in path.name else path.name for path, *_ in saved]
         if len(names) == 1:
             body = f"saved {names[0]}"
         else:
             body = f"saved {len(names)} files: " + ", ".join(names)
-        await self.send(chat_id=peer, content=body)
+        await self.send(chat_id=chat_id, content=body)
 
     async def _write_inbox_breadcrumb(
         self, source, saved: List[Tuple[Path, dict, str]]

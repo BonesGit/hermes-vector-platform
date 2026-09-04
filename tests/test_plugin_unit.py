@@ -180,6 +180,22 @@ class TestParseTargetRef:
         assert vector_adapter._parse_target_ref("garbage") is None
 
 
+class TestSendTarget:
+    def test_channel_hex_not_encoded_as_npub(self):
+        assert vector_adapter._send_target(CHANNEL_ID) == CHANNEL_ID
+        assert vector_adapter._send_target(CHANNEL_ID.upper()) == CHANNEL_ID
+
+    def test_npub_canonical(self):
+        assert vector_adapter._send_target(NPUB) == NPUB
+
+    def test_pending_key_group_vs_dm(self):
+        assert vector_adapter._pending_inbox_key(PEER_NPUB) == PEER_NPUB
+        assert (
+            vector_adapter._pending_inbox_key(PEER_NPUB, CHANNEL_ID)
+            == f"{CHANNEL_ID}:{PEER_NPUB}"
+        )
+
+
 class TestMentionsBot:
     def test_at_npub(self):
         assert vector_adapter._mentions_bot(f"hey @{NPUB}", NPUB)
@@ -198,6 +214,20 @@ class TestMentionsBot:
 
     def test_unrelated(self):
         assert not vector_adapter._mentions_bot("hello there", NPUB, "Hermes")
+
+
+class TestMentionRemainder:
+    def test_mention_only_npub(self):
+        assert vector_adapter._mention_remainder(f"@{NPUB}", NPUB, "Hermes") == ""
+
+    def test_mention_plus_ask(self):
+        assert (
+            vector_adapter._mention_remainder(f"@{NPUB} what's this", NPUB, "Hermes")
+            == "what's this"
+        )
+
+    def test_display_name_only(self):
+        assert vector_adapter._mention_remainder("@Hermes", NPUB, "Hermes") == ""
 
 
 class TestGroupSlashCommand:
@@ -756,6 +786,10 @@ def _make_adapter(monkeypatch, tmp_path, **extra):
         monkeypatch.setenv("VECTOR_CREATE_COMMUNITY", "on")
     else:
         monkeypatch.delenv("VECTOR_CREATE_COMMUNITY", raising=False)
+    if extra.get("community_download_all"):
+        monkeypatch.setenv("VECTOR_COMMUNITY_DOWNLOAD_ALL", "on")
+    else:
+        monkeypatch.delenv("VECTOR_COMMUNITY_DOWNLOAD_ALL", raising=False)
     monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
     data_dir = Path(extra.get("data_dir") or (tmp_path / "sdk"))
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -3269,6 +3303,263 @@ class TestInboundFiles:
         assert not (tmp_path / "files" / "inbox").exists()
 
 
+class TestGroupFiles:
+    def _wire(self, adapter, tmp_path):
+        handled = []
+        downloads = []
+        acks = []
+        crumbs = []
+
+        async def capture(event):
+            handled.append(event)
+
+        async def fake_download(att, dest, *, author_npub):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"bytes")
+            downloads.append(str(dest))
+            return dest
+
+        async def fake_send(**kwargs):
+            acks.append(kwargs)
+            return vector_adapter.SendResult(success=True, message_id="ack")
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        adapter._download_attachment = fake_download  # type: ignore[method-assign]
+        adapter.send = fake_send  # type: ignore[method-assign]
+        adapter._append_session_breadcrumb = (  # type: ignore[method-assign]
+            lambda source, content: crumbs.append(content)
+        )
+        return handled, downloads, acks, crumbs
+
+    def _file_event(self, *, msg_id: str, **overrides):
+        data = dict(
+            is_group=True,
+            is_file=True,
+            chat_id=CHANNEL_ID,
+            community_id="cc" * 32,
+            attachments=[
+                {"id": "a", "name": "notes.pdf", "extension": "pdf", "size": 4}
+            ],
+        )
+        data.update(overrides)
+        return _message_event(PEER_NPUB, "", msg_id=msg_id, **data)
+
+    def test_file_only_not_downloaded_by_default(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        handled, downloads, acks, crumbs = self._wire(adapter, tmp_path)
+        asyncio.run(
+            adapter._handle_message_event(self._file_event(msg_id="g-file-quiet"))
+        )
+        assert handled == []
+        assert downloads == []
+        assert acks == []
+        assert crumbs == []
+        assert not (tmp_path / "files" / "inbox").exists()
+        pending = vector_adapter._group_file_pending_path(CHANNEL_ID, "g-file-quiet")
+        assert pending.is_file()
+
+    def test_reply_mention_only_downloads_no_turn(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        handled, downloads, acks, crumbs = self._wire(adapter, tmp_path)
+        asyncio.run(
+            adapter._handle_message_event(self._file_event(msg_id="g-file-1"))
+        )
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB}",
+                    msg_id="g-reply-only",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    reply_to="g-file-1",
+                )
+            )
+        )
+        assert handled == []
+        assert downloads
+        assert acks == []
+        assert crumbs and "notes.pdf" in crumbs[0]
+        inbox = list((tmp_path / "files" / "inbox" / CHANNEL_ID).rglob("*.pdf"))
+        assert len(inbox) == 1
+
+    def test_reply_mention_plus_text_takes_turn(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        handled, downloads, acks, _crumbs = self._wire(adapter, tmp_path)
+        asyncio.run(
+            adapter._handle_message_event(self._file_event(msg_id="g-file-2"))
+        )
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} what's in this",
+                    msg_id="g-reply-ask",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    reply_to="g-file-2",
+                )
+            )
+        )
+        assert len(handled) == 1
+        assert handled[0].source.chat_type == "group"
+        assert handled[0].media_urls
+        assert handled[0].message_type == vector_adapter.MessageType.DOCUMENT
+        assert downloads
+        assert acks == []
+
+    def test_reply_without_mention_not_downloaded(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        handled, downloads, acks, _crumbs = self._wire(adapter, tmp_path)
+        asyncio.run(
+            adapter._handle_message_event(self._file_event(msg_id="g-file-3"))
+        )
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "nice pdf",
+                    msg_id="g-reply-chat",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    reply_to="g-file-3",
+                )
+            )
+        )
+        assert handled == []
+        assert downloads == []
+        assert acks == []
+
+    def test_unauthorized_reply_mention_not_downloaded(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=NPUB
+        )
+        handled, downloads, _acks, _crumbs = self._wire(adapter, tmp_path)
+        asyncio.run(
+            adapter._handle_message_event(self._file_event(msg_id="g-file-4"))
+        )
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} look",
+                    msg_id="g-reply-unauth",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    reply_to="g-file-4",
+                )
+            )
+        )
+        assert handled == []
+        assert downloads == []
+
+    def test_same_event_file_plus_mention_still_works(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        handled, downloads, acks, _crumbs = self._wire(adapter, tmp_path)
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} what's in this",
+                    msg_id="g-file-cap",
+                    is_group=True,
+                    is_file=True,
+                    chat_id=CHANNEL_ID,
+                    attachments=[
+                        {"id": "g1", "name": "shot.png", "extension": "png", "size": 5}
+                    ],
+                )
+            )
+        )
+        assert len(handled) == 1
+        assert handled[0].media_urls
+        assert downloads
+        assert acks == []
+
+    def test_download_all_saves_file_only_silently(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=PEER_NPUB,
+            community_download_all=True,
+        )
+        handled, downloads, acks, crumbs = self._wire(adapter, tmp_path)
+        asyncio.run(
+            adapter._handle_message_event(self._file_event(msg_id="g-file-all"))
+        )
+        assert handled == []
+        assert downloads
+        assert acks == []
+        assert crumbs
+        inbox = list((tmp_path / "files" / "inbox" / CHANNEL_ID).rglob("*.pdf"))
+        assert len(inbox) == 1
+
+    def test_download_all_then_reply_mention_text_uses_saved(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
+        )
+        adapter = _make_adapter(
+            monkeypatch,
+            tmp_path,
+            npub=NPUB,
+            allowed_users=PEER_NPUB,
+            community_download_all=True,
+        )
+        handled, downloads, _acks, _crumbs = self._wire(adapter, tmp_path)
+        asyncio.run(
+            adapter._handle_message_event(self._file_event(msg_id="g-file-all-2"))
+        )
+        n_first = len(downloads)
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    f"@{NPUB} summarize this",
+                    msg_id="g-reply-all",
+                    is_group=True,
+                    chat_id=CHANNEL_ID,
+                    reply_to="g-file-all-2",
+                )
+            )
+        )
+        assert len(handled) == 1
+        assert handled[0].media_urls
+        assert Path(handled[0].media_urls[0]).is_file()
+        assert len(downloads) == n_first
+
+
 class TestOutboundFiles:
     def test_send_document_posts_send_file(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)
@@ -3303,6 +3594,42 @@ class TestOutboundFiles:
         assert any(p["url"].endswith("/send-file") for p in posts)
         assert posts[0]["json"]["path"] == str(payload)
         assert any(p["url"].endswith("/send") for p in posts)
+
+    def test_send_document_to_channel_posts_channel_id(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._running = True
+        payload = tmp_path / "out.pdf"
+        payload.write_bytes(b"pdf")
+        monkeypatch.setattr(
+            vector_adapter.VectorAdapter,
+            "validate_media_delivery_path",
+            staticmethod(lambda path, session_key="": str(path)),
+        )
+
+        class _Resp:
+            status_code = 200
+            content = b'{"id":"file1"}'
+
+            def json(self):
+                return {"id": "file1"}
+
+        posts = []
+
+        class _Client:
+            async def post(self, url, json=None, headers=None, timeout=None):
+                posts.append({"url": url, "json": json})
+                return _Resp()
+
+        adapter._http_client = _Client()
+        result = asyncio.run(
+            adapter.send_document(CHANNEL_ID, str(payload), caption="here")
+        )
+        assert result.success
+        file_post = next(p for p in posts if p["url"].endswith("/send-file"))
+        cap_post = next(p for p in posts if p["url"].endswith("/send"))
+        assert file_post["json"]["to"] == CHANNEL_ID
+        assert cap_post["json"]["to"] == CHANNEL_ID
+        assert not file_post["json"]["to"].startswith("npub1")
 
 
 _EYES = "\U0001f440"

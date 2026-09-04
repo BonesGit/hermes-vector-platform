@@ -66,7 +66,7 @@ logger = logging.getLogger("hermes_plugins.vector_platform.adapter")
 # ---------------------------------------------------------------------------
 # Plugin identity / paths
 # ---------------------------------------------------------------------------
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _BRIDGE_DIR = _PLUGIN_ROOT / "bridge"
 _DEFAULT_BRIDGE_BIN = _BRIDGE_DIR / "target" / "release" / "vector-bridge"

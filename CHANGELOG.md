@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-04
+
+Communities, slash commands, profile, reactions, mnemonic-on-disk, and
+community file attachments.
+
 ### Added
 
 - Concord **community file attachments** (same Blossom path as DMs). The Vector
@@ -92,10 +97,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `DESIGN.md` is local-only (gitignored); operator docs live in the README.
 - README: prerequisites before install; pip install notes that Rust is still
-  required; community files / reactions / missed-❌ are documented as DM-only.
+  required. Community files ship; reactions and missed-❌ stay DM-only.
 - Removed ``VECTOR_GROUP_ALLOWED_CHATS``. A trusted invite auto-join is
   enough for the bot to listen; mention/people gates still apply.
-
 - Sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk)
   `=0.9.0` (and `vector-core` `0.8`) instead of a sibling
   `../../Vector/crates/vector-sdk` path. GitHub Actions no longer checkouts
@@ -148,7 +152,7 @@ missed while the sidecar was down is **not** in v1 — the peer retries.
 
 - Requires Hermes Agent with the platform plugin registry (current `main`)
 - Requires Rust ≥ 1.75. Sidecar now depends on crates.io `vector_sdk` `=0.9.0`
-  (see Unreleased); v0.1.0 originally needed a sibling Vector checkout.
+  (see 0.3.0); v0.1.0 originally needed a sibling Vector checkout.
 - User plugins must be enabled: `hermes plugins enable vector-platform`
 - Sidecar binds `127.0.0.1:8096` by default; every route except `/live` needs
   the token. Do not set `VECTOR_STUB` in the gateway.

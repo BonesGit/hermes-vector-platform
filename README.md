@@ -127,7 +127,7 @@ flowchart LR
 | `VECTOR_BRIDGE_BIN` | no | Absolute path to `vector-bridge` |
 | `VECTOR_STARTUP_TIMEOUT` | no | Seconds to wait for sidecar `/health status=ready` (default `60`). The plugin floors `HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT` to `90` when that env is unset (Hermes default is `30`). |
 | `VECTOR_PAIRING` | no | `on` (default) = unknown npubs get a Hermes pairing code; `off` = drop them before `handle_message` |
-| `VECTOR_MISSED_REACT` | no | `off` to skip ❌ on DMs received while the sidecar was down (default on) |
+| `VECTOR_MISSED_REACT` | no | `off` to skip ❌ on DMs received while the sidecar was down (default on). Concord: missed messages are ignored (no ❌). |
 | `VECTOR_MISSED_REACT_EMOJI` | no | Override the missed-DM reaction (default ❌) |
 | `VECTOR_REACTIONS` | no | `on` = 👀 while the agent works, then ✅/❌ on the triggering DM (default **off**). Agent `send_message(action=react)` always works. |
 | `VECTOR_GROUP_ALLOWED_USERS` | no | Npubs who may trigger community turns **without** DM access. |
@@ -143,20 +143,21 @@ flowchart LR
 
 ## Display / tool progress
 
-Vector can edit messages, but this plugin has no `/edit` route yet. Setup merges only the `display.platforms.vector` mapping (comment-preserving when `ruamel.yaml` is available; otherwise a full dump of `config.yaml`):
+Vector edits in place (`POST /edit` → `Channel::edit`). Hermes tool-progress **accumulates on one bubble** (`tool_progress: new`). Token streaming stays off — each edit is another NIP-17 gift wrap. Setup merges only the `display.platforms.vector` mapping (comment-preserving when `ruamel.yaml` is available; otherwise a full dump of `config.yaml`):
 
 ```yaml
 # ~/.hermes/config.yaml
 display:
   platforms:
     vector:
-      tool_progress: off
+      tool_progress: new
       interim_assistant_messages: false
       long_running_notifications: false
       busy_ack_detail: false
+      streaming: false
 ```
 
-There is no `display.platform_tool_progress` key. Without the YAML override the plugin inherits Hermes' global `tool_progress: all` and would post a new Vector DM per tool event. Vector **does** render markdown. Setup still writes this block when you decline “Reconfigure Vector?” so a pre-existing `VECTOR_NPUB` gets the same override.
+There is no `display.platform_tool_progress` key. Without the YAML override the plugin inherits Hermes' global `tool_progress: all` (still edited in place, just noisier). Vector **does** render markdown. Setup still writes this block when you decline “Reconfigure Vector?” so a pre-existing `VECTOR_NPUB` gets the same override. Re-run `hermes gateway setup` (skip reconfigure) to flip an older `tool_progress: off` install.
 
 ## Default-deny inbox
 
@@ -181,9 +182,10 @@ The Vector app does not display channel ids. When the bot joins (trusted invite,
 
 **Bot-owned home room:** set `VECTOR_CREATE_COMMUNITY=on`. After Ready the sidecar creates or reuses a private community, persists `sdk/home-community.json` (restart will not create a second one), and direct-invites `VECTOR_ALLOWED_USERS`. No public invite URL, and the new channel is **not** written into `VECTOR_GROUP_ALLOW_ALL`. Direct-invited allowlisted members can already @mention; anyone else needs `VECTOR_GROUP_ALLOWED_USERS` or the channel id in `VECTOR_GROUP_ALLOW_ALL`.
 
-Community **reactions** and missed-❌ catch-up stay DM-only. Concord channels
-are text, slash commands, and **file attachments**. The Vector app sends group
-files with no caption and no @mention on that event. Default: the bot stashes
+Community **reactions** and missed-❌ catch-up stay DM-only. Missed Concord
+messages while the sidecar was down are **ignored** (no ❌, no Hermes turn).
+Concord channels are text, slash commands, and **file attachments**. The Vector
+app sends group files with no caption and no @mention on that event. Default: the bot stashes
 metadata and **does not download** until someone **replies to that file** and
 @mentions the bot. A mention-only reply stores the file (session breadcrumb, no
 AI turn). Extra text on that reply starts a turn with `media_urls`. Set
@@ -288,7 +290,7 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 | Port 8096 in use | `ss -ltnp \| rg 8096` or set `VECTOR_BRIDGE_PORT`. A leftover `vector-bridge` is reaped on connect; a foreign process is a retryable fatal. |
 | Lost the bot / contacts don't recognize it | Restoring needs `identity.nsec` **or** `identity.mnemonic`. Replacing the nsec **is** a new bot (new npub, lost DMs). Identities minted before mnemonic-on-create, or imported from nsec only, have no seed file. |
 | Sidecar is a stub / no live DMs | `VECTOR_STUB` must **not** be set in the gateway. Production `connect()` strips it. Only HTTP unit tests set it (binds without `VectorBot::build`). |
-| Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `VECTOR_MISSED_REACT=off` disables. Agent react/unreact and optional 👀/✅/❌ acks: see `VECTOR_REACTIONS` above. |
+| Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `VECTOR_MISSED_REACT=off` disables. Missed **community** messages are ignored (no ❌, no turn). Agent react/unreact and optional 👀/✅/❌ acks: see `VECTOR_REACTIONS` above. |
 | Group messages ignored | The bot must have **joined** (trusted inviter). Then the sender needs `VECTOR_ALLOWED_USERS`, `VECTOR_GROUP_ALLOWED_USERS`, or the channel in `VECTOR_GROUP_ALLOW_ALL`. Mentions (`@bot npub` / `@VECTOR_BOT_NAME`), a reply to the bot, or a registered slash command (`/approve`, `/deny`, …) are required; `@everyone` is ignored. Pairing is not sent in groups. Group files download when you **reply to the file and @mention** the bot (or set `VECTOR_COMMUNITY_DOWNLOAD_ALL=on`). |
 | Slash `/approve` missing from the Vector picker | Sidecar must be rebuilt after this feature (`hermes gateway setup` / `cargo build --release` in `bridge/`). `VECTOR_SLASH_COMMANDS` must not be `off`. Kind-10304 publishes in the background after `BotEvent::Ready` (does not block gateway start). Type `/` in a chat with the bot. Typed `/approve` in a DM works even without the picker. |
 | Bot not joining a community | Inviter npub must be in `VECTOR_TRUSTED_INVITERS` or `VECTOR_ALLOWED_USERS`. `VECTOR_INVITE_POLICY=manual` parks all invites. Check `/health` `pending_invites`. |

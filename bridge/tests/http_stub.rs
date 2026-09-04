@@ -321,6 +321,68 @@ fn send_validates_npub_and_requires_ready() {
 }
 
 #[test]
+fn edit_validates_and_returns_original_id() {
+    let server = spawn_server(&[]);
+    let (status, body) = post(
+        &server,
+        "/edit",
+        Some(&server.token),
+        json!({ "to": VALID_NPUB, "message_id": "deadbeef", "body": "hi" }),
+    );
+    assert_eq!(status, 503);
+    assert_eq!(body["code"], "not_ready");
+
+    let (status, body) = post(
+        &server,
+        "/edit",
+        Some(&server.token),
+        json!({ "to": "not-an-npub", "message_id": "deadbeef", "body": "hi" }),
+    );
+    assert_eq!(status, 400);
+    assert_eq!(body["code"], "invalid_npub");
+
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    let (status, body) = post(
+        &server,
+        "/edit",
+        Some(&server.token),
+        json!({ "to": VALID_NPUB, "body": "hi" }),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let (status, body) = post(
+        &server,
+        "/edit",
+        Some(&server.token),
+        json!({ "to": VALID_NPUB, "message_id": "deadbeef", "body": "" }),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let (status, body) = post(
+        &server,
+        "/edit",
+        Some(&server.token),
+        json!({ "to": VALID_NPUB, "message_id": "deadbeef", "body": "edited" }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], "deadbeef");
+    assert_eq!(body["edit_id"].as_str().expect("edit_id").len(), 64);
+
+    let channel = "a".repeat(64);
+    let (status, body) = post(
+        &server,
+        "/edit",
+        Some(&server.token),
+        json!({ "to": channel, "message_id": "cafebabe", "body": "group edit" }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], "cafebabe");
+}
+
+#[test]
 fn payload_over_64kib_is_413() {
     let server = spawn_server(&[]);
     let too_big = "x".repeat(64 * 1024 + 1);

@@ -838,6 +838,7 @@ class VectorAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     supports_code_blocks = True
+    SUPPORTS_MESSAGE_EDITING = True
 
     # Shared reaction-ack flow (base.on_processing_complete): swap 👀 for
     # ✅/❌. Gated by VECTOR_REACTIONS (default off) via _reactions_enabled.
@@ -1187,6 +1188,91 @@ class VectorAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e), retryable=True)
         except Exception as e:
             logger.error("Vector: exception while sending: %s", e)
+            return SendResult(success=False, error=str(e), retryable=False)
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a previously sent Vector message (kind-16 / Concord send_edit).
+
+        Hermes tool-progress and streaming hold one ``message_id`` for the
+        whole bubble. The sidecar's kind-16 rumor has its own id; this
+        method always returns the original target id. ``finalize`` is a
+        no-op — Vector edits have no lifecycle state.
+        """
+        if not self._running or not self._http_client:
+            return SendResult(success=False, error="Not connected")
+        target = (message_id or "").strip()
+        if not target:
+            return SendResult(success=False, error="Vector edit needs a message id")
+        if not content:
+            return SendResult(success=False, error="Empty message")
+
+        if self._bridge_process and self._bridge_process.poll() is not None:
+            msg = (
+                f"vector-bridge exited unexpectedly "
+                f"(code {self._bridge_process.returncode})."
+            )
+            if not self.has_fatal_error:
+                logger.error("Vector: %s", msg)
+                self._set_fatal_error("vector_bridge_exited", msg, retryable=True)
+                self._close_bridge_log()
+                asyncio.create_task(self._notify_fatal_error())
+            return SendResult(success=False, error=self.fatal_error_message or msg)
+
+        payload: Dict[str, Any] = {
+            "to": chat_id,
+            "message_id": target,
+            "body": content,
+        }
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/edit",
+                json=payload,
+                headers=self._token_headers(),
+                timeout=30.0,
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except (ValueError, json.JSONDecodeError) as e:
+                    logger.warning(
+                        "Vector: /edit returned 200 but JSON was unreadable: %s",
+                        e,
+                    )
+                    return SendResult(success=True, message_id=target, retryable=False)
+                if not isinstance(data, dict):
+                    data = {}
+                edit_id = data.get("edit_id")
+                if edit_id:
+                    self._record_sent_message(str(edit_id))
+                    self._is_duplicate(str(edit_id))
+                return SendResult(
+                    success=True,
+                    message_id=target,
+                    raw_response=data,
+                )
+            error_text = resp.text[:200] if resp.text else "No error text"
+            logger.warning(
+                "Vector: /edit failed with status %d: %s",
+                resp.status_code,
+                error_text,
+            )
+            return SendResult(
+                success=False,
+                error=f"Sidecar /edit returned {resp.status_code}: {error_text}",
+                retryable=resp.status_code >= 500,
+            )
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            logger.error("Vector: connection error while editing: %s", e)
+            return SendResult(success=False, error=str(e), retryable=True)
+        except Exception as e:
+            logger.error("Vector: exception while editing: %s", e)
             return SendResult(success=False, error=str(e), retryable=False)
 
     async def send_reaction(
@@ -2990,12 +3076,14 @@ def _config_yaml_path() -> Path:
     return Path(home) / "config.yaml"
 
 
-# D12 + Signal/Photon _TIER_LOW extras until /edit exists.
+# D12: POST /edit lets Hermes accumulate tool-progress on one bubble.
+# Streaming extras stay off — each token edit is another NIP-17 gift wrap.
 _VECTOR_DISPLAY_SETTINGS = {
-    "tool_progress": "off",
+    "tool_progress": "new",
     "interim_assistant_messages": False,
     "long_running_notifications": False,
     "busy_ack_detail": False,
+    "streaming": False,
 }
 _YAML11_AMBIGUOUS = {
     "y",
@@ -3400,13 +3488,13 @@ async def _standalone_send(
 def _maybe_merge_display(io) -> None:
     if _merge_vector_display_config():
         io.print_info(
-            "Wrote display.platforms.vector.tool_progress: off to config.yaml"
+            "Wrote display.platforms.vector.tool_progress: new to config.yaml"
         )
     else:
         io.print_warning(
             "Could not merge display.platforms.vector into config.yaml. "
-            "Add tool_progress: off under display.platforms.vector yourself "
-            "or Hermes will post a new Vector DM per tool event."
+            "Add tool_progress: new under display.platforms.vector yourself "
+            "or Hermes inherits the global default (all)."
         )
 
 

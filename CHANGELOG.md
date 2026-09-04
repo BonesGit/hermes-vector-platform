@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Message **edit**. Sidecar `POST /edit` `{to, message_id, body}` calls
+  `Channel::edit` (Concord) or `edit_dm` (DMs, so we keep the kind-16
+  `edit_id`). Adapter `edit_message` always returns the **original** rumor
+  id so Hermes tool-progress / streaming can keep one bubble; the kind-16
+  id is marked seen so our own echo is not dispatched. Setup now writes
+  `display.platforms.vector.tool_progress: new` (streaming extras stay
+  off, including per-platform `streaming: false`). Re-run
+  `hermes gateway setup` to refresh an older `off` override.
+
+### Changed
+
+- Missed Concord messages stay silent. Catch-up ❌ is **DM-only**; group
+  chatter that arrived while the sidecar was down is ignored (no reaction,
+  no Hermes turn).
+
 ## [0.3.0] — 2026-09-04
 
 Communities, slash commands, profile, reactions, mnemonic-on-disk, and

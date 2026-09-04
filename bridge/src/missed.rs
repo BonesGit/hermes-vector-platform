@@ -1,5 +1,9 @@
 //! Ack DMs that arrived while the sidecar was down: react ❌, do not
 //! dispatch them to Hermes. First boot seeds the cursor and does not react.
+//!
+//! Concord channels are never walked. Missed group messages are ignored
+//! (no ❌, no Hermes turn) — a room full of catch-up chips is worse than
+//! silence.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -109,6 +113,8 @@ fn react_emoji() -> String {
 }
 
 fn allowlisted_npubs() -> Vec<String> {
+    // DM peers only. Do not union VECTOR_GROUP_ALLOW_ALL — those are
+    // Concord channel ids and must not get catch-up ❌.
     let mut out = Vec::new();
     for key in ["VECTOR_ALLOWED_USERS", "VECTOR_HOME_CHANNEL"] {
         let Ok(val) = std::env::var(key) else {
@@ -157,7 +163,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// After `Ready`: ❌ DMs stored while we were down. Never SSE them.
+/// After `Ready`: ❌ allowlisted **DMs** stored while we were down. Never
+/// SSE them. Never touch Concord channels.
 pub async fn ack_missed_while_down(bot: &VectorBot, data_dir: &Path) {
     if !missed_react_enabled() {
         return;
@@ -173,6 +180,10 @@ pub async fn ack_missed_while_down(bot: &VectorBot, data_dir: &Path) {
         load_seen(data_dir)
     };
     for npub in peers {
+        // VECTOR_GROUP_ALLOW_ALL / channel hex must never enter this loop.
+        if crate::api::is_channel_id(&npub) {
+            continue;
+        }
         let history = bot.dm(&npub).history(HISTORY_LIMIT).await;
         match local.chats.get(&npub).cloned() {
             None => {
@@ -266,5 +277,14 @@ mod tests {
         let n = newest_inbound(&msgs).unwrap();
         assert_eq!(n.id, "c");
         assert_eq!(n.at_ms, 20);
+    }
+
+    #[test]
+    fn channel_hex_is_not_a_missed_react_peer() {
+        let channel = "ab".repeat(32);
+        assert!(crate::api::is_channel_id(&channel));
+        assert!(!crate::api::is_channel_id(
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
+        ));
     }
 }

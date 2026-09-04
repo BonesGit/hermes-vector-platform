@@ -597,17 +597,19 @@ class FakeBridgeProc:
 
 
 class MockSidecar:
-    """Loopback HTTP sidecar: token auth, /health, /send, /typing, /events."""
+    """Loopback HTTP sidecar: token auth, /health, /send, /edit, /typing, /events."""
 
     def __init__(self, token: str, npub: str = NPUB, ready: bool = True):
         self.token = token
         self.npub = npub
         self.ready = ready
         self.sends: list = []
+        self.edits: list = []
         self.typing: list = []
         self.reacts: list = []
         self.health_headers: list = []
         self.send_headers: list = []
+        self.edit_headers: list = []
         self.typing_headers: list = []
         self.react_headers: list = []
         self.events_headers: list = []
@@ -696,6 +698,13 @@ class MockSidecar:
                         self.wfile.write(sidecar.send_raw)
                         return
                     return self._json(200, {"id": "evt-outbound-1"})
+                if path == "/edit":
+                    sidecar.edits.append(data)
+                    sidecar.edit_headers.append(dict(self.headers))
+                    orig = data.get("message_id") or "evt-edit-target"
+                    return self._json(
+                        200, {"id": orig, "edit_id": "evt-kind16-1"}
+                    )
                 if path == "/typing":
                     sidecar.typing.append(data)
                     sidecar.typing_headers.append(dict(self.headers))
@@ -1734,6 +1743,110 @@ class TestMockedSidecarHttp:
         finally:
             sidecar.stop()
 
+    def test_edit_message_posts_edit_and_keeps_original_id(
+        self, monkeypatch, tmp_path
+    ):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    result = await adapter.edit_message(
+                        PEER_NPUB, "orig-msg-1", "updated text", finalize=True
+                    )
+                    assert result.success
+                    assert result.message_id == "orig-msg-1"
+                    assert result.retryable is False
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.edits == [
+                {
+                    "to": PEER_NPUB,
+                    "message_id": "orig-msg-1",
+                    "body": "updated text",
+                }
+            ]
+            assert sidecar.edit_headers[0].get("X-Hermes-Sidecar-Token") == token
+            assert "evt-kind16-1" in adapter._sent_message_ids
+            assert "evt-kind16-1" in adapter._inbound_ids
+        finally:
+            sidecar.stop()
+
+    def test_edit_message_channel_hex(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    result = await adapter.edit_message(
+                        CHANNEL_ID, "orig-group-1", "group edit"
+                    )
+                    assert result.success
+                    assert result.message_id == "orig-group-1"
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.edits == [
+                {
+                    "to": CHANNEL_ID,
+                    "message_id": "orig-group-1",
+                    "body": "group edit",
+                }
+            ]
+        finally:
+            sidecar.stop()
+
+    def test_edit_message_requires_id_and_body(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._running = True
+        adapter._http_client = object()
+        empty_id = asyncio.run(adapter.edit_message(PEER_NPUB, "", "text"))
+        assert empty_id.success is False
+        assert "message id" in (empty_id.error or "")
+        empty_body = asyncio.run(adapter.edit_message(PEER_NPUB, "orig-1", ""))
+        assert empty_body.success is False
+        assert "Empty" in (empty_body.error or "")
+
+    def test_edit_message_requires_running(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        result = asyncio.run(adapter.edit_message(PEER_NPUB, "orig-1", "text"))
+        assert result.success is False
+        assert result.error == "Not connected"
+
+    def test_edit_message_5xx_is_retryable(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._running = True
+
+        class _Resp:
+            status_code = 503
+            text = "not ready"
+
+        class _Http:
+            async def post(self, url, json=None, headers=None, timeout=None):
+                assert url.endswith("/edit")
+                return _Resp()
+
+        adapter._http_client = _Http()
+        result = asyncio.run(adapter.edit_message(PEER_NPUB, "orig-1", "text"))
+        assert result.success is False
+        assert result.retryable is True
+        assert "503" in (result.error or "")
+
     def test_ensure_home_community_seeds_allowlist(self, monkeypatch, tmp_path):
         token = "a" * 64
         sidecar = MockSidecar(token=token)
@@ -2206,10 +2319,11 @@ class TestDisplayYamlMerge:
         assert data["display"]["tool_progress"] == "all"
         assert data["display"]["platforms"]["telegram"]["tool_progress"] == "all"
         assert data["display"]["platforms"]["telegram"]["streaming"] is True
-        assert data["display"]["platforms"]["vector"]["tool_progress"] == "off"
+        assert data["display"]["platforms"]["vector"]["tool_progress"] == "new"
         assert data["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
         assert data["display"]["platforms"]["vector"]["long_running_notifications"] is False
         assert data["display"]["platforms"]["vector"]["busy_ack_detail"] is False
+        assert data["display"]["platforms"]["vector"]["streaming"] is False
 
     def test_creates_file_when_missing(self, tmp_path):
         if yaml is None:
@@ -2217,10 +2331,11 @@ class TestDisplayYamlMerge:
         path = tmp_path / "nested" / "config.yaml"
         assert vector_adapter._merge_vector_display_config(path) is True
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        assert data["display"]["platforms"]["vector"]["tool_progress"] == "off"
+        assert data["display"]["platforms"]["vector"]["tool_progress"] == "new"
         assert data["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
         assert data["display"]["platforms"]["vector"]["long_running_notifications"] is False
         assert data["display"]["platforms"]["vector"]["busy_ack_detail"] is False
+        assert data["display"]["platforms"]["vector"]["streaming"] is False
 
     def test_preserves_comments_when_ruamel_available(self, tmp_path):
         if yaml is None:
@@ -2243,7 +2358,7 @@ class TestDisplayYamlMerge:
         data = yaml.safe_load(text)
         assert data["model"]["default"] == "foo"
         assert data["display"]["tool_progress"] == "all"
-        assert data["display"]["platforms"]["vector"]["tool_progress"] == "off"
+        assert data["display"]["platforms"]["vector"]["tool_progress"] == "new"
 
     def test_refuses_unparseable(self, tmp_path):
         path = tmp_path / "config.yaml"
@@ -2579,7 +2694,7 @@ class TestInteractiveSetup:
         assert cli_calls[0] == ["--check"]
         assert cli_calls[1] == ["--setup"]
         cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-        assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "off"
+        assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "new"
         assert cfg["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
         assert any("Share this npub" in m for m in io.logs["info"])
         assert any("identity.mnemonic" in m for m in io.logs["info"])
@@ -2733,7 +2848,7 @@ class TestInteractiveSetup:
         assert called == []
         assert io.saved == {}
         cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-        assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "off"
+        assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "new"
         assert cfg["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
 
     def test_skip_reconfigure_still_adopts_stale_bak(self, monkeypatch, tmp_path):

@@ -76,7 +76,7 @@ optional_env:
     prompt: "Pairing (on/off)"
     password: false
   - name: VECTOR_MISSED_REACT
-    description: "off = do not ❌ DMs received while the sidecar was down (default on)"
+    description: "off = do not ❌ DMs received while the sidecar was down (default on). Concord channels are never ❌'d; missed group messages are ignored."
     prompt: "React on missed DMs? (on/off)"
     password: false
   - name: VECTOR_MISSED_REACT_EMOJI

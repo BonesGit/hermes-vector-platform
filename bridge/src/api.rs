@@ -176,6 +176,7 @@ pub fn router(state: AppState) -> Router {
         .route("/npub", get(npub))
         .route("/events", get(events::get_events))
         .route("/send", post(send))
+        .route("/edit", post(edit))
         .route("/typing", post(typing))
         .route("/communities", get(list_communities).post(create_community))
         .route("/communities/invite", post(invite_to_community))
@@ -399,6 +400,60 @@ async fn send(
         Ok(Json(json!({ "id": id })))
     } else {
         Ok(Json(json!({ "id": state.next_event_id() })))
+    }
+}
+
+#[derive(Deserialize)]
+struct EditRequest {
+    to: String,
+    #[serde(default)]
+    message_id: String,
+    #[serde(default)]
+    body: String,
+}
+
+/// Edit a message this bot previously sent. `id` is the **original** rumor
+/// id (Hermes stream/progress holds one id across edits). Kind-16's own
+/// event id is `edit_id` when the SDK returns it (DMs).
+async fn edit(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<EditRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let to = parse_send_target(&req.to)?;
+    let message_id = req.message_id.trim();
+    if message_id.is_empty() {
+        return Err(ApiError::bad_request("message_id is required"));
+    }
+    if req.body.is_empty() {
+        return Err(ApiError::bad_request("body is required"));
+    }
+    state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        if is_channel_id(&to) {
+            bot.channel(&to)
+                .edit(message_id, &req.body)
+                .await
+                .map_err(|err| {
+                    eprintln!("[vector-bridge] edit failed: {err}");
+                    ApiError::internal()
+                })?;
+            Ok(Json(json!({ "id": message_id })))
+        } else {
+            let edit_id = bot
+                .core()
+                .edit_dm(&to, message_id, &req.body)
+                .await
+                .map_err(|err| {
+                    eprintln!("[vector-bridge] edit failed: {err}");
+                    ApiError::internal()
+                })?;
+            Ok(Json(json!({ "id": message_id, "edit_id": edit_id })))
+        }
+    } else {
+        Ok(Json(
+            json!({ "id": message_id, "edit_id": state.next_event_id() }),
+        ))
     }
 }
 
@@ -697,7 +752,7 @@ const HOME_COMMUNITY_FILE: &str = "home-community.json";
 const STUB_COMMUNITY_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const STUB_CHANNEL_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-fn is_channel_id(raw: &str) -> bool {
+pub(crate) fn is_channel_id(raw: &str) -> bool {
     raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit())
 }
 

@@ -973,29 +973,10 @@ async fn list_communities(
 ) -> Result<Json<Value>, ApiError> {
     state.require_ready().await?;
     if let Some(bot) = state.bot().await {
-        let mut out = Vec::new();
-        for community in bot.communities().await {
-            let id = community.id().to_string();
-            let channels: Vec<Value> = community
-                .channels()
-                .await
-                .into_iter()
-                .map(|ch| {
-                    json!({
-                        "channel_id": ch.id(),
-                        "name": ch.name(),
-                        "private": ch.is_private(),
-                        "readable": ch.is_readable(),
-                    })
-                })
-                .collect();
-            out.push(json!({
-                "community_id": id,
-                "dissolved": community.is_dissolved().await,
-                "channels": channels,
-            }));
-        }
-        Ok(Json(json!({ "communities": out })))
+        // SDK JSON includes community `name` / `description` (not on Community::).
+        Ok(Json(json!({
+            "communities": bot.core().list_communities().await,
+        })))
     } else {
         Ok(Json(json!({ "communities": [] })))
     }

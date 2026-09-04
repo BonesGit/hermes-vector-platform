@@ -307,10 +307,13 @@ pub(crate) async fn handle_bot_event(
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     let channels = list_channel_values(&bot, &community_id).await;
                     if !channels.is_empty() {
+                        let name = community_display_name(&bot, &community_id).await;
                         log_joined_channels(&community_id, &channels);
-                        state
-                            .events()
-                            .publish(community_joined_item(&community_id, channels));
+                        state.events().publish(community_joined_item(
+                            &community_id,
+                            &name,
+                            channels,
+                        ));
                         return;
                     }
                 }
@@ -329,7 +332,7 @@ pub(crate) async fn handle_bot_event(
                 "[vector-bridge] channel keyed channel_id={channel_id} \
                  community_id={community_id}"
             );
-            let name = bot
+            let channel_name = bot
                 .community(&community_id)
                 .channels()
                 .await
@@ -337,27 +340,42 @@ pub(crate) async fn handle_bot_event(
                 .find(|ch| ch.id() == channel_id)
                 .map(|ch| ch.name().to_string())
                 .unwrap_or_default();
+            let name = community_display_name(bot, &community_id).await;
             state.events().publish(community_joined_item(
                 &community_id,
-                vec![json!({ "channel_id": channel_id, "name": name })],
+                &name,
+                vec![json!({ "channel_id": channel_id, "name": channel_name })],
             ));
         }
         _ => {}
     }
 }
 
-fn community_joined_item(community_id: &str, channels: Vec<Value>) -> SseItem {
+fn community_joined_item(community_id: &str, name: &str, channels: Vec<Value>) -> SseItem {
     SseItem {
         id: Some(format!("joined:{community_id}")),
         payload: json!({
             "type": "community_joined",
             "data": {
                 "community_id": community_id,
+                "name": name,
                 "channels": channels,
             }
         })
         .to_string(),
     }
+}
+
+async fn community_display_name(bot: &VectorBot, community_id: &str) -> String {
+    bot.core()
+        .list_communities()
+        .await
+        .into_iter()
+        .find(|v| {
+            v.get("community_id").and_then(|i| i.as_str()) == Some(community_id)
+        })
+        .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default()
 }
 
 async fn list_channel_values(bot: &VectorBot, community_id: &str) -> Vec<Value> {
@@ -427,11 +445,13 @@ mod tests {
         let channel_id = "ab".repeat(32);
         let item = community_joined_item(
             &community_id,
+            "Ada's house",
             vec![json!({ "channel_id": channel_id, "name": "general" })],
         );
         let payload: Value = serde_json::from_str(&item.payload).unwrap();
         assert_eq!(payload["type"], "community_joined");
         assert_eq!(payload["data"]["community_id"], community_id);
+        assert_eq!(payload["data"]["name"], "Ada's house");
         assert_eq!(payload["data"]["channels"][0]["channel_id"], channel_id);
         assert_eq!(payload["data"]["channels"][0]["name"], "general");
     }

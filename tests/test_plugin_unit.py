@@ -328,6 +328,34 @@ class TestTruncateNpub:
         assert vector_adapter._truncate_npub(None) == ""  # type: ignore[arg-type]
 
 
+class TestGroupChatName:
+    def test_community_hides_general(self):
+        assert (
+            vector_adapter._group_chat_name("Ada's house", "general", CHANNEL_ID)
+            == "Ada's house"
+        )
+        assert (
+            vector_adapter._group_chat_name("Ada's house", "GENERAL", CHANNEL_ID)
+            == "Ada's house"
+        )
+        assert (
+            vector_adapter._group_chat_name("Ada's house", "", CHANNEL_ID)
+            == "Ada's house"
+        )
+
+    def test_extra_channel_is_appended(self):
+        assert (
+            vector_adapter._group_chat_name("Ada's house", "random", CHANNEL_ID)
+            == "Ada's house · random"
+        )
+
+    def test_no_community_skips_bare_general(self):
+        assert vector_adapter._group_chat_name("", "general", CHANNEL_ID) == (
+            f"{CHANNEL_ID[:16]}..."
+        )
+        assert vector_adapter._group_chat_name("", "random", CHANNEL_ID) == "random"
+
+
 class TestProfileDisplayName:
     def test_name_then_display_name_then_truncate(self):
         assert (
@@ -976,6 +1004,7 @@ class TestGetChatInfo:
         sidecar.listed_communities = [
             {
                 "community_id": "cc" * 32,
+                "name": "Ada's house",
                 "channels": [
                     {
                         "channel_id": CHANNEL_ID,
@@ -996,8 +1025,43 @@ class TestGetChatInfo:
                 try:
                     info = await adapter.get_chat_info(CHANNEL_ID)
                     assert info["type"] == "group"
-                    assert info["name"] == "general"
+                    assert info["name"] == "Ada's house"
                     assert adapter._channel_names[CHANNEL_ID] == "general"
+                    assert adapter._community_names["cc" * 32] == "Ada's house"
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+        finally:
+            sidecar.stop()
+
+    def test_extra_channel_appended_to_community_name(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        sidecar.listed_communities = [
+            {
+                "community_id": "cc" * 32,
+                "name": "Ada's house",
+                "channels": [
+                    {
+                        "channel_id": CHANNEL_ID,
+                        "name": "random",
+                        "private": False,
+                        "readable": True,
+                    }
+                ],
+            }
+        ]
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    info = await adapter.get_chat_info(CHANNEL_ID)
+                    assert info["name"] == "Ada's house · random"
                 finally:
                     await adapter._http_client.aclose()
 
@@ -1019,7 +1083,9 @@ class TestJoinedChannelNotice:
         body = vector_adapter._format_joined_notice(
             community,
             [{"channel_id": CHANNEL_ID, "name": "general"}],
+            community_name="Ada's house",
         )
+        assert "I joined Ada's house." in body
         assert f"channel_id: {CHANNEL_ID}" in body
         assert f"community_id: {community}" in body
         assert "VECTOR_GROUP_ALLOW_ALL" in body

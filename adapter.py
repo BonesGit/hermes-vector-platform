@@ -677,10 +677,13 @@ def _home_operator_npub() -> Optional[str]:
     return normalize_npub((os.getenv("VECTOR_HOME_CHANNEL") or "").strip())
 
 
-def _format_joined_notice(community_id: str, channels: list) -> str:
+def _format_joined_notice(
+    community_id: str, channels: list, community_name: str = ""
+) -> str:
     """Operator-facing DM/log body with copy-pasteable channel ids."""
+    title = (community_name or "").strip()
     lines = [
-        "Vector: I joined a community.",
+        f"Vector: I joined {title}." if title else "Vector: I joined a community.",
         "Copy a channel_id into VECTOR_GROUP_ALLOW_ALL if you want every member to @mention me.",
         "",
     ]
@@ -747,6 +750,26 @@ def _profile_display_name(data: Optional[Dict[str, Any]], fallback: str) -> str:
             label = str(data.get(key) or "").strip()
             if label:
                 return label
+    return _truncate_npub(fallback)
+
+
+_DEFAULT_CHANNEL_NAMES = frozenset({"general"})
+
+
+def _group_chat_name(
+    community_name: Optional[str],
+    channel_name: Optional[str],
+    fallback: str = "",
+) -> str:
+    """Vector list title: community name. Append channel only if it isn't ``general``."""
+    community = (community_name or "").strip()
+    channel = (channel_name or "").strip()
+    if channel and channel.lower() not in _DEFAULT_CHANNEL_NAMES:
+        if community:
+            return f"{community} · {channel}"
+        return channel
+    if community:
+        return community
     return _truncate_npub(fallback)
 
 
@@ -909,6 +932,8 @@ class VectorAdapter(BasePlatformAdapter):
         # Peer npub → kind-0 label; channel hex → Concord channel name.
         self._profile_names: Dict[str, str] = {}
         self._channel_names: Dict[str, str] = {}
+        self._community_names: Dict[str, str] = {}
+        self._channel_community: Dict[str, str] = {}
 
         logger.info(
             "Vector plugin v%s initialized: port=%d host=%s bot=%s",
@@ -1457,7 +1482,7 @@ class VectorAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         channel = normalize_channel_id(chat_id)
         if channel:
-            name = await self._channel_label(channel)
+            name = await self._group_label(channel)
             return {
                 "name": name,
                 "type": "group",
@@ -1470,15 +1495,44 @@ class VectorAdapter(BasePlatformAdapter):
     def _peer_label(self, peer: str) -> str:
         return self._profile_names.get(peer) or _truncate_npub(peer)
 
-    async def _channel_label(self, channel_id: str, community_id: Optional[str] = None) -> str:
-        cached = self._channel_names.get(channel_id)
-        if cached:
-            return cached
+    def _remember_group_room(
+        self,
+        community_id: str,
+        channel_id: str,
+        *,
+        community_name: str = "",
+        channel_name: str = "",
+    ) -> None:
+        cid = normalize_channel_id(channel_id) or (channel_id or "").strip()
+        comm = (community_id or "").strip()
+        if cid and comm:
+            self._channel_community[cid] = comm
+        if comm and community_name.strip():
+            self._community_names[comm] = community_name.strip()
+        if cid and channel_name.strip():
+            self._channel_names[cid] = channel_name.strip()
+
+    def _group_label_cached(
+        self, channel_id: str, community_id: Optional[str] = None
+    ) -> str:
+        comm_id = (
+            (community_id or "").strip()
+            or self._channel_community.get(channel_id)
+            or ""
+        )
+        return _group_chat_name(
+            self._community_names.get(comm_id),
+            self._channel_names.get(channel_id),
+            comm_id or channel_id,
+        )
+
+    async def _group_label(self, channel_id: str, community_id: Optional[str] = None) -> str:
+        label = self._group_label_cached(channel_id, community_id)
+        if label and label != _truncate_npub(community_id or channel_id):
+            return label
         if self._http_client:
             await self._sync_joined_channels()
-            cached = self._channel_names.get(channel_id)
-            if cached:
-                return cached
+            return self._group_label_cached(channel_id, community_id)
         return _truncate_npub(community_id or channel_id)
 
     async def _fetch_profile_name(self, npub: str) -> str:
@@ -1556,11 +1610,23 @@ class VectorAdapter(BasePlatformAdapter):
         if channel_id:
             await self._notify_joined_channels(
                 community_id,
-                [{"channel_id": channel_id, "name": name}],
+                [{"channel_id": channel_id, "name": ""}],
+                community_name=name,
             )
 
-    async def _notify_joined_channels(self, community_id: str, channels: list) -> None:
+    async def _notify_joined_channels(
+        self,
+        community_id: str,
+        channels: list,
+        *,
+        community_name: str = "",
+    ) -> None:
         """Log full channel ids and DM VECTOR_HOME_CHANNEL once per channel."""
+        comm_name = community_name.strip() or self._community_names.get(
+            (community_id or "").strip(), ""
+        )
+        if (community_id or "").strip() and comm_name:
+            self._community_names[(community_id or "").strip()] = comm_name
         rows = []
         for row in channels or []:
             if not isinstance(row, dict):
@@ -1569,9 +1635,12 @@ class VectorAdapter(BasePlatformAdapter):
             if not cid:
                 continue
             _remember_channel(cid)
-            name = str(row.get("name") or "").strip()
-            if name:
-                self._channel_names[cid] = name
+            self._remember_group_room(
+                community_id,
+                cid,
+                community_name=comm_name,
+                channel_name=str(row.get("name") or "").strip(),
+            )
             rows.append(
                 {
                     "channel_id": cid,
@@ -1588,9 +1657,10 @@ class VectorAdapter(BasePlatformAdapter):
         community = (community_id or "").strip() or "(unknown)"
         for row in new_rows:
             logger.info(
-                "Vector: joined channel_id=%s name=%s community_id=%s",
+                "Vector: joined channel_id=%s name=%s community=%s community_id=%s",
                 row["channel_id"],
                 row["name"] or "(unnamed)",
+                comm_name or "(unnamed)",
                 community,
             )
         home = _home_operator_npub()
@@ -1600,7 +1670,12 @@ class VectorAdapter(BasePlatformAdapter):
                     "Vector: not connected; will DM channel_id to VECTOR_HOME_CHANNEL later"
                 )
                 return
-            result = await self.send(home, _format_joined_notice(community_id, new_rows))
+            result = await self.send(
+                home,
+                _format_joined_notice(
+                    community_id, new_rows, community_name=comm_name
+                ),
+            )
             if not result.success:
                 logger.warning(
                     "Vector: could not DM VECTOR_HOME_CHANNEL the channel id: %s",
@@ -1638,6 +1713,9 @@ class VectorAdapter(BasePlatformAdapter):
             if not isinstance(community, dict):
                 continue
             community_id = str(community.get("community_id") or "")
+            community_name = str(community.get("name") or "").strip()
+            if community_id and community_name:
+                self._community_names[community_id] = community_name
             channels = community.get("channels")
             if not isinstance(channels, list):
                 continue
@@ -1648,9 +1726,13 @@ class VectorAdapter(BasePlatformAdapter):
                 cid = normalize_channel_id(str(ch.get("channel_id") or ""))
                 _remember_channel(cid)
                 ch_name = str(ch.get("name") or "").strip()
-                if cid and ch_name:
-                    self._channel_names[cid] = ch_name
                 if cid:
+                    self._remember_group_room(
+                        community_id,
+                        cid,
+                        community_name=community_name,
+                        channel_name=ch_name,
+                    )
                     channel_rows.append(
                         {
                             "channel_id": cid,
@@ -1658,7 +1740,9 @@ class VectorAdapter(BasePlatformAdapter):
                         }
                     )
             if channel_rows:
-                await self._notify_joined_channels(community_id, channel_rows)
+                await self._notify_joined_channels(
+                    community_id, channel_rows, community_name=community_name
+                )
 
     async def send_image(
         self,
@@ -1924,8 +2008,11 @@ class VectorAdapter(BasePlatformAdapter):
             inner = inner or {}
             channels = inner.get("channels") if isinstance(inner.get("channels"), list) else []
             community_id = str(inner.get("community_id") or "")
+            community_name = str(inner.get("name") or "").strip()
             if channels:
-                await self._notify_joined_channels(community_id, channels)
+                await self._notify_joined_channels(
+                    community_id, channels, community_name=community_name
+                )
             elif community_id:
                 await self._sync_joined_channels()
         else:
@@ -2268,9 +2355,7 @@ class VectorAdapter(BasePlatformAdapter):
 
     def _group_source(self, channel_id: str, peer: str, msg_id: str, community_id: Optional[str]):
         name = self._peer_label(peer)
-        chat_name = self._channel_names.get(channel_id) or _truncate_npub(
-            community_id or channel_id
-        )
+        chat_name = self._group_label_cached(channel_id, community_id)
         return self.build_source(
             chat_id=channel_id,
             chat_name=chat_name,

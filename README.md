@@ -159,6 +159,8 @@ display:
 
 There is no `display.platform_tool_progress` key. Without the YAML override the plugin inherits Hermes' global `tool_progress: all` (still edited in place, just noisier). Vector **does** render markdown. Setup still writes this block when you decline “Reconfigure Vector?” so a pre-existing `VECTOR_NPUB` gets the same override. Re-run `hermes gateway setup` (skip reconfigure) to flip an older `tool_progress: off` install.
 
+Session titles use the peer’s public kind-0 **name** (then `display_name`) via sidecar `GET /profile?npub=`. No card → truncated npub. Concord rooms use the channel name from `GET /communities`. Inbound `user_name` uses the last fetched label; this is not a live subscription to profile edits.
+
 ## Default-deny inbox
 
 `VECTOR_ALLOWED_USERS` + Hermes pairing codes (`VECTOR_PAIRING` default **on**). Setup requires the operator npub as the first allowlisted user. `VECTOR_ALLOW_ALL_USERS` is dev-only. `hermes pairing approve` writes back into `VECTOR_ALLOWED_USERS`.

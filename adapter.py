@@ -740,6 +740,16 @@ def _truncate_npub(npub: str) -> str:
     return npub
 
 
+def _profile_display_name(data: Optional[Dict[str, Any]], fallback: str) -> str:
+    """Kind-0 ``name``, then ``display_name``, else a truncated npub/hex."""
+    if isinstance(data, dict):
+        for key in ("name", "display_name"):
+            label = str(data.get(key) or "").strip()
+            if label:
+                return label
+    return _truncate_npub(fallback)
+
+
 def _env_flag(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip().lower()
 
@@ -896,6 +906,9 @@ class VectorAdapter(BasePlatformAdapter):
         # DMs key by peer npub; groups key by ``{channel_id}:{peer}``.
         self._pending_inbox: Dict[str, List[Tuple[str, str]]] = {}
         self._notified_channel_ids: set = _load_notified_channel_ids(self.data_dir)
+        # Peer npub → kind-0 label; channel hex → Concord channel name.
+        self._profile_names: Dict[str, str] = {}
+        self._channel_names: Dict[str, str] = {}
 
         logger.info(
             "Vector plugin v%s initialized: port=%d host=%s bot=%s",
@@ -1444,14 +1457,56 @@ class VectorAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         channel = normalize_channel_id(chat_id)
         if channel:
+            name = await self._channel_label(channel)
             return {
-                "name": _truncate_npub(channel),
+                "name": name,
                 "type": "group",
                 "chat_id": channel,
             }
         npub = normalize_npub(chat_id) or (chat_id or "").strip()
-        name = _truncate_npub(npub)
+        name = await self._fetch_profile_name(npub)
         return {"name": name, "type": "dm", "chat_id": npub}
+
+    def _peer_label(self, peer: str) -> str:
+        return self._profile_names.get(peer) or _truncate_npub(peer)
+
+    async def _channel_label(self, channel_id: str, community_id: Optional[str] = None) -> str:
+        cached = self._channel_names.get(channel_id)
+        if cached:
+            return cached
+        if self._http_client:
+            await self._sync_joined_channels()
+            cached = self._channel_names.get(channel_id)
+            if cached:
+                return cached
+        return _truncate_npub(community_id or channel_id)
+
+    async def _fetch_profile_name(self, npub: str) -> str:
+        """Pull kind-0 via sidecar ``GET /profile``. Cache the label for inbound."""
+        if not npub:
+            return ""
+        if not self._http_client:
+            return self._peer_label(npub)
+        try:
+            resp = await self._http_client.get(
+                f"{self.bridge_url}/profile",
+                params={"npub": npub},
+                headers=self._token_headers(),
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Vector: fetch profile failed: %s", e)
+            return self._peer_label(npub)
+        if resp.status_code != 200:
+            return self._peer_label(npub)
+        try:
+            data = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return self._peer_label(npub)
+        label = _profile_display_name(data if isinstance(data, dict) else None, npub)
+        if label and label != _truncate_npub(npub):
+            self._profile_names[npub] = label
+        return label
 
     async def _ensure_home_community(self) -> None:
         """Slice 2: create-or-reuse a bot-owned Concord community (no public link)."""
@@ -1514,6 +1569,9 @@ class VectorAdapter(BasePlatformAdapter):
             if not cid:
                 continue
             _remember_channel(cid)
+            name = str(row.get("name") or "").strip()
+            if name:
+                self._channel_names[cid] = name
             rows.append(
                 {
                     "channel_id": cid,
@@ -1587,8 +1645,11 @@ class VectorAdapter(BasePlatformAdapter):
             for ch in channels:
                 if not isinstance(ch, dict):
                     continue
-                cid = str(ch.get("channel_id") or "")
+                cid = normalize_channel_id(str(ch.get("channel_id") or ""))
                 _remember_channel(cid)
+                ch_name = str(ch.get("name") or "").strip()
+                if cid and ch_name:
+                    self._channel_names[cid] = ch_name
                 if cid:
                     channel_rows.append(
                         {
@@ -1913,7 +1974,7 @@ class VectorAdapter(BasePlatformAdapter):
         if msg_id:
             self._record_last_inbound(peer, msg_id)
 
-        name = _truncate_npub(peer)
+        name = self._peer_label(peer)
         source = self.build_source(
             chat_id=peer,
             chat_name=name,
@@ -2137,7 +2198,7 @@ class VectorAdapter(BasePlatformAdapter):
             return
         if not _pairing_enabled() and not _sender_is_authorized(peer):
             return
-        name = _truncate_npub(peer)
+        name = self._peer_label(peer)
         source = self.build_source(
             chat_id=peer,
             chat_name=name,
@@ -2206,8 +2267,10 @@ class VectorAdapter(BasePlatformAdapter):
         return media_urls, media_types, msg_type
 
     def _group_source(self, channel_id: str, peer: str, msg_id: str, community_id: Optional[str]):
-        name = _truncate_npub(peer)
-        chat_name = _truncate_npub(community_id or channel_id)
+        name = self._peer_label(peer)
+        chat_name = self._channel_names.get(channel_id) or _truncate_npub(
+            community_id or channel_id
+        )
         return self.build_source(
             chat_id=channel_id,
             chat_name=chat_name,

@@ -328,6 +328,24 @@ class TestTruncateNpub:
         assert vector_adapter._truncate_npub(None) == ""  # type: ignore[arg-type]
 
 
+class TestProfileDisplayName:
+    def test_name_then_display_name_then_truncate(self):
+        assert (
+            vector_adapter._profile_display_name(
+                {"name": "Ada", "display_name": "A."}, NPUB
+            )
+            == "Ada"
+        )
+        assert (
+            vector_adapter._profile_display_name(
+                {"name": "  ", "display_name": "Ada Lovelace"}, NPUB
+            )
+            == "Ada Lovelace"
+        )
+        assert vector_adapter._profile_display_name({}, NPUB) == f"{NPUB[:16]}..."
+        assert vector_adapter._profile_display_name(None, NPUB) == f"{NPUB[:16]}..."
+
+
 class TestRuntimeRecord:
     def test_write_is_0600_payload_and_delete_unlinks(self, monkeypatch, tmp_path):
         monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
@@ -616,6 +634,8 @@ class MockSidecar:
         self.inject_queue: list = []
         self.communities: list = []
         self.listed_communities: list = []
+        self.profiles: dict = {}
+        self.profile_gets: list = []
         self.send_raw: bytes | None = None
         self.port: int | None = None
         self._httpd = None
@@ -644,7 +664,7 @@ class MockSidecar:
                 self.wfile.write(body)
 
             def do_GET(self):
-                path = self.path.split("?", 1)[0]
+                path, _, query = self.path.partition("?")
                 if path == "/live":
                     return self._json(200, {"ok": True})
                 if not self._auth():
@@ -658,6 +678,30 @@ class MockSidecar:
                     return self._json(200, {"status": "starting"})
                 if path == "/communities":
                     return self._json(200, {"communities": sidecar.listed_communities})
+                if path == "/profile":
+                    npub = ""
+                    for part in query.split("&"):
+                        if part.startswith("npub="):
+                            npub = part[5:]
+                            break
+                    sidecar.profile_gets.append(npub)
+                    canned = sidecar.profiles.get(npub)
+                    if isinstance(canned, dict):
+                        return self._json(200, canned)
+                    return self._json(
+                        200,
+                        {
+                            "npub": npub,
+                            "name": "",
+                            "display_name": "",
+                            "about": "",
+                            "picture": "",
+                            "banner": "",
+                            "bot": False,
+                            "nip05": "",
+                            "website": "",
+                        },
+                    )
                 if path == "/events":
                     sidecar.events_headers.append(dict(self.headers))
                     self.send_response(200)
@@ -871,6 +915,95 @@ class TestGetChatInfo:
         assert info["type"] == "group"
         assert info["chat_id"] == CHANNEL_ID
         assert info["name"] == f"{CHANNEL_ID[:16]}..."
+
+    def test_fetches_kind0_name(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        sidecar.profiles[NPUB] = {
+            "npub": NPUB,
+            "name": "Ada",
+            "display_name": "",
+            "about": "hi",
+            "picture": "",
+            "banner": "",
+            "bot": False,
+        }
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    info = await adapter.get_chat_info(NPUB)
+                    assert info["name"] == "Ada"
+                    assert info["type"] == "dm"
+                    assert info["chat_id"] == NPUB
+                    assert adapter._peer_label(NPUB) == "Ada"
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.profile_gets == [NPUB]
+        finally:
+            sidecar.stop()
+
+    def test_empty_kind0_falls_back_to_truncate(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    info = await adapter.get_chat_info(NPUB)
+                    assert info["name"] == f"{NPUB[:16]}..."
+                    assert NPUB not in adapter._profile_names
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+        finally:
+            sidecar.stop()
+
+    def test_channel_name_from_communities_list(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        sidecar = MockSidecar(token=token)
+        sidecar.listed_communities = [
+            {
+                "community_id": "cc" * 32,
+                "channels": [
+                    {
+                        "channel_id": CHANNEL_ID,
+                        "name": "general",
+                        "private": False,
+                        "readable": True,
+                    }
+                ],
+            }
+        ]
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    info = await adapter.get_chat_info(CHANNEL_ID)
+                    assert info["type"] == "group"
+                    assert info["name"] == "general"
+                    assert adapter._channel_names[CHANNEL_ID] == "general"
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+        finally:
+            sidecar.stop()
 
     def test_group_allow_all_published_as_hermes_extra(self, monkeypatch, tmp_path):
         adapter = _make_adapter(

@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `display.platforms.vector.tool_progress: new` (streaming extras stay
   off, including per-platform `streaming: false`). Re-run
   `hermes gateway setup` to refresh an older `off` override.
+- Peer **profiles**. `GET /profile?npub=` calls `VectorBot::fetch_profile`
+  (kind-0 `name` / `display_name` / about / picture). `get_chat_info` uses
+  that for DM titles; inbound `user_name` uses the cached label. Empty
+  card still truncates the npub. Concord rooms use the channel name from
+  `GET /communities`.
 
 ### Changed
 

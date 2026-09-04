@@ -404,9 +404,43 @@ fn v1_1_routes_are_501() {
         assert_eq!(status, 501, "{path} {body}");
         assert_eq!(body["code"], "not_implemented", "{path}");
     }
+}
+
+#[test]
+fn get_profile_requires_npub_and_ready() {
+    let server = spawn_server(&[]);
+    let (status, body) = get(&server, "/profile", Some(&server.token));
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
     let (status, body) = get(&server, "/profile?npub=npub1abc", Some(&server.token));
-    assert_eq!(status, 501, "{body}");
-    assert_eq!(body["code"], "not_implemented");
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "invalid_npub");
+
+    let (status, body) = get(
+        &server,
+        &format!("/profile?npub={VALID_NPUB}"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready");
+
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = get(
+        &server,
+        &format!("/profile?npub={VALID_NPUB}"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["npub"], VALID_NPUB);
+    assert_eq!(body["name"], "");
+    assert_eq!(body["display_name"], "");
+    assert_eq!(body["about"], "");
+    assert_eq!(body["bot"], false);
+
+    let (status, body) = get(&server, "/profile?npub=npub1abc", None);
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["code"], "unauthorized");
 }
 
 #[test]

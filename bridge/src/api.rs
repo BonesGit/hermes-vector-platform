@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use vector_sdk::nostr::{PublicKey, ToBech32};
 use vector_sdk::vector_core::deletion::delete_own_reaction;
-use vector_sdk::{Attachment, VectorBot};
+use vector_sdk::{Attachment, SlimProfile, VectorBot};
 
 use crate::events::{self, EventHub, SseItem};
 
@@ -180,7 +180,7 @@ pub fn router(state: AppState) -> Router {
         .route("/typing", post(typing))
         .route("/communities", get(list_communities).post(create_community))
         .route("/communities/invite", post(invite_to_community))
-        .route("/profile", post(profile).get(not_implemented))
+        .route("/profile", post(profile).get(get_profile))
         .route("/react", post(react))
         .route("/send-file", post(send_file))
         .route("/download-attachment", post(download_attachment))
@@ -620,6 +620,58 @@ fn optional_abs_file(raw: Option<&str>, bad: &'static str) -> Result<Option<Path
         return Err(ApiError::bad_request(bad));
     }
     Ok(Some(path))
+}
+
+#[derive(Deserialize)]
+struct GetProfileQuery {
+    #[serde(default)]
+    npub: String,
+}
+
+fn profile_json(npub: &str, p: Option<SlimProfile>) -> Value {
+    match p {
+        Some(p) => json!({
+            "npub": npub,
+            "name": p.name,
+            "display_name": p.display_name,
+            "about": p.about,
+            "picture": p.avatar,
+            "banner": p.banner,
+            "bot": p.bot,
+            "nip05": p.nip05,
+            "website": p.website,
+        }),
+        None => json!({
+            "npub": npub,
+            "name": "",
+            "display_name": "",
+            "about": "",
+            "picture": "",
+            "banner": "",
+            "bot": false,
+            "nip05": "",
+            "website": "",
+        }),
+    }
+}
+
+async fn get_profile(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Query(q): Query<GetProfileQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let raw = q.npub.trim();
+    if raw.is_empty() {
+        return Err(ApiError::bad_request("npub is required"));
+    }
+    let npub = parse_npub(raw)?;
+    state.require_ready().await?;
+    let p = if let Some(bot) = state.bot().await {
+        bot.fetch_profile(&npub).await
+    } else {
+        None
+    };
+    Ok(Json(profile_json(&npub, p)))
 }
 
 async fn profile(

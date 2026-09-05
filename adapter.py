@@ -13,17 +13,10 @@ Required env vars / config.extra keys:
     VECTOR_ALLOWED_USERS         Comma-separated npubs allowed to DM (also
                                  grants community turns; pairing is DM-only)
     VECTOR_HOME_CHANNEL          Operator npub for cron + join notices
-    VECTOR_PAIRING               on (default) = pairing codes; off = drop unauthorized
-    VECTOR_BRIDGE_PORT           HTTP port (default 8096)
-    VECTOR_BRIDGE_HOST           Bind address (default 127.0.0.1)
-    VECTOR_REACTIONS             on = 👀/✅/❌ processing acks; default off
-    VECTOR_GROUP_ALLOWED_USERS    Npubs who may trigger community turns without DMs
-    VECTOR_GROUP_ALLOW_ALL       Channel ids where any member may @mention / reply
-    VECTOR_TRUSTED_INVITERS      Optional inviter npubs (default: ALLOWED_USERS)
-    VECTOR_INVITE_POLICY         manual | whitelist (default whitelist)
-    VECTOR_CREATE_COMMUNITY      on = bot-owned home community after Ready
-    VECTOR_COMMUNITY_DOWNLOAD_ALL  on = save every group file on arrival (default off)
-    VECTOR_SLASH_COMMANDS        off = do not publish Vector / picker commands
+
+Profile, communities, reactions, and pairing live in config.yaml ``vector:``
+(see ``_apply_yaml_config``). Sidecar plumbing (port/host/bin/data dir) stays
+getenv overrides with defaults. Legacy VECTOR_* env for those keys still wins.
 """
 
 from __future__ import annotations
@@ -66,7 +59,7 @@ logger = logging.getLogger("hermes_plugins.vector_platform.adapter")
 # ---------------------------------------------------------------------------
 # Plugin identity / paths
 # ---------------------------------------------------------------------------
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _BRIDGE_DIR = _PLUGIN_ROOT / "bridge"
 _DEFAULT_BRIDGE_BIN = _BRIDGE_DIR / "target" / "release" / "vector-bridge"
@@ -193,8 +186,24 @@ def validate_bot_avatar_src(src: str) -> Path:
     return validate_bot_image_src(src)
 
 
+def discover_bot_image(data_dir: Path, stem: str) -> Optional[Path]:
+    """Return ``{data_dir}/{stem}.<ext>`` if a supported image exists."""
+    if stem not in ("avatar", "banner"):
+        return None
+    root = Path(data_dir)
+    for suffix in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        path = root / f"{stem}{suffix}"
+        if path.is_file():
+            return path
+    return None
+
+
 def install_bot_avatar(src: str, data_dir: Path) -> Path:
     return install_bot_image(src, data_dir, "avatar")
+
+
+def install_bot_banner(src: str, data_dir: Path) -> Path:
+    return install_bot_image(src, data_dir, "banner")
 
 
 def _sanitize_filename(name: str, fallback: str = "file") -> str:
@@ -693,7 +702,8 @@ def _format_joined_notice(
     title = (community_name or "").strip()
     lines = [
         f"Vector: I joined {title}." if title else "Vector: I joined a community.",
-        "Copy a channel_id into VECTOR_GROUP_ALLOW_ALL if you want every member to @mention me.",
+        "Copy a channel_id into vector.communities.open_channels in config.yaml "
+        "if you want every member to @mention me.",
         "",
     ]
     cid = (community_id or "").strip()
@@ -810,23 +820,24 @@ def _env_flag(name: str, default: str = "") -> str:
 
 
 def _pairing_enabled() -> bool:
-    """VECTOR_PAIRING default on. off/0/false/no drop unauthorized senders."""
+    """Pairing codes unless VECTOR_PAIRING is off or YAML says ignore.
+
+    Default on. ``unauthorized_dm_behavior: ignore`` is bridged to
+    ``VECTOR_PAIRING=off`` by ``_apply_yaml_config``.
+    """
     return _env_flag("VECTOR_PAIRING", "on") not in (
         "off",
         "0",
         "false",
         "no",
         "disabled",
+        "ignore",
     )
 
 
 def _processing_reactions_enabled() -> bool:
     """VECTOR_REACTIONS default off. 👀/✅/❌ on the triggering DM while the agent works."""
     return _env_flag("VECTOR_REACTIONS") in ("1", "true", "yes", "on")
-
-
-def _allow_all_users() -> bool:
-    return _env_flag("VECTOR_ALLOW_ALL_USERS") in ("1", "true", "yes", "on")
 
 
 def _create_community_enabled() -> bool:
@@ -855,9 +866,7 @@ def _group_allowed_users() -> set:
 
 
 def _sender_is_authorized(peer: str) -> bool:
-    """Adapter-layer DM allowlist (VECTOR_ALLOW_ALL_USERS / VECTOR_ALLOWED_USERS)."""
-    if _allow_all_users():
-        return True
+    """Adapter-layer DM allowlist (VECTOR_ALLOWED_USERS)."""
     npub = normalize_npub(peer) or (peer or "").strip()
     if not npub:
         return False
@@ -867,8 +876,8 @@ def _sender_is_authorized(peer: str) -> bool:
 def _is_home_operator(peer: str) -> bool:
     """True when this DM is ``VECTOR_HOME_CHANNEL``.
 
-    Operator commands (mute, parked invites) stay here. Allowlisted users,
-    pairing-approved senders, and ``VECTOR_ALLOW_ALL_USERS`` do not grant this.
+    Operator commands (mute, parked invites) stay here. Allowlisted users
+    and pairing-approved senders do not grant this.
     """
     npub = normalize_npub(peer) or (peer or "").strip()
     home = _home_operator_npub()
@@ -894,12 +903,10 @@ def _parse_invite_command(text: str) -> Optional[Tuple[str, str]]:
 def _group_sender_is_authorized(peer: str, channel_id: str) -> bool:
     """Who may trigger a community turn.
 
-    Union: ``VECTOR_ALLOW_ALL_USERS``, channel in ``VECTOR_GROUP_ALLOW_ALL``,
-    DM allowlist (``VECTOR_ALLOWED_USERS``), or ``VECTOR_GROUP_ALLOWED_USERS``.
+    Union: channel in ``VECTOR_GROUP_ALLOW_ALL``, DM allowlist
+    (``VECTOR_ALLOWED_USERS``), or ``VECTOR_GROUP_ALLOWED_USERS``.
     Pairing is never offered in a channel.
     """
-    if _allow_all_users():
-        return True
     cid = normalize_channel_id(channel_id) or (channel_id or "").strip().lower()
     if cid and cid in _group_allow_all_chats():
         return True
@@ -959,11 +966,9 @@ class VectorAdapter(BasePlatformAdapter):
         raw_avatar = (
             extra.get("bot_avatar") or os.getenv("VECTOR_BOT_AVATAR") or ""
         ).strip()
-        self.bot_avatar: Optional[Path] = Path(raw_avatar).expanduser() if raw_avatar else None
         raw_banner = (
             extra.get("bot_banner") or os.getenv("VECTOR_BOT_BANNER") or ""
         ).strip()
-        self.bot_banner: Optional[Path] = Path(raw_banner).expanduser() if raw_banner else None
         self.startup_timeout: int = int(
             os.getenv("VECTOR_STARTUP_TIMEOUT")
             or extra.get("startup_timeout")
@@ -971,6 +976,12 @@ class VectorAdapter(BasePlatformAdapter):
         )
         self._npub: Optional[str] = extra.get("npub") or (os.getenv("VECTOR_NPUB") or "").strip() or None
         self.data_dir: Path = Path(extra.get("data_dir") or resolve_data_dir())
+        self.bot_avatar: Optional[Path] = (
+            Path(raw_avatar).expanduser() if raw_avatar else discover_bot_image(self.data_dir, "avatar")
+        )
+        self.bot_banner: Optional[Path] = (
+            Path(raw_banner).expanduser() if raw_banner else discover_bot_image(self.data_dir, "banner")
+        )
         self.bridge_url: str = f"http://{_client_host(self.bridge_host)}:{self.bridge_port}"
 
         self._bridge_process: Optional[subprocess.Popen] = None
@@ -3197,6 +3208,9 @@ class VectorAdapter(BasePlatformAdapter):
         env.pop("VECTOR_BOT_ABOUT", None)
         env.pop("VECTOR_BOT_AVATAR", None)
         env.pop("VECTOR_BOT_BANNER", None)
+        extra = getattr(self.config, "extra", None) or {}
+        if isinstance(extra, dict):
+            _overlay_sidecar_extra_env(env, extra)
         if self.bot_name:
             env["VECTOR_BOT_NAME"] = self.bot_name
         if self.bot_about:
@@ -3393,7 +3407,7 @@ def _env_enablement():
     if home:
         seed["home_channel"] = {
             "chat_id": normalize_npub(home) or home,
-            "name": os.getenv("VECTOR_HOME_CHANNEL_NAME") or "Home",
+            "name": "Home",
         }
     group_users = (os.getenv("VECTOR_GROUP_ALLOWED_USERS") or "").strip()
     if group_users:
@@ -3475,6 +3489,35 @@ def _parse_bridge_json(text: str) -> Optional[Dict[str, Any]]:
         ):
             return data
     return None
+
+
+def _overlay_sidecar_extra_env(env: Dict[str, str], extra: dict) -> None:
+    """Copy YAML-seeded extra flags into sidecar env when unset."""
+    mapping = (
+        ("VECTOR_INVITE_POLICY", "invite_policy"),
+        ("VECTOR_TRUSTED_INVITERS", "trusted_inviters"),
+        ("VECTOR_SLASH_COMMANDS", "slash_commands"),
+        ("VECTOR_MISSED_REACT", "missed_react"),
+        ("VECTOR_MISSED_REACT_EMOJI", "missed_react_emoji"),
+        ("VECTOR_COMMUNITY_NAME", "community_name"),
+        ("VECTOR_CREATE_COMMUNITY", "create_community"),
+        ("VECTOR_COMMUNITY_DOWNLOAD_ALL", "community_download_all"),
+        ("VECTOR_REACTIONS", "reactions"),
+        ("VECTOR_GROUP_ALLOWED_USERS", "group_allowed_users"),
+        ("VECTOR_GROUP_ALLOW_ALL", "group_allowed_chats"),
+    )
+    for env_key, extra_key in mapping:
+        if (env.get(env_key) or "").strip():
+            continue
+        val = extra.get(extra_key)
+        if val is None or val == "":
+            continue
+        if isinstance(val, bool):
+            env[env_key] = "on" if val else "off"
+        elif isinstance(val, (list, tuple)):
+            env[env_key] = ",".join(str(v).strip() for v in val if str(v).strip())
+        else:
+            env[env_key] = str(val)
 
 
 def _bridge_cli_env(data_dir: Path) -> Dict[str, str]:
@@ -3712,19 +3755,23 @@ def _quote_yaml11_str(value: Any) -> Any:
         return value
 
 
-def _merge_vector_display_config(config_path: Optional[Path] = None) -> bool:
+def _merge_vector_display_config(
+    config_path: Optional[Path] = None,
+    platform: Optional[Dict[str, Any]] = None,
+) -> bool:
     """D12: merge display.platforms.vector without clobbering other keys.
 
     Prefers ruamel round-trip so comments, key order, and quoting survive.
     Falls back to PyYAML (full dump) if ruamel is unavailable. Unparseable
-    or non-mapping roots are refused rather than overwritten.
+    or non-mapping roots are refused rather than overwritten. ``platform``
+    is merged into the top-level ``vector:`` block (None values delete keys).
     """
     path = Path(config_path) if config_path else _config_yaml_path()
     if not _display_config_is_writable(path):
         return False
-    if _merge_display_ruamel(path):
+    if _merge_display_ruamel(path, platform):
         return True
-    return _merge_display_pyyaml(path)
+    return _merge_display_pyyaml(path, platform)
 
 
 def _display_config_is_writable(path: Path) -> bool:
@@ -3771,6 +3818,200 @@ def _apply_vector_display_settings(root: dict) -> None:
         vector[key] = value
 
 
+def _apply_vector_platform_settings(root: dict, platform: Optional[Dict[str, Any]]) -> None:
+    """Replace named keys under top-level ``vector:``. None / empty pops."""
+    if not platform:
+        return
+    vector = _ensure_mapping(root, "vector")
+    for key, value in platform.items():
+        if value is None or value == {} or value == []:
+            vector.pop(key, None)
+        else:
+            vector[key] = value
+    if not vector:
+        root.pop("vector", None)
+
+
+def _read_vector_yaml_block(config_path: Optional[Path] = None) -> dict:
+    """Best-effort load of top-level ``vector:`` from config.yaml."""
+    path = Path(config_path) if config_path else _config_yaml_path()
+    if not path.is_file():
+        return {}
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    block = loaded.get("vector")
+    return block if isinstance(block, dict) else {}
+
+
+def _yaml_list_to_csv(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(v).strip() for v in value if str(v).strip())
+    return str(value).strip()
+
+
+def _yaml_on_off(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    text = str(value).strip().lower()
+    if text in ("on", "true", "1", "yes"):
+        return "on"
+    if text in ("off", "false", "0", "no"):
+        return "off"
+    return None
+
+
+def _set_env_if_unset(key: str, value: Optional[str], *, skip: bool) -> None:
+    if skip or value is None:
+        return
+    if (os.getenv(key) or "").strip():
+        return
+    os.environ[key] = value
+
+
+def _build_setup_vector_yaml(
+    *,
+    bot_name: str,
+    bot_about: str,
+    pairing_on: bool,
+    group_users: List[str],
+    open_chats: List[str],
+    create_home: bool,
+    community_name: str,
+) -> Dict[str, Any]:
+    """Wizard answers as a top-level ``vector:`` mapping. Empties clear keys."""
+    bot: Dict[str, Any] = {}
+    if bot_name:
+        bot["name"] = bot_name
+    if bot_about:
+        bot["about"] = bot_about
+    communities: Dict[str, Any] = {}
+    if group_users:
+        communities["group_allowed_users"] = list(group_users)
+    if open_chats:
+        communities["open_channels"] = list(open_chats)
+    if create_home:
+        communities["create"] = True
+        if community_name:
+            communities["name"] = community_name
+    return {
+        "bot": bot or None,
+        "communities": communities or None,
+        "unauthorized_dm_behavior": None if pairing_on else "ignore",
+    }
+
+
+def _profile_scoped_config_load() -> bool:
+    """True inside a multiplexed secondary profile's secret scope."""
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        return bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return False
+
+
+def _apply_yaml_config(yaml_cfg: dict, vector_cfg: dict) -> Optional[dict]:
+    """Translate config.yaml ``vector:`` keys into env + PlatformConfig.extra.
+
+    Env wins. Sidecar still reads VECTOR_* process env; this hook is the
+    YAML→env bridge (same pattern as Discord / Mattermost).
+    """
+    if not isinstance(vector_cfg, dict):
+        vector_cfg = {}
+    skip = _profile_scoped_config_load()
+    seeded: Dict[str, Any] = {}
+
+    bot = vector_cfg.get("bot")
+    if isinstance(bot, dict):
+        name = str(bot.get("name") or "").strip()
+        about = str(bot.get("about") or "").strip()
+        avatar = str(bot.get("avatar") or "").strip()
+        banner = str(bot.get("banner") or "").strip()
+        if name:
+            seeded["bot_name"] = name
+            _set_env_if_unset("VECTOR_BOT_NAME", name, skip=skip)
+        if about:
+            seeded["bot_about"] = about
+            _set_env_if_unset("VECTOR_BOT_ABOUT", about, skip=skip)
+        if avatar:
+            seeded["bot_avatar"] = avatar
+            _set_env_if_unset("VECTOR_BOT_AVATAR", avatar, skip=skip)
+        if banner:
+            seeded["bot_banner"] = banner
+            _set_env_if_unset("VECTOR_BOT_BANNER", banner, skip=skip)
+
+    if "reactions" in vector_cfg:
+        reactions = _yaml_on_off(vector_cfg.get("reactions"))
+        if reactions is not None:
+            seeded["reactions"] = reactions
+            _set_env_if_unset("VECTOR_REACTIONS", reactions, skip=skip)
+    if "missed_react" in vector_cfg:
+        missed = _yaml_on_off(vector_cfg.get("missed_react"))
+        if missed is not None:
+            seeded["missed_react"] = missed
+            _set_env_if_unset("VECTOR_MISSED_REACT", missed, skip=skip)
+    emoji = str(vector_cfg.get("missed_react_emoji") or "").strip()
+    if emoji:
+        seeded["missed_react_emoji"] = emoji
+        _set_env_if_unset("VECTOR_MISSED_REACT_EMOJI", emoji, skip=skip)
+    if "slash_commands" in vector_cfg:
+        slash = _yaml_on_off(vector_cfg.get("slash_commands"))
+        if slash is not None:
+            seeded["slash_commands"] = slash
+            _set_env_if_unset("VECTOR_SLASH_COMMANDS", slash, skip=skip)
+
+    behavior = str(vector_cfg.get("unauthorized_dm_behavior") or "").strip().lower()
+    if behavior == "ignore":
+        _set_env_if_unset("VECTOR_PAIRING", "off", skip=skip)
+    elif behavior == "pair":
+        _set_env_if_unset("VECTOR_PAIRING", "on", skip=skip)
+
+    communities = vector_cfg.get("communities")
+    if isinstance(communities, dict):
+        if "create" in communities:
+            create = _yaml_on_off(communities.get("create"))
+            if create is not None:
+                seeded["create_community"] = create
+                _set_env_if_unset("VECTOR_CREATE_COMMUNITY", create, skip=skip)
+        cname = str(communities.get("name") or "").strip()
+        if cname:
+            seeded["community_name"] = cname
+            _set_env_if_unset("VECTOR_COMMUNITY_NAME", cname, skip=skip)
+        if "download_all" in communities:
+            download = _yaml_on_off(communities.get("download_all"))
+            if download is not None:
+                seeded["community_download_all"] = download
+                _set_env_if_unset("VECTOR_COMMUNITY_DOWNLOAD_ALL", download, skip=skip)
+        policy = str(communities.get("invite_policy") or "").strip().lower()
+        if policy:
+            seeded["invite_policy"] = policy
+            _set_env_if_unset("VECTOR_INVITE_POLICY", policy, skip=skip)
+        group_users = _yaml_list_to_csv(communities.get("group_allowed_users"))
+        if group_users:
+            seeded["group_allowed_users"] = group_users
+            _set_env_if_unset("VECTOR_GROUP_ALLOWED_USERS", group_users, skip=skip)
+        open_channels = _yaml_list_to_csv(communities.get("open_channels"))
+        if open_channels:
+            seeded["group_allowed_chats"] = open_channels
+            _set_env_if_unset("VECTOR_GROUP_ALLOW_ALL", open_channels, skip=skip)
+        inviters = _yaml_list_to_csv(communities.get("trusted_inviters"))
+        if inviters:
+            seeded["trusted_inviters"] = inviters
+            _set_env_if_unset("VECTOR_TRUSTED_INVITERS", inviters, skip=skip)
+
+    return seeded or None
+
+
 def _atomic_write_text(path: Path, writer) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
@@ -3789,7 +4030,7 @@ def _atomic_write_text(path: Path, writer) -> None:
         raise
 
 
-def _merge_display_ruamel(path: Path) -> bool:
+def _merge_display_ruamel(path: Path, platform: Optional[Dict[str, Any]] = None) -> bool:
     try:
         from ruamel.yaml import YAML
         from ruamel.yaml.comments import CommentedMap
@@ -3827,6 +4068,7 @@ def _merge_display_ruamel(path: Path) -> bool:
         vector = _cm(_cm(_cm(data, "display"), "platforms"), "vector")
         for key, value in _VECTOR_DISPLAY_SETTINGS.items():
             vector[key] = _quote_yaml11_str(value)
+        _apply_vector_platform_settings(data, platform)
 
         _atomic_write_text(path, lambda fh: yaml_rt.dump(data, fh))
         return True
@@ -3835,7 +4077,9 @@ def _merge_display_ruamel(path: Path) -> bool:
         return False
 
 
-def _merge_display_pyyaml(path: Path) -> bool:
+def _merge_display_pyyaml(
+    path: Path, platform: Optional[Dict[str, Any]] = None
+) -> bool:
     try:
         import yaml
     except ImportError:
@@ -3859,6 +4103,7 @@ def _merge_display_pyyaml(path: Path) -> bool:
                 data = loaded
 
     _apply_vector_display_settings(data)
+    _apply_vector_platform_settings(data, platform)
 
     class _Dumper(yaml.SafeDumper):
         pass
@@ -4086,14 +4331,16 @@ async def _standalone_send(
         return {"error": f"Vector send failed: {e}"}
 
 
-def _maybe_merge_display(io) -> None:
-    if _merge_vector_display_config():
+def _maybe_merge_display(io, platform: Optional[Dict[str, Any]] = None) -> None:
+    if _merge_vector_display_config(platform=platform):
         io.print_info(
             "Wrote display.platforms.vector.tool_progress: new to config.yaml"
         )
+        if platform:
+            io.print_info("Wrote vector: settings to config.yaml")
     else:
         io.print_warning(
-            "Could not merge display.platforms.vector into config.yaml. "
+            "Could not merge Vector settings into config.yaml. "
             "Add tool_progress: new under display.platforms.vector yourself "
             "or Hermes inherits the global default (all)."
         )
@@ -4226,22 +4473,27 @@ def _run_interactive_setup(io) -> None:
         "anyone who has the bot npub can fetch them from relays. Leave them "
         "blank to publish no profile card."
     )
+    existing_vector = _read_vector_yaml_block()
+    bot_yaml = existing_vector.get("bot")
+    bot_yaml = bot_yaml if isinstance(bot_yaml, dict) else {}
+    comm_yaml = existing_vector.get("communities")
+    comm_yaml = comm_yaml if isinstance(comm_yaml, dict) else {}
     bot_name = (
         io.prompt(
             "Bot display name (optional, public; blank = do not publish)",
-            default=io.get_env_value("VECTOR_BOT_NAME") or None,
+            default=(bot_yaml.get("name") or io.get_env_value("VECTOR_BOT_NAME") or None),
         )
         or ""
     ).strip()
     bot_about = (
         io.prompt(
             "Bot about text (optional, public; blank = do not publish)",
-            default=io.get_env_value("VECTOR_BOT_ABOUT") or None,
+            default=(bot_yaml.get("about") or io.get_env_value("VECTOR_BOT_ABOUT") or None),
         )
         or ""
     ).strip()
 
-    current_avatar = (io.get_env_value("VECTOR_BOT_AVATAR") or "").strip()
+    current_avatar = discover_bot_image(data_dir, "avatar")
     if current_avatar:
         io.print_info(f"Current bot avatar: {current_avatar}")
     avatar_raw = (
@@ -4259,7 +4511,7 @@ def _run_interactive_setup(io) -> None:
             io.print_error(f"Avatar not installed: {e}")
             io.print_info("Continuing without changing the avatar.")
 
-    current_banner = (io.get_env_value("VECTOR_BOT_BANNER") or "").strip()
+    current_banner = discover_bot_image(data_dir, "banner")
     if current_banner:
         io.print_info(f"Current bot banner: {current_banner}")
     banner_raw = (
@@ -4298,7 +4550,9 @@ def _run_interactive_setup(io) -> None:
         "Enable pairing codes for unknown npubs?", True
     )
 
-    existing_group_users = (io.get_env_value("VECTOR_GROUP_ALLOWED_USERS") or "").strip()
+    existing_group_users = _yaml_list_to_csv(comm_yaml.get("group_allowed_users")) or (
+        io.get_env_value("VECTOR_GROUP_ALLOWED_USERS") or ""
+    ).strip()
     io.print_info(
         "Group-only npubs can @mention the bot in those rooms without DM access. "
         "People already in VECTOR_ALLOWED_USERS can talk in groups automatically. "
@@ -4319,14 +4573,16 @@ def _run_interactive_setup(io) -> None:
         elif part.strip() and not npub:
             io.print_warning(f"Skipping invalid group-only npub: {part.strip()[:20]}")
 
-    existing_open = (io.get_env_value("VECTOR_GROUP_ALLOW_ALL") or "").strip()
+    existing_open = _yaml_list_to_csv(comm_yaml.get("open_channels")) or (
+        io.get_env_value("VECTOR_GROUP_ALLOW_ALL") or ""
+    ).strip()
     io.print_info(
         "Open channels: any member may @mention or reply to the bot "
         "(@everyone is ignored). Leave blank unless you want a whole room open."
     )
     open_raw = (
         io.prompt(
-            "Open community channel ids (VECTOR_GROUP_ALLOW_ALL)",
+            "Open community channel ids (64-hex)",
             default=existing_open or None,
         )
         or ""
@@ -4404,33 +4660,20 @@ def _run_interactive_setup(io) -> None:
 
     existing_allowed = io.get_env_value("VECTOR_ALLOWED_USERS") or ""
     io.save_env_value("VECTOR_NPUB", bot_npub)
-    io.save_env_value("VECTOR_BOT_NAME", bot_name)
-    io.save_env_value("VECTOR_BOT_ABOUT", bot_about)
-    if pending_avatar:
-        try:
-            installed = install_bot_image(pending_avatar, data_dir, "avatar")
-            io.save_env_value("VECTOR_BOT_AVATAR", str(installed))
-        except ValueError as e:
-            io.print_error(f"Avatar not installed: {e}")
-    if pending_banner:
-        try:
-            installed = install_bot_image(pending_banner, data_dir, "banner")
-            io.save_env_value("VECTOR_BOT_BANNER", str(installed))
-        except ValueError as e:
-            io.print_error(f"Banner not installed: {e}")
-    io.save_env_value("VECTOR_DATA_DIR", str(data_dir))
     io.save_env_value("VECTOR_HOME_CHANNEL", operator_npub)
     io.save_env_value(
         "VECTOR_ALLOWED_USERS", _merge_allowed_users(operator_npub, existing_allowed)
     )
-    io.save_env_value("VECTOR_PAIRING", "on" if pairing_on else "off")
-    if group_users:
-        io.save_env_value("VECTOR_GROUP_ALLOWED_USERS", ",".join(group_users))
-    if open_chats:
-        io.save_env_value("VECTOR_GROUP_ALLOW_ALL", ",".join(open_chats))
-    io.save_env_value("VECTOR_CREATE_COMMUNITY", "on" if create_home else "off")
-    if create_home:
-        io.save_env_value("VECTOR_COMMUNITY_NAME", community_name)
+    if pending_avatar:
+        try:
+            install_bot_image(pending_avatar, data_dir, "avatar")
+        except ValueError as e:
+            io.print_error(f"Avatar not installed: {e}")
+    if pending_banner:
+        try:
+            install_bot_image(pending_banner, data_dir, "banner")
+        except ValueError as e:
+            io.print_error(f"Banner not installed: {e}")
 
     if env_nsec:
         io.print_warning(
@@ -4441,7 +4684,18 @@ def _run_interactive_setup(io) -> None:
             "VECTOR_MNEMONIC is still in .env. Delete it after you have a backup."
         )
 
-    _maybe_merge_display(io)
+    _maybe_merge_display(
+        io,
+        platform=_build_setup_vector_yaml(
+            bot_name=bot_name,
+            bot_about=bot_about,
+            pairing_on=pairing_on,
+            group_users=group_users,
+            open_chats=open_chats,
+            create_home=create_home,
+            community_name=community_name,
+        ),
+    )
 
     if status == "created":
         io.print_success(f"Account created! Bot npub: {bot_npub}")
@@ -4452,14 +4706,14 @@ def _run_interactive_setup(io) -> None:
     io.print_info("Share this npub with contacts.")
     io.print_info(
         "Communities: invite the bot from a trusted npub; it auto-joins and "
-        "listens. @mention or reply to take a turn. "
-        "VECTOR_GROUP_ALLOWED_USERS is group-only; VECTOR_GROUP_ALLOW_ALL "
-        "opens a listed channel to every member (mention/reply only)."
+        "listens. @mention or reply to take a turn. Group-only npubs and "
+        "open channel ids live under vector.communities in config.yaml."
     )
     if create_home:
         io.print_info(
-            "VECTOR_CREATE_COMMUNITY=on — the gateway will create or reuse a "
-            "private home community after Ready (no public invite link)."
+            "Home community create is on in config.yaml — the gateway will "
+            "create or reuse a private home community after Ready (no public "
+            "invite link)."
         )
     backup_bits = [str(data_dir / "identity.nsec")]
     mnemonic_path = data_dir / "identity.mnemonic"
@@ -4499,11 +4753,11 @@ def register(ctx) -> None:
         ),
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
+        apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="VECTOR_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
         parse_target_ref_fn=_parse_target_ref,
         allowed_users_env="VECTOR_ALLOWED_USERS",
-        allow_all_env="VECTOR_ALLOW_ALL_USERS",
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="🛡️",
         pii_safe=False,

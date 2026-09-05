@@ -281,12 +281,9 @@ class TestBlockCommandParse:
     def test_home_operator_only(self, monkeypatch):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
         monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         assert not vector_adapter._is_home_operator(PEER_NPUB)
         monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
         assert vector_adapter._is_home_operator(NPUB)
-        assert not vector_adapter._is_home_operator(PEER_NPUB)
-        monkeypatch.setenv("VECTOR_ALLOW_ALL_USERS", "1")
         assert not vector_adapter._is_home_operator(PEER_NPUB)
 
 
@@ -342,7 +339,6 @@ class TestGroupSenderAuth:
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
         monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
         monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is True
         assert vector_adapter._group_sender_is_authorized(NPUB, CHANNEL_ID) is False
 
@@ -350,7 +346,6 @@ class TestGroupSenderAuth:
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
         monkeypatch.setenv("VECTOR_GROUP_ALLOWED_USERS", PEER_HEX)
         monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is True
         assert vector_adapter._sender_is_authorized(PEER_NPUB) is False
 
@@ -358,7 +353,6 @@ class TestGroupSenderAuth:
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
         monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
         monkeypatch.setenv("VECTOR_GROUP_ALLOW_ALL", CHANNEL_ID.upper())
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is True
         other = "cd" * 32
         assert vector_adapter._group_sender_is_authorized(PEER_NPUB, other) is False
@@ -367,15 +361,13 @@ class TestGroupSenderAuth:
         monkeypatch.delenv("VECTOR_ALLOWED_USERS", raising=False)
         monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
         monkeypatch.setenv("VECTOR_GROUP_ALLOW_ALL", "*")
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is False
 
-    def test_global_allow_all_users(self, monkeypatch):
+    def test_no_open_override_without_allowlist(self, monkeypatch):
         monkeypatch.delenv("VECTOR_ALLOWED_USERS", raising=False)
         monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
         monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
-        monkeypatch.setenv("VECTOR_ALLOW_ALL_USERS", "true")
-        assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is True
+        assert vector_adapter._group_sender_is_authorized(PEER_NPUB, CHANNEL_ID) is False
 
 
 class TestTruncateNpub:
@@ -494,10 +486,9 @@ class TestEnvEnablement:
     def test_home_channel_seeded(self, monkeypatch):
         monkeypatch.setenv("VECTOR_NPUB", NPUB)
         monkeypatch.setenv("VECTOR_HOME_CHANNEL", HEX_PUBKEY)
-        monkeypatch.setenv("VECTOR_HOME_CHANNEL_NAME", "Me")
         seed = vector_adapter._env_enablement()
         assert seed["home_channel"]["chat_id"] == NPUB
-        assert seed["home_channel"]["name"] == "Me"
+        assert seed["home_channel"]["name"] == "Home"
 
     def test_seeds_bot_avatar(self, monkeypatch):
         monkeypatch.setenv("VECTOR_NPUB", NPUB)
@@ -574,6 +565,14 @@ class TestInstallBotAvatar:
         else:
             raise AssertionError("expected ValueError")
 
+    def test_discover_finds_copied_image(self, tmp_path):
+        src = tmp_path / "face.png"
+        src.write_bytes(b"png")
+        dest = vector_adapter.install_bot_avatar(str(src), tmp_path / "sdk")
+        found = vector_adapter.discover_bot_image(tmp_path / "sdk", "avatar")
+        assert found == dest
+        assert vector_adapter.discover_bot_image(tmp_path / "sdk", "banner") is None
+
 
 class TestValidateConfig:
     def test_true_with_env(self, monkeypatch):
@@ -631,7 +630,8 @@ class TestRegister:
         assert kwargs["label"] == "Vector"
         assert kwargs["cron_deliver_env_var"] == "VECTOR_HOME_CHANNEL"
         assert kwargs["allowed_users_env"] == "VECTOR_ALLOWED_USERS"
-        assert kwargs["allow_all_env"] == "VECTOR_ALLOW_ALL_USERS"
+        assert "allow_all_env" not in kwargs or not kwargs.get("allow_all_env")
+        assert kwargs["apply_yaml_config_fn"] is vector_adapter._apply_yaml_config
         assert kwargs["parse_target_ref_fn"] is vector_adapter._parse_target_ref
         assert kwargs["parse_target_ref_fn"] is not vector_adapter.normalize_npub
         assert kwargs["parse_target_ref_fn"] is not vector_adapter._parse_npub_target
@@ -990,11 +990,14 @@ def _make_adapter(monkeypatch, tmp_path, **extra):
     vector_adapter._known_channel_ids.clear()
     if extra.get("allowed_users"):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", extra["allowed_users"])
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
     if extra.get("group_allowed_users"):
         monkeypatch.setenv("VECTOR_GROUP_ALLOWED_USERS", extra["group_allowed_users"])
+    else:
+        monkeypatch.delenv("VECTOR_GROUP_ALLOWED_USERS", raising=False)
     if extra.get("group_allow_all"):
         monkeypatch.setenv("VECTOR_GROUP_ALLOW_ALL", extra["group_allow_all"])
+    else:
+        monkeypatch.delenv("VECTOR_GROUP_ALLOW_ALL", raising=False)
     if extra.get("create_community"):
         monkeypatch.setenv("VECTOR_CREATE_COMMUNITY", "on")
     else:
@@ -1220,7 +1223,7 @@ class TestJoinedChannelNotice:
         assert "I joined Ada's house." in body
         assert f"channel_id: {CHANNEL_ID}" in body
         assert f"community_id: {community}" in body
-        assert "VECTOR_GROUP_ALLOW_ALL" in body
+        assert "vector.communities.open_channels" in body
         assert "general" in body
 
     def test_load_save_roundtrip(self, tmp_path):
@@ -2226,6 +2229,14 @@ class TestSpawnEnv:
         assert captured["kwargs"]["env"]["VECTOR_BOT_BANNER"] == str(pic.resolve())
         adapter._close_bridge_log()
 
+    def test_init_discovers_avatar_in_data_dir(self, monkeypatch, tmp_path):
+        data_dir = tmp_path / "sdk"
+        data_dir.mkdir()
+        pic = data_dir / "avatar.png"
+        pic.write_bytes(b"png")
+        adapter = _make_adapter(monkeypatch, tmp_path, data_dir=str(data_dir))
+        assert adapter.bot_avatar == pic
+
 
 class TestConnectMissingBinary:
     def test_missing_binary_is_fatal_not_retryable(self, monkeypatch, tmp_path):
@@ -2899,7 +2910,6 @@ class TestPairingHelpers:
 
     def test_sender_authorized_via_hex_allowlist(self, monkeypatch):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", HEX_PUBKEY)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         assert vector_adapter._sender_is_authorized(NPUB) is True
         assert vector_adapter._sender_is_authorized(PEER_NPUB) is False
 
@@ -2908,7 +2918,6 @@ class TestPairingPrefilter:
     def test_off_drops_unauthorized_before_handle_message(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VECTOR_PAIRING", "off")
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         adapter = _make_adapter(monkeypatch, tmp_path)
         captured = []
 
@@ -2926,7 +2935,6 @@ class TestPairingPrefilter:
     def test_off_allows_allowlisted_sender(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VECTOR_PAIRING", "off")
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_HEX)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         adapter = _make_adapter(monkeypatch, tmp_path)
         captured = []
 
@@ -2945,7 +2953,6 @@ class TestPairingPrefilter:
     def test_on_forwards_unauthorized_for_pairing_code(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VECTOR_PAIRING", "on")
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         adapter = _make_adapter(monkeypatch, tmp_path)
         captured = []
 
@@ -2960,24 +2967,6 @@ class TestPairingPrefilter:
         )
         assert len(captured) == 1
         assert captured[0].source.chat_id == PEER_NPUB
-
-    def test_off_allow_all_users_still_forwards(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("VECTOR_PAIRING", "off")
-        monkeypatch.delenv("VECTOR_ALLOWED_USERS", raising=False)
-        monkeypatch.setenv("VECTOR_ALLOW_ALL_USERS", "true")
-        adapter = _make_adapter(monkeypatch, tmp_path)
-        captured = []
-
-        async def capture(event):
-            captured.append(event)
-
-        adapter.handle_message = capture  # type: ignore[method-assign]
-        asyncio.run(
-            adapter._handle_message_event(
-                _message_event(PEER_NPUB, "open", msg_id="open-1")
-            )
-        )
-        assert len(captured) == 1
 
 
 class TestDisplayYamlMerge:
@@ -3004,6 +2993,23 @@ class TestDisplayYamlMerge:
         assert data["display"]["platforms"]["vector"]["long_running_notifications"] is False
         assert data["display"]["platforms"]["vector"]["busy_ack_detail"] is False
         assert data["display"]["platforms"]["vector"]["streaming"] is False
+
+    def test_writes_vector_platform_block(self, tmp_path):
+        if yaml is None:
+            return
+        path = tmp_path / "config.yaml"
+        path.write_text("model:\n  default: foo\n", encoding="utf-8")
+        platform = {
+            "bot": {"name": "Ada"},
+            "unauthorized_dm_behavior": "ignore",
+            "communities": {"create": True, "name": "Hermes"},
+        }
+        assert vector_adapter._merge_vector_display_config(path, platform) is True
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["model"]["default"] == "foo"
+        assert data["vector"]["bot"]["name"] == "Ada"
+        assert data["vector"]["unauthorized_dm_behavior"] == "ignore"
+        assert data["vector"]["communities"]["create"] is True
 
     def test_creates_file_when_missing(self, tmp_path):
         if yaml is None:
@@ -3053,6 +3059,81 @@ class TestDisplayYamlMerge:
         path.write_text(original, encoding="utf-8")
         assert vector_adapter._merge_vector_display_config(path) is False
         assert path.read_text(encoding="utf-8") == original
+
+    def test_clears_vector_keys_when_none(self, tmp_path):
+        if yaml is None:
+            return
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            "vector:\n  unauthorized_dm_behavior: ignore\n  bot:\n    name: Ada\n",
+            encoding="utf-8",
+        )
+        assert (
+            vector_adapter._merge_vector_display_config(
+                path,
+                {
+                    "bot": {"name": "Ada"},
+                    "unauthorized_dm_behavior": None,
+                    "communities": None,
+                },
+            )
+            is True
+        )
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert data["vector"]["bot"]["name"] == "Ada"
+        assert "unauthorized_dm_behavior" not in data["vector"]
+        assert "communities" not in data["vector"]
+
+
+class TestApplyYamlConfig:
+    def test_bridges_bot_and_communities(self, monkeypatch):
+        keys = (
+            "VECTOR_BOT_NAME",
+            "VECTOR_BOT_ABOUT",
+            "VECTOR_CREATE_COMMUNITY",
+            "VECTOR_GROUP_ALLOW_ALL",
+            "VECTOR_GROUP_ALLOWED_USERS",
+            "VECTOR_PAIRING",
+            "VECTOR_REACTIONS",
+        )
+        saved = {k: os.environ.get(k) for k in keys}
+        try:
+            for k in keys:
+                os.environ.pop(k, None)
+            seeded = vector_adapter._apply_yaml_config(
+                {},
+                {
+                    "bot": {"name": "Ada", "about": "bot"},
+                    "unauthorized_dm_behavior": "ignore",
+                    "reactions": True,
+                    "communities": {
+                        "create": True,
+                        "open_channels": [CHANNEL_ID],
+                        "group_allowed_users": [PEER_NPUB],
+                    },
+                },
+            )
+            assert seeded["bot_name"] == "Ada"
+            assert seeded["create_community"] == "on"
+            assert seeded["group_allowed_chats"] == CHANNEL_ID
+            assert seeded["group_allowed_users"] == PEER_NPUB
+            assert os.environ["VECTOR_BOT_NAME"] == "Ada"
+            assert os.environ["VECTOR_PAIRING"] == "off"
+            assert os.environ["VECTOR_REACTIONS"] == "on"
+            assert os.environ["VECTOR_CREATE_COMMUNITY"] == "on"
+            assert os.environ["VECTOR_GROUP_ALLOW_ALL"] == CHANNEL_ID
+        finally:
+            for k in keys:
+                if saved[k] is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = saved[k]
+
+    def test_env_wins_over_yaml(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_BOT_NAME", "FromEnv")
+        seeded = vector_adapter._apply_yaml_config({}, {"bot": {"name": "FromYaml"}})
+        assert seeded["bot_name"] == "FromYaml"
+        assert os.environ["VECTOR_BOT_NAME"] == "FromEnv"
 
 
 class TestStandaloneSend:
@@ -3365,10 +3446,11 @@ class TestInteractiveSetup:
         assert io.saved["VECTOR_NPUB"] == NPUB
         assert io.saved["VECTOR_HOME_CHANNEL"] == NPUB
         assert io.saved["VECTOR_ALLOWED_USERS"] == NPUB
-        assert io.saved["VECTOR_PAIRING"] == "on"
-        assert io.saved["VECTOR_CREATE_COMMUNITY"] == "off"
-        assert io.saved["VECTOR_BOT_NAME"] == "Hermes"
-        assert io.saved["VECTOR_BOT_ABOUT"] == ""
+        assert "VECTOR_PAIRING" not in io.saved
+        assert "VECTOR_CREATE_COMMUNITY" not in io.saved
+        assert "VECTOR_BOT_NAME" not in io.saved
+        assert "VECTOR_BOT_ABOUT" not in io.saved
+        assert "VECTOR_DATA_DIR" not in io.saved
         assert "VECTOR_NSEC" not in io.saved
         assert "VECTOR_MNEMONIC" not in io.saved
         assert cli_calls[0] == ["--check"]
@@ -3376,6 +3458,9 @@ class TestInteractiveSetup:
         cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "new"
         assert cfg["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
+        assert cfg["vector"]["bot"]["name"] == "Hermes"
+        assert "unauthorized_dm_behavior" not in cfg.get("vector", {})
+        assert "communities" not in cfg.get("vector", {})
         assert any("Share this npub" in m for m in io.logs["info"])
         assert any("identity.mnemonic" in m for m in io.logs["info"])
 
@@ -3417,10 +3502,13 @@ class TestInteractiveSetup:
         assert dest.read_bytes() == b"jpeg"
         assert banner.is_file()
         assert banner.read_bytes() == b"jpeg"
-        assert io.saved["VECTOR_BOT_AVATAR"] == str(dest)
-        assert io.saved["VECTOR_BOT_BANNER"] == str(banner)
-        assert io.saved["VECTOR_BOT_NAME"] == "Hermes"
-        assert io.saved["VECTOR_BOT_ABOUT"] == "Public bio"
+        assert "VECTOR_BOT_AVATAR" not in io.saved
+        assert "VECTOR_BOT_BANNER" not in io.saved
+        assert "VECTOR_BOT_NAME" not in io.saved
+        assert "VECTOR_BOT_ABOUT" not in io.saved
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+        assert cfg["vector"]["bot"]["name"] == "Hermes"
+        assert cfg["vector"]["bot"]["about"] == "Public bio"
 
     def test_import_nsec_uses_temp_0600_file_not_env(self, monkeypatch, tmp_path):
         fake_bin = tmp_path / "vector-bridge"
@@ -3467,8 +3555,10 @@ class TestInteractiveSetup:
         assert not seen_files[0].exists()
         assert io.saved["VECTOR_HOME_CHANNEL"] == PEER_NPUB
         assert io.saved["VECTOR_ALLOWED_USERS"] == PEER_NPUB
-        assert io.saved["VECTOR_PAIRING"] == "off"
+        assert "VECTOR_PAIRING" not in io.saved
         assert "VECTOR_NSEC" not in io.saved
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+        assert cfg["vector"]["unauthorized_dm_behavior"] == "ignore"
 
     def test_existing_identity_skips_create_import_unless_confirmed(
         self, monkeypatch, tmp_path
@@ -3810,7 +3900,6 @@ class TestInboundFiles:
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setattr(
             vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
         )
@@ -3871,7 +3960,6 @@ class TestInboundFiles:
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setattr(
             vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
         )
@@ -3919,7 +4007,6 @@ class TestInboundFiles:
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setattr(
             vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
         )
@@ -4025,7 +4112,6 @@ class TestInboundFiles:
 
     def test_file_plus_caption_goes_to_agent(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setattr(
             vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
         )
@@ -4071,7 +4157,6 @@ class TestInboundFiles:
     ):
         monkeypatch.setenv("VECTOR_PAIRING", "off")
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
-        monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setattr(
             vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
         )
@@ -4586,7 +4671,7 @@ class TestReactions:
         ]
 
     def test_inbound_records_last_inbound(self, monkeypatch, tmp_path):
-        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter = _make_adapter(monkeypatch, tmp_path, allowed_users=PEER_NPUB)
         captured = []
 
         async def capture(event):
@@ -4602,7 +4687,7 @@ class TestReactions:
         assert captured[0].message_id == "live-1"
 
     def test_inbound_peer_reaction_on_ours(self, monkeypatch, tmp_path):
-        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB)
         adapter._record_sent_message("bot-msg-1")
         captured = []
 

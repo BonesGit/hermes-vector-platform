@@ -1,7 +1,7 @@
 name: vector-platform
 label: Vector
 kind: platform
-version: 0.3.0
+version: 0.4.0
 description: >
   Vector (vectorapp.io) gateway adapter for Hermes Agent.
   Spawns a local Rust sidecar wrapping vector-sdk and relays
@@ -15,107 +15,11 @@ requires_env:
     url: "https://vectorapp.io"
     password: false
 optional_env:
-  - name: VECTOR_NSEC
-    description: "Import-only. Setup copies this into sdk/identity.nsec; the sidecar never reads it. Delete from .env after setup."
-    prompt: "Vector nsec (import)"
-    password: true
-  - name: VECTOR_MNEMONIC
-    description: "Import-only 12-word BIP-39 seed (NIP-06). Setup copies it to sdk/identity.nsec + sdk/identity.mnemonic; then delete this. Create writes identity.mnemonic itself."
-    prompt: "12-word mnemonic (NIP-06 import)"
-    password: true
   - name: VECTOR_ALLOWED_USERS
     description: "Comma-separated npubs allowed to DM the bot. Also grants community turns (union). Pairing is DM-only."
     prompt: "Allowed npubs (DMs)"
     password: false
-  - name: VECTOR_ALLOW_ALL_USERS
-    description: "Allow any Vector user (dev only)"
-    prompt: "Allow all users?"
-    password: false
   - name: VECTOR_HOME_CHANNEL
     description: "Operator npub for cron / join notices (channel ids)"
     prompt: "Home npub"
-    password: false
-  - name: VECTOR_BOT_NAME
-    description: "Optional public display name (Nostr kind-0). Blank = do not publish a profile name."
-    prompt: "Bot display name (optional, public)"
-    password: false
-  - name: VECTOR_BOT_ABOUT
-    description: "Optional public about/bio text (Nostr kind-0). Blank = do not publish about."
-    prompt: "Bot about text (optional, public)"
-    password: false
-  - name: VECTOR_BOT_AVATAR
-    description: "Optional public avatar (jpg/png/webp/gif → Blossom URL in kind-0). Blank = do not publish a picture."
-    prompt: "Bot avatar image path (optional, public)"
-    password: false
-  - name: VECTOR_BOT_BANNER
-    description: "Optional public banner (jpg/png/webp/gif → Blossom URL in kind-0). Blank = do not publish a banner."
-    prompt: "Bot banner image path (optional, public)"
-    password: false
-  - name: VECTOR_DATA_DIR
-    description: "Absolute path for Vector SDK data (default plugin-data/vector-platform/sdk)"
-    prompt: "Data dir"
-    password: false
-  - name: VECTOR_BRIDGE_PORT
-    description: "Local HTTP port for the Rust sidecar (default 8096)"
-    prompt: "Bridge port"
-    password: false
-  - name: VECTOR_BRIDGE_HOST
-    description: "Sidecar bind address (default 127.0.0.1). LAN bind is a risk even with the token."
-    prompt: "Bridge host"
-    password: false
-  - name: VECTOR_BRIDGE_BIN
-    description: "Absolute path to vector-bridge binary"
-    prompt: "Bridge binary"
-    password: false
-  - name: VECTOR_STARTUP_TIMEOUT
-    description: "Seconds to wait for sidecar /health status=ready (default 60). Plugin also floors HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT to 90 if unset."
-    prompt: "Startup timeout"
-    password: false
-  - name: VECTOR_PAIRING
-    description: "on (default) = unknown npubs get a Hermes pairing code; off = drop them before handle_message"
-    prompt: "Pairing (on/off)"
-    password: false
-  - name: VECTOR_MISSED_REACT
-    description: "off = do not ❌ DMs received while the sidecar was down (default on). Concord channels are never ❌'d; missed group messages are ignored."
-    prompt: "React on missed DMs? (on/off)"
-    password: false
-  - name: VECTOR_MISSED_REACT_EMOJI
-    description: "Unicode emoji for missed-DM ack (default ❌). Sidecar only; not used unless VECTOR_MISSED_REACT is on."
-    prompt: "Missed-DM reaction emoji"
-    password: false
-  - name: VECTOR_REACTIONS
-    description: "on = react 👀 while the agent works, then ✅/❌ on the triggering DM (default off). Does not gate send_message action=react."
-    prompt: "Processing-lifecycle reactions? (on/off, default off)"
-    password: false
-  - name: VECTOR_GROUP_ALLOWED_USERS
-    description: "Comma-separated npubs who may trigger community turns without DM access. VECTOR_ALLOWED_USERS already get group access."
-    prompt: "Group-only npubs"
-    password: false
-  - name: VECTOR_GROUP_ALLOW_ALL
-    description: "Comma-separated channel ids (64-hex) where any member may @mention or reply to the bot. @everyone is ignored. No * wildcard. Copy the id from the join DM to VECTOR_HOME_CHANNEL or from vector-bridge.log (the Vector app does not show it)."
-    prompt: "Open community channel ids (any member)"
-    password: false
-  - name: VECTOR_TRUSTED_INVITERS
-    description: "Npubs whose community invites the bot auto-accepts (default: VECTOR_ALLOWED_USERS). VECTOR_INVITE_POLICY=manual parks all invites."
-    prompt: "Trusted community inviters (npubs)"
-    password: false
-  - name: VECTOR_INVITE_POLICY
-    description: "whitelist (default) or manual. public is refused."
-    prompt: "Community invite policy (whitelist/manual)"
-    password: false
-  - name: VECTOR_CREATE_COMMUNITY
-    description: "on = after Ready, create or reuse a bot-owned private Concord community (no public invite link)"
-    prompt: "Create a bot-owned home community? (on/off)"
-    password: false
-  - name: VECTOR_COMMUNITY_NAME
-    description: "Name for VECTOR_CREATE_COMMUNITY (default Hermes)"
-    prompt: "Home community name"
-    password: false
-  - name: VECTOR_COMMUNITY_DOWNLOAD_ALL
-    description: "on = download every community file on arrival (default off). Off = download only when someone replies to that file and @mentions the bot."
-    prompt: "Download all community files on arrival? (on/off, default off)"
-    password: false
-  - name: VECTOR_SLASH_COMMANDS
-    description: "off = do not publish Vector / picker commands (kind 10304). Default on. Typed /approve still works in DMs."
-    prompt: "Publish Vector slash commands? (on/off)"
     password: false

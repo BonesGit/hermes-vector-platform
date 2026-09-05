@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `VECTOR_ALLOW_ALL_USERS` (and Hermes `allow_all_env`). Open the inbox with
+  pairing + `VECTOR_ALLOWED_USERS`, or a listed channel in
+  `vector.communities.open_channels`.
+- `VECTOR_HOME_CHANNEL_NAME`. Home is a DM; status label is always `Home`.
+- Wizard persistence of `VECTOR_NSEC` / `VECTOR_MNEMONIC` / profile /
+  pairing / community / data-dir defaults into `.env`. Import still uses a
+  temp `0600` file. Leftover secret env vars are warned, then ignored by
+  the sidecar.
+
+### Changed
+
+- `plugin.yaml` now declares only `VECTOR_NPUB`, `VECTOR_ALLOWED_USERS`, and
+  `VECTOR_HOME_CHANNEL`. Profile, communities, reactions, slash commands,
+  and pairing live in `config.yaml` `vector:` (`apply_yaml_config_fn`).
+  Env still wins if a legacy `VECTOR_*` key is set.
+- Pairing off is `vector.unauthorized_dm_behavior: ignore` (Hermes shared
+  key). Adapter pre-filter still honors leftover `VECTOR_PAIRING=off`.
+- Bot avatar/banner are discovered from `sdk/avatar.*` / `sdk/banner.*`
+  when no path is configured.
+- Setup writes `vector:` (bot name/about, communities, pairing) next to
+  `display.platforms.vector`.
+- Missed Concord messages stay silent. Catch-up ❌ is **DM-only**; group
+  chatter that arrived while the sidecar was down is ignored (no reaction,
+  no Hermes turn).
+
 ### Added
 
 - Message **edit**. Sidecar `POST /edit` `{to, message_id, body}` calls
@@ -39,12 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (not the Vector `/` picker). Sidecar `GET /invites`,
   `POST /invites/accept`, `POST /invites/decline`. Accepting does not add
   the inviter to `VECTOR_ALLOWED_USERS`.
-
-### Changed
-
-- Missed Concord messages stay silent. Catch-up ❌ is **DM-only**; group
-  chatter that arrived while the sidecar was down is ignored (no reaction,
-  no Hermes turn).
 
 ## [0.3.0] — 2026-09-04
 

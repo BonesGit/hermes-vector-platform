@@ -802,6 +802,190 @@ fn sse_ping_and_fake_inject() {
     assert!(buf.contains("\"type\":\"message\""), "{buf}");
 }
 
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Inject a DM that looks freshly arrived, so replay's age horizon treats it
+/// the way it would treat a real message.
+fn inject_message(server: &Server, id: &str, text: &str) {
+    let (status, body) = post(
+        server,
+        "/__test/inject",
+        Some(&server.token),
+        json!({
+            "id": id,
+            "chat_id": VALID_NPUB,
+            "npub": VALID_NPUB,
+            "is_group": false,
+            "is_mine": false,
+            "is_file": false,
+            "text": text,
+            "reply_to": "",
+            "reply_to_text": null,
+            "at_ms": wall_clock_ms()
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+}
+
+/// Events published with no client attached must be counted as dropped, not
+/// reported as delivered.
+#[test]
+fn sse_events_without_client_are_counted_as_dropped() {
+    let server = spawn_server(&[("VECTOR_SSE_PING_MS", "5000")]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    let (_, body) = get(&server, "/health", Some(&server.token));
+    assert_eq!(body["sse_dropped"], 0);
+
+    inject_message(&server, "aaa1", "first");
+    inject_message(&server, "aaa2", "second");
+
+    let (_, body) = get(&server, "/health", Some(&server.token));
+    assert_eq!(body["sse_dropped"], 2, "{body}");
+    assert_eq!(body["sse_retained"], 2, "{body}");
+}
+
+/// A client reconnecting with Last-Event-ID gets everything after that id —
+/// this is what stops an SSE gap from silently losing DMs.
+#[test]
+fn sse_resume_replays_events_missed_during_the_gap() {
+    let server = spawn_server(&[("VECTOR_SSE_PING_MS", "5000")]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    let mut first = open_sse(server.port, &server.token);
+    inject_message(&server, "bbb1", "delivered");
+    read_sse_until(
+        &mut first,
+        |s| s.contains("id: bbb1"),
+        Duration::from_secs(3),
+    );
+    drop(first);
+
+    // Arrives while nothing is listening.
+    inject_message(&server, "bbb2", "during the gap");
+    inject_message(&server, "bbb3", "also during the gap");
+
+    let mut resumed = open_sse_resume(server.port, &server.token, Some("bbb1"));
+    let buf = read_sse_until(
+        &mut resumed,
+        |s| s.contains("id: bbb3"),
+        Duration::from_secs(3),
+    );
+    assert!(buf.contains("during the gap"), "{buf}");
+    assert!(buf.contains("also during the gap"), "{buf}");
+    assert!(
+        !buf.contains("\"text\":\"delivered\""),
+        "must not replay the already-acked event: {buf}"
+    );
+}
+
+/// End-to-end: a reconnect after a burst replays everything but flags all but
+/// the newest per chat, so the adapter only runs one turn.
+#[test]
+fn sse_resume_flags_superseded_messages_in_a_burst() {
+    let server = spawn_server(&[("VECTOR_SSE_PING_MS", "5000")]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    let mut first = open_sse(server.port, &server.token);
+    inject_message(&server, "burst0", "anchor");
+    read_sse_until(
+        &mut first,
+        |s| s.contains("id: burst0"),
+        Duration::from_secs(3),
+    );
+    drop(first);
+
+    // A frustrated peer firing off three messages into a dead stream.
+    inject_message(&server, "burst1", "hello?");
+    inject_message(&server, "burst2", "you there?");
+    inject_message(&server, "burst3", "so what do you think?");
+
+    let mut resumed = open_sse_resume(server.port, &server.token, Some("burst0"));
+    let buf = read_sse_until(
+        &mut resumed,
+        |s| s.contains("id: burst3"),
+        Duration::from_secs(3),
+    );
+
+    let superseded = buf.matches("\"superseded\":true").count();
+    let replayed = buf.matches("\"replayed\":true").count();
+    assert_eq!(replayed, 3, "all three replayed: {buf}");
+    assert_eq!(superseded, 2, "only the newest keeps its turn: {buf}");
+
+    // The one that survives is the newest.
+    let newest = buf
+        .split("data: ")
+        .find(|chunk| chunk.contains("burst3"))
+        .unwrap_or_default();
+    assert!(
+        !newest.contains("\"superseded\":true"),
+        "newest must run: {newest}"
+    );
+}
+
+/// `VECTOR_SSE_REPLAY_MAX=0` turns replay off, leaving the gap to the ❌
+/// catch-up. This is the operator's escape hatch against backlog cost.
+#[test]
+fn sse_replay_can_be_disabled_by_env() {
+    let server = spawn_server(&[
+        ("VECTOR_SSE_PING_MS", "150"),
+        ("VECTOR_SSE_REPLAY_MAX", "0"),
+    ]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    inject_message(&server, "off1", "never replayed");
+
+    let mut resumed = open_sse_resume(server.port, &server.token, Some("unknown"));
+    let buf = read_sse_until(
+        &mut resumed,
+        |s| s.contains(": ping"),
+        Duration::from_secs(3),
+    );
+    assert!(!buf.contains("never replayed"), "{buf}");
+}
+
+/// An id the ring no longer holds replays the whole retained window rather
+/// than silently delivering nothing. The client dedupes the overlap.
+#[test]
+fn sse_resume_with_unknown_id_replays_retained_window() {
+    let server = spawn_server(&[("VECTOR_SSE_PING_MS", "5000")]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    inject_message(&server, "ccc1", "older");
+    inject_message(&server, "ccc2", "newer");
+
+    let mut resumed = open_sse_resume(server.port, &server.token, Some("long-forgotten"));
+    let buf = read_sse_until(
+        &mut resumed,
+        |s| s.contains("id: ccc2"),
+        Duration::from_secs(3),
+    );
+    assert!(buf.contains("older"), "{buf}");
+    assert!(buf.contains("newer"), "{buf}");
+}
+
+/// A fresh connect (no Last-Event-ID) must not dump the backlog — the
+/// missed-DM catch-up owns that case, and replaying would re-run old turns.
+#[test]
+fn sse_fresh_connect_does_not_replay() {
+    let server = spawn_server(&[("VECTOR_SSE_PING_MS", "150")]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    inject_message(&server, "ddd1", "backlog");
+
+    let mut fresh = open_sse(server.port, &server.token);
+    let buf = read_sse_until(&mut fresh, |s| s.contains(": ping"), Duration::from_secs(3));
+    assert!(
+        !buf.contains("backlog"),
+        "fresh connect should not replay: {buf}"
+    );
+}
+
 #[test]
 fn sse_inject_group_message() {
     let server = spawn_server(&[("VECTOR_SSE_PING_MS", "5000")]);
@@ -1050,12 +1234,20 @@ struct SseClient {
 }
 
 fn open_sse(port: u16, token: &str) -> SseClient {
+    open_sse_resume(port, token, None)
+}
+
+fn open_sse_resume(port: u16, token: &str, last_event_id: Option<&str>) -> SseClient {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
+    let resume = match last_event_id {
+        Some(id) => format!("Last-Event-ID: {id}\r\n"),
+        None => String::new(),
+    };
     let req = format!(
-        "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Hermes-Sidecar-Token: {token}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Hermes-Sidecar-Token: {token}\r\nAccept: text/event-stream\r\n{resume}Connection: close\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).unwrap();
     let mut buf = Vec::new();

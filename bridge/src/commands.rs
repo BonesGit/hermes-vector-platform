@@ -240,8 +240,8 @@ mod tests {
 
     #[test]
     fn slash_forward_keeps_typed_args() {
-        let state = AppState::new("tok".into(), Duration::from_secs(30));
-        let mut rx = state.events().connect();
+        let state = AppState::new("tok".into(), Duration::from_secs(30), None);
+        let mut rx = state.events().connect(None);
         forward_slash(&state, &incoming("/approve session", false));
         let item = rx.try_recv().expect("sse item");
         let payload: Value = serde_json::from_str(&item.payload).unwrap();
@@ -254,8 +254,8 @@ mod tests {
 
     #[test]
     fn slash_forward_keeps_group_chat_id() {
-        let state = AppState::new("tok".into(), Duration::from_secs(30));
-        let mut rx = state.events().connect();
+        let state = AppState::new("tok".into(), Duration::from_secs(30), None);
+        let mut rx = state.events().connect(None);
         forward_slash(&state, &incoming("/deny all", true));
         let item = rx.try_recv().expect("sse item");
         let payload: Value = serde_json::from_str(&item.payload).unwrap();

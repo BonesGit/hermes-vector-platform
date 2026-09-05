@@ -817,6 +817,9 @@ class MockSidecar:
                         self.wfile.flush()
                         for evt in list(sidecar.inject_queue):
                             payload = json.dumps(evt).encode()
+                            evt_id = str((evt.get("data") or {}).get("id") or "")
+                            if evt_id:
+                                self.wfile.write(b"id: " + evt_id.encode() + b"\n")
                             self.wfile.write(b"data: " + payload + b"\n\n")
                             self.wfile.flush()
                         while True:
@@ -2767,6 +2770,136 @@ class TestMockedSidecarHttp:
         finally:
             sidecar.stop()
 
+    def test_sse_commits_last_event_id_after_dispatch(self, monkeypatch, tmp_path):
+        """The resume point advances only once an event has been handed off."""
+        token = "c" * 64
+        sidecar = MockSidecar(token=token, npub=NPUB)
+        sidecar.inject_queue.append(
+            _message_event(PEER_NPUB, "from-sse", msg_id="sse-77")
+        )
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(
+                monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
+            )
+            monkeypatch.setattr(vector_adapter.secrets, "token_hex", lambda n: token)
+            captured = []
+
+            async def capture(event):
+                captured.append(event)
+
+            adapter.handle_message = capture  # type: ignore[method-assign]
+
+            async def idle_health(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise
+
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter, "_health_monitor", idle_health
+            )
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter,
+                "_spawn_bridge",
+                lambda self: FakeBridgeProc(),
+            )
+
+            async def go():
+                assert await adapter.connect() is True
+                for _ in range(50):
+                    if captured:
+                        break
+                    await asyncio.sleep(0.05)
+                await adapter.disconnect()
+
+            asyncio.run(go())
+            assert len(captured) == 1
+            assert adapter._sse_last_event_id == "sse-77"
+        finally:
+            sidecar.stop()
+
+    def test_sse_reconnect_sends_last_event_id(self, monkeypatch, tmp_path):
+        """A known resume point is offered to the sidecar so it can replay."""
+        token = "c" * 64
+        sidecar = MockSidecar(token=token, npub=NPUB)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(
+                monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
+            )
+            monkeypatch.setattr(vector_adapter.secrets, "token_hex", lambda n: token)
+            adapter._sse_last_event_id = "sse-42"
+
+            async def idle_health(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise
+
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter, "_health_monitor", idle_health
+            )
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter,
+                "_spawn_bridge",
+                lambda self: FakeBridgeProc(),
+            )
+
+            async def go():
+                assert await adapter.connect() is True
+                for _ in range(50):
+                    if sidecar.events_headers:
+                        break
+                    await asyncio.sleep(0.05)
+                await adapter.disconnect()
+
+            asyncio.run(go())
+            assert sidecar.events_headers
+            assert sidecar.events_headers[0].get("Last-Event-ID") == "sse-42"
+        finally:
+            sidecar.stop()
+
+    def test_sse_fresh_connect_omits_last_event_id(self, monkeypatch, tmp_path):
+        """No resume point means no header — the sidecar must not replay."""
+        token = "c" * 64
+        sidecar = MockSidecar(token=token, npub=NPUB)
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(
+                monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
+            )
+            monkeypatch.setattr(vector_adapter.secrets, "token_hex", lambda n: token)
+
+            async def idle_health(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise
+
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter, "_health_monitor", idle_health
+            )
+            monkeypatch.setattr(
+                vector_adapter.VectorAdapter,
+                "_spawn_bridge",
+                lambda self: FakeBridgeProc(),
+            )
+
+            async def go():
+                assert await adapter.connect() is True
+                for _ in range(50):
+                    if sidecar.events_headers:
+                        break
+                    await asyncio.sleep(0.05)
+                await adapter.disconnect()
+
+            asyncio.run(go())
+            assert sidecar.events_headers
+            assert "Last-Event-ID" not in sidecar.events_headers[0]
+        finally:
+            sidecar.stop()
+
     def test_connect_does_not_set_vector_stub(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)
         adapter._sidecar_token = "t" * 64
@@ -2969,6 +3102,121 @@ class TestPairingPrefilter:
         assert captured[0].source.chat_id == PEER_NPUB
 
 
+class TestSupersededReplay:
+    """A reconnect burst must cost one turn per chat, not one per message."""
+
+    def test_superseded_replay_files_context_without_a_turn(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_HEX)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+        breadcrumbs = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            vector_adapter.VectorAdapter,
+            "_append_session_breadcrumb",
+            lambda self, source, content: breadcrumbs.append(content),
+        )
+
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB,
+                    "are you there?",
+                    msg_id="sup-1",
+                    replayed=True,
+                    superseded=True,
+                )
+            )
+        )
+
+        assert captured == [], "superseded replay must not start an agent turn"
+        assert len(breadcrumbs) == 1
+        assert "are you there?" in breadcrumbs[0]
+        assert "context only" in breadcrumbs[0]
+
+    def test_newest_replayed_message_still_runs(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_HEX)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB, "so what do you think?", msg_id="sup-2", replayed=True
+                )
+            )
+        )
+
+        assert len(captured) == 1
+        assert captured[0].text == "so what do you think?"
+
+    def test_replayed_without_superseded_flag_is_a_normal_turn(
+        self, monkeypatch, tmp_path
+    ):
+        """`superseded` alone (no `replayed`) must not suppress a live message."""
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_HEX)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "live", msg_id="sup-3", superseded=True)
+            )
+        )
+
+        assert len(captured) == 1
+
+    def test_superseded_reaction_replay_is_skipped(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VECTOR_PAIRING", "off")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_HEX)
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        adapter._sent_message_ids["target-1"] = None
+
+        asyncio.run(
+            adapter._handle_message_update(
+                {
+                    "id": "target-1",
+                    "chat_id": PEER_NPUB,
+                    "npub": PEER_NPUB,
+                    "mine": True,
+                    "text": "bot said this",
+                    "reactions": [
+                        {"id": "r1", "author_id": PEER_NPUB, "emoji": "👍"}
+                    ],
+                    "replayed": True,
+                    "superseded": True,
+                }
+            )
+        )
+
+        assert captured == []
+
+
 class TestDisplayYamlMerge:
     def test_preserves_other_config(self, tmp_path):
         if yaml is None:
@@ -3134,6 +3382,63 @@ class TestApplyYamlConfig:
         seeded = vector_adapter._apply_yaml_config({}, {"bot": {"name": "FromYaml"}})
         assert seeded["bot_name"] == "FromYaml"
         assert os.environ["VECTOR_BOT_NAME"] == "FromEnv"
+
+    def test_replay_block_seeds_env(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX", raising=False)
+        monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX_AGE_SECS", raising=False)
+        seeded = vector_adapter._apply_yaml_config(
+            {}, {"replay": {"max_messages": 8, "max_age_secs": 120}}
+        )
+        assert seeded["replay_max"] == "8"
+        assert seeded["replay_max_age_secs"] == "120"
+        assert os.environ["VECTOR_SSE_REPLAY_MAX"] == "8"
+        assert os.environ["VECTOR_SSE_REPLAY_MAX_AGE_SECS"] == "120"
+
+    def test_replay_zero_is_preserved(self, monkeypatch):
+        """`0` disables replay / removes the age limit, so it must not be
+        treated as an empty value."""
+        monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX", raising=False)
+        monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX_AGE_SECS", raising=False)
+        seeded = vector_adapter._apply_yaml_config(
+            {}, {"replay": {"max_messages": 0, "max_age_secs": 0}}
+        )
+        assert seeded["replay_max"] == "0"
+        assert seeded["replay_max_age_secs"] == "0"
+        assert os.environ["VECTOR_SSE_REPLAY_MAX"] == "0"
+
+        env: dict = {}
+        vector_adapter._overlay_sidecar_extra_env(env, seeded)
+        assert env["VECTOR_SSE_REPLAY_MAX"] == "0", "0 must reach the sidecar"
+        assert env["VECTOR_SSE_REPLAY_MAX_AGE_SECS"] == "0"
+
+    def test_replay_env_wins_over_yaml(self, monkeypatch):
+        monkeypatch.setenv("VECTOR_SSE_REPLAY_MAX", "99")
+        seeded = vector_adapter._apply_yaml_config({}, {"replay": {"max_messages": 8}})
+        assert seeded["replay_max"] == "8"
+        assert os.environ["VECTOR_SSE_REPLAY_MAX"] == "99"
+
+        env = {"VECTOR_SSE_REPLAY_MAX": "99"}
+        vector_adapter._overlay_sidecar_extra_env(env, seeded)
+        assert env["VECTOR_SSE_REPLAY_MAX"] == "99"
+
+    def test_replay_rejects_non_counts(self, monkeypatch):
+        """A typo falls back to the documented default instead of silently
+        disabling replay. `false` in particular must not read as 0."""
+        for bad in ("soon", False, True, -1, "", None, 1.5, "10 minutes"):
+            monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX", raising=False)
+            seeded = vector_adapter._apply_yaml_config(
+                {}, {"replay": {"max_messages": bad}}
+            )
+            assert (seeded or {}).get("replay_max") is None, f"accepted {bad!r}"
+            assert "VECTOR_SSE_REPLAY_MAX" not in os.environ, f"set env for {bad!r}"
+
+    def test_replay_absent_keys_are_untouched(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX", raising=False)
+        monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX_AGE_SECS", raising=False)
+        seeded = vector_adapter._apply_yaml_config({}, {"replay": {"max_messages": 4}})
+        assert seeded["replay_max"] == "4"
+        assert "replay_max_age_secs" not in seeded
+        assert "VECTOR_SSE_REPLAY_MAX_AGE_SECS" not in os.environ
 
 
 class TestStandaloneSend:

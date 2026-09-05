@@ -51,14 +51,16 @@ struct Health {
 }
 
 impl AppState {
-    pub fn new(token: String, ping_interval: Duration) -> Self {
+    /// `data_dir` is where the missed-DM cursor lives. `None` (stub mode) keeps
+    /// the event hub in memory only.
+    pub fn new(token: String, ping_interval: Duration, data_dir: Option<PathBuf>) -> Self {
         Self(Arc::new(Inner {
             token,
             health: RwLock::new(Health {
                 ready: false,
                 npub: None,
             }),
-            events: EventHub::new(),
+            events: EventHub::new(data_dir),
             ping_interval,
             send_seq: AtomicU64::new(1),
             bot: RwLock::new(None),
@@ -164,10 +166,10 @@ impl AppState {
 }
 
 pub fn ready_item(npub: &str) -> SseItem {
-    SseItem {
-        id: None,
-        payload: json!({"type": "ready", "data": {"npub": npub}}).to_string(),
-    }
+    SseItem::new(
+        None,
+        json!({"type": "ready", "data": {"npub": npub}}).to_string(),
+    )
 }
 
 pub fn router(state: AppState) -> Router {
@@ -341,9 +343,16 @@ struct HealthBody {
     npub: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_invites: Option<usize>,
+    /// Events no live client accepted. Non-zero means Hermes missed something;
+    /// replay or the missed-DM catch-up has to cover it.
+    sse_dropped: u64,
+    /// Items currently available for `Last-Event-ID` replay.
+    sse_retained: usize,
 }
 
 async fn health(State(state): State<AppState>, _auth: Auth) -> Json<HealthBody> {
+    let sse_dropped = state.events().dropped();
+    let sse_retained = state.events().retained();
     let health = state.0.health.read().await;
     if health.ready {
         let pending_invites = match state.bot().await {
@@ -354,12 +363,16 @@ async fn health(State(state): State<AppState>, _auth: Auth) -> Json<HealthBody> 
             status: "ready",
             npub: health.npub.clone(),
             pending_invites,
+            sse_dropped,
+            sse_retained,
         })
     } else {
         Json(HealthBody {
             status: "starting",
             npub: None,
             pending_invites: None,
+            sse_dropped,
+            sse_retained,
         })
     }
 }
@@ -1242,7 +1255,7 @@ mod tests {
 
     #[test]
     fn remembers_and_takes_own_reactions() {
-        let state = AppState::new("tok".into(), Duration::from_secs(1));
+        let state = AppState::new("tok".into(), Duration::from_secs(1), None);
         state.remember_own_reaction("npub1a", "msg", "👀", "rid-eyes");
         state.remember_own_reaction("npub1a", "msg", "✅", "rid-ok");
         let eyes = state.take_own_reactions("npub1a", "msg", "👀");

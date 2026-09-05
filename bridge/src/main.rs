@@ -488,7 +488,7 @@ async fn serve() -> Result<ExitCode, CliError> {
         .map_err(|_| CliError::Other("VECTOR_BRIDGE_PORT must be a port number".into()))?;
 
     let ping_interval = parse_ms_env("VECTOR_SSE_PING_MS").unwrap_or(DEFAULT_SSE_PING);
-    let state = AppState::new(token, ping_interval);
+    let state = AppState::new(token, ping_interval, data_dir.clone());
 
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)

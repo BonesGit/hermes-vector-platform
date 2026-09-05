@@ -873,6 +873,17 @@ def _sender_is_authorized(peer: str) -> bool:
     return npub in _allowed_npubs()
 
 
+def _is_superseded_replay(msg_data: dict) -> bool:
+    """True when the sidecar replayed this message and a newer one followed.
+
+    Set only on ``Last-Event-ID`` replay after a reconnect. The newest message
+    per chat is never superseded, so every chat still gets exactly one turn.
+    """
+    if not isinstance(msg_data, dict):
+        return False
+    return bool(msg_data.get("replayed")) and bool(msg_data.get("superseded"))
+
+
 def _is_home_operator(peer: str) -> bool:
     """True when this DM is ``VECTOR_HOME_CHANNEL``.
 
@@ -991,6 +1002,9 @@ class VectorAdapter(BasePlatformAdapter):
         self._sse_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
         self._sidecar_token: Optional[str] = None
+        # Last SSE id we finished dispatching. Sent as Last-Event-ID so the
+        # sidecar replays the gap instead of dropping it on reconnect.
+        self._sse_last_event_id: str = ""
         self._inbound_ids: OrderedDict[str, None] = OrderedDict()
         self._last_inbound_by_chat: OrderedDict[str, str] = OrderedDict()
         self._sent_message_ids: OrderedDict[str, None] = OrderedDict()
@@ -2310,13 +2324,16 @@ class VectorAdapter(BasePlatformAdapter):
 
             try:
                 logger.debug("Vector SSE: connecting to %s", url)
+                headers = {
+                    **self._token_headers(),
+                    "Accept": "text/event-stream",
+                }
+                if self._sse_last_event_id:
+                    headers["Last-Event-ID"] = self._sse_last_event_id
                 async with self._http_client.stream(
                     "GET",
                     url,
-                    headers={
-                        **self._token_headers(),
-                        "Accept": "text/event-stream",
-                    },
+                    headers=headers,
                     timeout=None,
                 ) as response:
                     if response.status_code != 200:
@@ -2329,6 +2346,7 @@ class VectorAdapter(BasePlatformAdapter):
                     logger.info("Vector SSE: connected")
 
                     buffer = ""
+                    pending_id = ""
                     aiter = response.aiter_text().__aiter__()
                     while self._running:
                         try:
@@ -2357,6 +2375,9 @@ class VectorAdapter(BasePlatformAdapter):
                             line = line.rstrip("\r")
                             if not line or line.startswith(":"):
                                 continue
+                            if line.startswith("id:"):
+                                pending_id = line[3:].strip()
+                                continue
                             if line.startswith("data:"):
                                 data_str = line[5:].strip()
                                 if not data_str:
@@ -2364,6 +2385,11 @@ class VectorAdapter(BasePlatformAdapter):
                                 try:
                                     data = json.loads(data_str)
                                     await self._dispatch_sse_event(data)
+                                    # Commit the resume point only once the event
+                                    # is handed off; a failure leaves it
+                                    # uncommitted so the sidecar replays it.
+                                    if pending_id:
+                                        self._sse_last_event_id = pending_id
                                 except json.JSONDecodeError:
                                     logger.debug(
                                         "Vector SSE: invalid JSON: %s",
@@ -2373,6 +2399,8 @@ class VectorAdapter(BasePlatformAdapter):
                                     logger.exception(
                                         "Vector SSE: error handling event"
                                     )
+                                finally:
+                                    pending_id = ""
 
             except asyncio.CancelledError:
                 break
@@ -2525,6 +2553,15 @@ class VectorAdapter(BasePlatformAdapter):
                 await self.handle_message(event)
             return
 
+        if _is_superseded_replay(msg_data):
+            logger.info(
+                "Vector: replayed message superseded by a newer one from %s; "
+                "filing as context",
+                _truncate_npub(peer),
+            )
+            await self._file_superseded_replay(source, text, saved)
+            return
+
         media_urls, media_types, msg_type = self._media_for_event(
             pending_key, saved, is_file=is_file
         )
@@ -2658,6 +2695,14 @@ class VectorAdapter(BasePlatformAdapter):
             await self._write_inbox_breadcrumb(source, saved)
             return
 
+        if _is_superseded_replay(msg_data):
+            logger.info(
+                "Vector: replayed channel message superseded by a newer one; "
+                "filing as context",
+            )
+            await self._file_superseded_replay(source, text, saved)
+            return
+
         media_urls = [str(path) for path, _att, _mime in saved]
         media_types = [mime for _path, _att, mime in saved]
         msg_type = MessageType.TEXT
@@ -2744,6 +2789,10 @@ class VectorAdapter(BasePlatformAdapter):
             if isinstance(row, dict) and row.get("id"):
                 self._remember_reaction_id(str(row["id"]))
         if already_seen or not ours or not emoji:
+            return
+        if _is_superseded_replay(msg_data):
+            # A stale reaction is not worth a turn once a newer event for the
+            # same chat has already been replayed.
             return
         if bot_npub and author == bot_npub:
             return
@@ -3088,6 +3137,36 @@ class VectorAdapter(BasePlatformAdapter):
         else:
             body = f"saved {len(names)} files: " + ", ".join(names)
         await self.send(chat_id=chat_id, content=body)
+
+    async def _file_superseded_replay(
+        self, source, text: str, saved: List[Tuple[Path, dict, str]]
+    ) -> None:
+        """Record a superseded replayed message as context, with no agent turn.
+
+        A reconnect can hand back a whole burst the peer sent while the stream
+        was down. Someone who fires off five messages is waiting on an answer to
+        the last one, not five answers — and five turns is five times the GPU.
+        The sidecar flags every replayed message that a newer one in the same
+        chat supersedes; those land in the session transcript so the agent still
+        sees them, and only the newest actually runs.
+        """
+        lines = [
+            "[Vector] Earlier message, delivered late after a reconnect "
+            "(context only — answered as part of the newest message):"
+        ]
+        if text.strip():
+            lines.append(text.strip())
+        for path, att, mime in saved:
+            orig = att.get("name") or path.name
+            lines.append(f"- attachment {orig} ({mime}) `{path}`")
+        try:
+            await asyncio.to_thread(
+                self._append_session_breadcrumb, source, "\n".join(lines)
+            )
+        except Exception:
+            logger.warning(
+                "Vector: failed to write superseded replay breadcrumb", exc_info=True
+            )
 
     async def _write_inbox_breadcrumb(
         self, source, saved: List[Tuple[Path, dict, str]]
@@ -3499,6 +3578,8 @@ def _overlay_sidecar_extra_env(env: Dict[str, str], extra: dict) -> None:
         ("VECTOR_SLASH_COMMANDS", "slash_commands"),
         ("VECTOR_MISSED_REACT", "missed_react"),
         ("VECTOR_MISSED_REACT_EMOJI", "missed_react_emoji"),
+        ("VECTOR_SSE_REPLAY_MAX", "replay_max"),
+        ("VECTOR_SSE_REPLAY_MAX_AGE_SECS", "replay_max_age_secs"),
         ("VECTOR_COMMUNITY_NAME", "community_name"),
         ("VECTOR_CREATE_COMMUNITY", "create_community"),
         ("VECTOR_COMMUNITY_DOWNLOAD_ALL", "community_download_all"),
@@ -3870,6 +3951,23 @@ def _yaml_on_off(value: Any) -> Optional[str]:
     return None
 
 
+def _yaml_count(value: Any) -> Optional[str]:
+    """Non-negative integer as a string, or None when it is not one.
+
+    ``0`` is meaningful for the replay knobs (disable / no limit), so it must
+    survive. Bools are rejected on purpose: ``max_messages: false`` is a typo,
+    not a count, and falling back to the documented default beats silently
+    turning replay off.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        count = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return str(count) if count >= 0 else None
+
+
 def _set_env_if_unset(key: str, value: Optional[str], *, skip: bool) -> None:
     if skip or value is None:
         return
@@ -3969,6 +4067,26 @@ def _apply_yaml_config(yaml_cfg: dict, vector_cfg: dict) -> Optional[dict]:
         if slash is not None:
             seeded["slash_commands"] = slash
             _set_env_if_unset("VECTOR_SLASH_COMMANDS", slash, skip=skip)
+
+    replay = vector_cfg.get("replay")
+    if isinstance(replay, dict):
+        for yaml_key, extra_key, env_key in (
+            ("max_messages", "replay_max", "VECTOR_SSE_REPLAY_MAX"),
+            ("max_age_secs", "replay_max_age_secs", "VECTOR_SSE_REPLAY_MAX_AGE_SECS"),
+        ):
+            if yaml_key not in replay:
+                continue
+            count = _yaml_count(replay.get(yaml_key))
+            if count is None:
+                logger.warning(
+                    "Vector: ignoring vector.replay.%s=%r (want a non-negative "
+                    "integer); using the default",
+                    yaml_key,
+                    replay.get(yaml_key),
+                )
+                continue
+            seeded[extra_key] = count
+            _set_env_if_unset(env_key, count, skip=skip)
 
     behavior = str(vector_cfg.get("unauthorized_dm_behavior") or "").strip().lower()
     if behavior == "ignore":

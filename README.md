@@ -107,6 +107,12 @@ flowchart LR
 
 `VectorAdapter.connect()` generates a spawn-time `X-Hermes-Sidecar-Token`, starts `vector-bridge` with `stdin=PIPE` + `VECTOR_SIDECAR_WATCH_STDIN=1` (parent-death), polls authenticated `GET /health` until `status=ready`, then subscribes to `GET /events` (SSE). DMs map as `chat_id = user_id = peer npub`.
 
+**SSE delivery.** The adapter tracks the last event id it finished dispatching and sends it as `Last-Event-ID` when the stream reconnects. The sidecar retains the most recent 256 items and replays everything after that point, so a dropped stream recovers the gap instead of losing it. A resume id older than the retained window replays the whole window (inbound dedup absorbs the overlap); a fresh connect with no resume point replays nothing, so a gateway restart does not re-run old turns. Anything no live client accepted is logged with its id and counted in `GET /health` as `sse_dropped` (`sse_retained` is the current replay depth). The missed-DM cursor advances only on real delivery, so anything replay cannot cover is still ❌'d by the catch-up.
+
+**Replay costs one turn per chat, not one per message.** A peer who fires off six messages into a dead stream is waiting on an answer to the last one, and six agent turns is six times the GPU. So replay is shaped before it is delivered: messages past the age horizon are skipped, the batch is capped, and every replayed message that a newer one in the same chat supersedes is flagged `superseded`. The adapter files those in the session transcript as context (no turn) and runs only the newest per chat. Skipped messages keep their cursor untouched, so they surface as ❌ catch-up marks rather than vanishing. Tune it under `vector.replay` in `config.yaml` (see below).
+
+Hermes narrows this further on its own: `_pending_messages` holds **one** pending event per session, and the default busy mode is `interrupt`, so even a burst that does reach it collapses rather than stacking.
+
 ## Environment variables
 
 Hermes pairing and cron need these in `~/.hermes/.env`. Setup writes only these three — not secrets, not defaults.
@@ -125,7 +131,7 @@ Sidecar plumbing stays getenv overrides (not in `plugin.yaml`, not written by th
 
 ## `config.yaml` (`vector:`)
 
-Profile, communities, reactions, and pairing live here. Env still overrides if set. Setup writes non-default answers; omit a key to keep the code default.
+Profile, communities, reactions, replay, and pairing live here. Env still overrides if set. Setup writes non-default answers; omit a key to keep the code default.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -138,6 +144,9 @@ vector:
   reactions: false                   # 👀/✅/❌ on the triggering DM; default off
   missed_react: true                 # ❌ on DMs that arrived while the sidecar was down
   slash_commands: true               # Vector / picker (kind 10304); typed /approve still works
+  replay:                            # how much backlog a reconnect is allowed to cost
+    max_messages: 5                  # items replayed per reconnect, newest first; 0 = never replay
+    max_age_secs: 600                # skip messages older than this; 0 = no age limit
   communities:
     create: false                    # true = bot-owned private home room after Ready
     name: Hermes                     # only used when create is true
@@ -338,6 +347,7 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 | Lost the bot / contacts don't recognize it | Restoring needs `identity.nsec` **or** `identity.mnemonic`. Replacing the nsec **is** a new bot (new npub, lost DMs). Identities minted before mnemonic-on-create, or imported from nsec only, have no seed file. |
 | Sidecar is a stub / no live DMs | `VECTOR_STUB` must **not** be set in the gateway. Production `connect()` strips it. Only HTTP unit tests set it (binds without `VectorBot::build`). |
 | Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `vector.missed_react: false` disables. Missed **community** messages are ignored (no ❌, no turn). Agent react/unreact and optional 👀/✅/❌ acks: see `vector.reactions`. |
+| DM with no reply, sidecar still up | A dropped SSE stream is replayed from `Last-Event-ID` (256-item window), so this should self-heal. Check `sse_dropped` in `GET /health` — non-zero means events outran the window; `~/.hermes/logs/vector-bridge.log` logs each drop with its id. Undelivered DMs stay unseen in `sdk/missed-seen.json` and get a ❌ on the next sidecar start. |
 | Group messages ignored | The bot must have **joined** (trusted inviter). Then the sender needs `VECTOR_ALLOWED_USERS`, `vector.communities.group_allowed_users`, or the channel in `open_channels`. Mentions (`@bot npub` / `@` display name), a reply to the bot, or a registered slash command (`/approve`, `/deny`, …) are required; `@everyone` is ignored. Pairing is not sent in groups. Group files download when you **reply to the file and @mention** the bot (or set `download_all: true`). |
 | Slash `/approve` missing from the Vector picker | Sidecar must be rebuilt after this feature (`hermes gateway setup` / `cargo build --release` in `bridge/`). `vector.slash_commands` must not be `false`. Kind-10304 publishes in the background after `BotEvent::Ready` (does not block gateway start). Type `/` in a chat with the bot. Typed `/approve` in a DM works even without the picker. |
 | Bot not joining a community | Inviter npub must be in `trusted_inviters` or `VECTOR_ALLOWED_USERS`. `invite_policy: manual` parks all invites. Parked invites do not ping home — type `/invites` in the `VECTOR_HOME_CHANNEL` DM, or check `/health` `pending_invites`. |

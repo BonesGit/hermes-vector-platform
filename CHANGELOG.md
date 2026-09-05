@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Inbound DMs could be lost silently during an SSE gap.** The sidecar
+  published each inbound event with `try_send` and discarded the result, and it
+  marked the message seen in `missed-seen.json` *before* publishing. Any gap —
+  a reconnect, the shutdown window, or a full client queue — therefore dropped
+  the message with no log, and the advanced cursor stopped the next catch-up
+  from ❌-ing it. The peer saw "delivered" and never got a reply. Now:
+  - `/events` honors `Last-Event-ID`. The sidecar retains the last 256 items
+    and replays everything after the client's resume point, so a reconnect
+    recovers the gap instead of losing it. An unknown id replays the whole
+    retained window (the adapter's inbound LRU absorbs the overlap); a fresh
+    connect with no resume point replays nothing, which keeps gateway restarts
+    from re-running old turns.
+  - The missed-DM cursor advances only when an item is actually handed to a
+    live client, including on replay. Anything the ring cannot cover stays
+    unseen and is ❌'d by the next catch-up as designed.
+  - Undelivered events are logged with their id and counted. `GET /health` now
+    reports `sse_dropped` and `sse_retained`.
+  - Replay is bounded so recovering a gap cannot turn into a wall of agent
+    turns. All but the newest message per chat is flagged `superseded` and
+    filed as session context instead of starting a turn. Tunable in
+    `config.yaml` under `vector.replay`: `max_messages` (default 5, `0`
+    disables replay entirely) caps items per reconnect, and `max_age_secs`
+    (default 600, `0` for no limit) skips stale messages. Skipped messages keep
+    their cursor untouched, so they surface as ❌ catch-up marks rather than
+    disappearing. `VECTOR_SSE_REPLAY_MAX` /
+    `VECTOR_SSE_REPLAY_MAX_AGE_SECS` still override, same as the other
+    legacy `VECTOR_*` keys.
+
 ### Removed
 
 - `VECTOR_ALLOW_ALL_USERS` (and Hermes `allow_all_env`). Open the inbox with
@@ -22,8 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `plugin.yaml` now declares only `VECTOR_NPUB`, `VECTOR_ALLOWED_USERS`, and
   `VECTOR_HOME_CHANNEL`. Profile, communities, reactions, slash commands,
-  and pairing live in `config.yaml` `vector:` (`apply_yaml_config_fn`).
-  Env still wins if a legacy `VECTOR_*` key is set.
+  replay, and pairing live in `config.yaml` `vector:`
+  (`apply_yaml_config_fn`). Env still wins if a legacy `VECTOR_*` key is set.
 - Pairing off is `vector.unauthorized_dm_behavior: ignore` (Hermes shared
   key). Adapter pre-filter still honors leftover `VECTOR_PAIRING=off`.
 - Bot avatar/banner are discovered from `sdk/avatar.*` / `sdk/banner.*`

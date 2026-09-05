@@ -456,6 +456,68 @@ fn post_block_requires_npub_and_ready() {
 }
 
 #[test]
+fn parked_invite_routes_require_ready_and_community_id() {
+    let server = spawn_server(&[]);
+    let cid = "aa".repeat(32);
+
+    let (status, body) = get(&server, "/invites", Some(&server.token));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready");
+
+    let (status, body) = post(&server, "/invites/accept", Some(&server.token), json!({}));
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let (status, body) = post(
+        &server,
+        "/invites/accept",
+        Some(&server.token),
+        json!({"community_id": "not-hex"}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let (status, body) = post(
+        &server,
+        "/invites/accept",
+        Some(&server.token),
+        json!({"community_id": cid}),
+    );
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready");
+
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = get(&server, "/invites", Some(&server.token));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["invites"], json!([]));
+
+    let (status, body) = post(
+        &server,
+        "/invites/accept",
+        Some(&server.token),
+        json!({"community_id": cid}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["community_id"], cid);
+    assert_eq!(body["channels"], json!([]));
+
+    let (status, body) = post(
+        &server,
+        "/invites/decline",
+        Some(&server.token),
+        json!({"community_id": cid}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["community_id"], cid);
+
+    let (status, body) = get(&server, "/invites", None);
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["code"], "unauthorized");
+}
+
+#[test]
 fn post_delete_requires_target_and_ready() {
     let server = spawn_server(&[]);
     let (status, body) = post(

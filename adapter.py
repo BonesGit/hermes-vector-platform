@@ -600,6 +600,10 @@ _BLOCK_COMMAND_RE = re.compile(
     r"^/(block|unblock|blocked)(?:\s+(\S+))?\s*$",
     re.IGNORECASE,
 )
+_INVITE_COMMAND_RE = re.compile(
+    r"^/(invites|join|decline)(?:\s+(\S+))?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _group_slash_command(text: str, *, is_command: bool = False) -> bool:
@@ -710,6 +714,29 @@ def _format_joined_notice(
     lines.append(
         "You can already @mention me there if you are on VECTOR_ALLOWED_USERS."
     )
+    return "\n".join(lines)
+
+
+def _format_pending_invites(rows: list) -> str:
+    """Home-DM body for parked Concord invites (no unsolicited notify)."""
+    if not rows:
+        return "No parked invites."
+    lines = [f"Parked invites ({len(rows)}):"]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("community_id") or "").strip()
+        name = str(row.get("name") or "").strip()
+        inviter = str(row.get("inviter_npub") or "").strip()
+        title = name or "(unnamed)"
+        lines.append(f"- {title}")
+        if cid:
+            lines.append(f"  community_id: {cid}")
+        if inviter:
+            lines.append(f"  from: {_truncate_npub(inviter)}")
+    lines.append("")
+    lines.append("Join: /join <community_id>")
+    lines.append("Decline: /decline <community_id>")
     return "\n".join(lines)
 
 
@@ -837,11 +864,11 @@ def _sender_is_authorized(peer: str) -> bool:
     return npub in _allowed_npubs()
 
 
-def _can_manage_blocks(peer: str) -> bool:
-    """Who may mute a DM peer: ``VECTOR_HOME_CHANNEL`` only.
+def _is_home_operator(peer: str) -> bool:
+    """True when this DM is ``VECTOR_HOME_CHANNEL``.
 
-    Allowlisted users, pairing-approved senders, and
-    ``VECTOR_ALLOW_ALL_USERS`` do not grant this.
+    Operator commands (mute, parked invites) stay here. Allowlisted users,
+    pairing-approved senders, and ``VECTOR_ALLOW_ALL_USERS`` do not grant this.
     """
     npub = normalize_npub(peer) or (peer or "").strip()
     home = _home_operator_npub()
@@ -851,6 +878,14 @@ def _can_manage_blocks(peer: str) -> bool:
 def _parse_block_command(text: str) -> Optional[Tuple[str, str]]:
     """Typed ``/block`` / ``/unblock`` / ``/blocked`` in a DM. None if not a match."""
     m = _BLOCK_COMMAND_RE.match((text or "").strip())
+    if not m:
+        return None
+    return m.group(1).lower(), (m.group(2) or "").strip()
+
+
+def _parse_invite_command(text: str) -> Optional[Tuple[str, str]]:
+    """Typed ``/invites`` / ``/join`` / ``/decline`` in a DM. None if not a match."""
+    m = _INVITE_COMMAND_RE.match((text or "").strip())
     if not m:
         return None
     return m.group(1).lower(), (m.group(2) or "").strip()
@@ -1433,6 +1468,87 @@ class VectorAdapter(BasePlatformAdapter):
         self._blocked_loaded = True
         return out
 
+    async def list_pending_invites(self) -> List[Dict[str, Any]]:
+        """Parked Concord invites from the sidecar (silent until listed)."""
+        if not self._http_client:
+            return []
+        try:
+            resp = await self._http_client.get(
+                f"{self.bridge_url}/invites",
+                headers=self._token_headers(),
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Vector: list_pending_invites failed: %s", e)
+            return []
+        if resp.status_code != 200:
+            return []
+        try:
+            data = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return []
+        rows = data.get("invites") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            cid = normalize_channel_id(str(row.get("community_id") or "")) or str(
+                row.get("community_id") or ""
+            ).strip()
+            if not cid:
+                continue
+            out.append(
+                {
+                    "community_id": cid,
+                    "name": str(row.get("name") or ""),
+                    "inviter_npub": str(row.get("inviter_npub") or ""),
+                    "version": row.get("version"),
+                }
+            )
+        return out
+
+    async def accept_invite(self, community_id: str) -> Optional[Dict[str, Any]]:
+        """Accept a parked invite. Returns sidecar JSON or None."""
+        cid = normalize_channel_id(community_id)
+        if not self._http_client or not cid:
+            return None
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/invites/accept",
+                json={"community_id": cid},
+                headers=self._token_headers(),
+                timeout=60.0,
+            )
+        except Exception as e:
+            logger.debug("Vector: accept_invite failed: %s", e)
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def decline_invite(self, community_id: str) -> bool:
+        """Drop a parked invite without joining."""
+        cid = normalize_channel_id(community_id)
+        if not self._http_client or not cid:
+            return False
+        try:
+            resp = await self._http_client.post(
+                f"{self.bridge_url}/invites/decline",
+                json={"community_id": cid},
+                headers=self._token_headers(),
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.debug("Vector: decline_invite failed: %s", e)
+            return False
+        return resp.status_code == 200
+
     async def send_reaction(
         self,
         chat_id: str,
@@ -1558,7 +1674,7 @@ class VectorAdapter(BasePlatformAdapter):
         message is consumed (no Hermes turn).
         """
         parsed = _parse_block_command(text)
-        if not parsed or not _can_manage_blocks(peer):
+        if not parsed or not _is_home_operator(peer):
             return False
         cmd, arg = parsed
         if cmd == "blocked":
@@ -1593,6 +1709,61 @@ class VectorAdapter(BasePlatformAdapter):
             return True
         verb = "Unblocked" if cmd == "unblock" else "Blocked"
         await self.send(peer, f"{verb} {_truncate_npub(target)}.")
+        return True
+
+    async def _try_invite_command(self, peer: str, text: str) -> bool:
+        """Handle typed parked-invite commands from the home DM.
+
+        Only ``VECTOR_HOME_CHANNEL`` may issue these. Parked invites are never
+        pushed to home; this is the pull path. Returns True when consumed
+        (no Hermes turn).
+        """
+        parsed = _parse_invite_command(text)
+        if not parsed or not _is_home_operator(peer):
+            return False
+        cmd, arg = parsed
+        if cmd == "invites":
+            rows = await self.list_pending_invites()
+            await self.send(peer, _format_pending_invites(rows))
+            return True
+        cid = normalize_channel_id(arg)
+        if not cid:
+            await self.send(peer, f"Usage: /{cmd} <community_id>")
+            return True
+        if cmd == "join":
+            data = await self.accept_invite(cid)
+            if not data:
+                await self.send(
+                    peer,
+                    f"Could not join {cid}. Is that invite still parked?",
+                )
+                return True
+            community_id = str(data.get("community_id") or cid)
+            name = str(data.get("name") or "").strip()
+            channels = data.get("channels") if isinstance(data, dict) else None
+            rows = self._ingest_joined_channels(
+                community_id,
+                channels if isinstance(channels, list) else [],
+                community_name=name,
+            )
+            if rows:
+                body = _format_joined_notice(
+                    community_id, rows, community_name=name
+                )
+                self._mark_channels_notified(row["channel_id"] for row in rows)
+            else:
+                title = name or "the community"
+                body = f"Joined {title}."
+            await self.send(peer, body)
+            return True
+        dropped = await self.decline_invite(cid)
+        if not dropped:
+            await self.send(
+                peer,
+                f"Could not decline {cid}. Is that invite still parked?",
+            )
+            return True
+        await self.send(peer, f"Declined invite {cid}.")
         return True
 
     def _record_sent_message(self, message_id: Optional[str]) -> None:
@@ -1824,14 +1995,14 @@ class VectorAdapter(BasePlatformAdapter):
                 community_name=name,
             )
 
-    async def _notify_joined_channels(
+    def _ingest_joined_channels(
         self,
         community_id: str,
         channels: list,
         *,
         community_name: str = "",
-    ) -> None:
-        """Log full channel ids and DM VECTOR_HOME_CHANNEL once per channel."""
+    ) -> list:
+        """Remember channel ids for a joined community. Does not DM home."""
         comm_name = community_name.strip() or self._community_names.get(
             (community_id or "").strip(), ""
         )
@@ -1857,6 +2028,26 @@ class VectorAdapter(BasePlatformAdapter):
                     "name": str(row.get("name") or "").strip(),
                 }
             )
+        return rows
+
+    def _mark_channels_notified(self, channel_ids) -> None:
+        self._notified_channel_ids.update(channel_ids)
+        _save_notified_channel_ids(self.data_dir, self._notified_channel_ids)
+
+    async def _notify_joined_channels(
+        self,
+        community_id: str,
+        channels: list,
+        *,
+        community_name: str = "",
+    ) -> None:
+        """Log full channel ids and DM VECTOR_HOME_CHANNEL once per channel."""
+        comm_name = community_name.strip() or self._community_names.get(
+            (community_id or "").strip(), ""
+        )
+        rows = self._ingest_joined_channels(
+            community_id, channels, community_name=comm_name
+        )
         if not rows:
             return
         new_rows = [
@@ -1892,8 +2083,7 @@ class VectorAdapter(BasePlatformAdapter):
                     result.error,
                 )
                 return
-        self._notified_channel_ids.update(row["channel_id"] for row in new_rows)
-        _save_notified_channel_ids(self.data_dir, self._notified_channel_ids)
+        self._mark_channels_notified(row["channel_id"] for row in new_rows)
 
     async def _sync_joined_channels(self) -> None:
         """Remember channel ids for communities the bot already belongs to."""
@@ -2278,6 +2468,11 @@ class VectorAdapter(BasePlatformAdapter):
             return
 
         if await self._try_block_command(peer, text):
+            if msg_id:
+                self._record_last_inbound(peer, msg_id)
+            return
+
+        if await self._try_invite_command(peer, text):
             if msg_id:
                 self._record_last_inbound(peer, msg_id)
             return

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use vector_sdk::nostr::{PublicKey, ToBech32};
+use vector_sdk::vector_core::db::community::delete_pending_invite;
 use vector_sdk::vector_core::deletion::delete_own_reaction;
 use vector_sdk::{Attachment, SlimProfile, VectorBot};
 
@@ -186,6 +187,9 @@ pub fn router(state: AppState) -> Router {
         .route("/download-attachment", post(download_attachment))
         .route("/block", post(block_user).get(list_blocked))
         .route("/delete", post(delete_message))
+        .route("/invites", get(list_pending_invites))
+        .route("/invites/accept", post(accept_pending_invite))
+        .route("/invites/decline", post(decline_pending_invite))
         .route("/__test/ready", post(test_ready))
         .route("/__test/inject", post(events::inject))
         .layer(DefaultBodyLimit::max(MAX_BODY))
@@ -828,13 +832,12 @@ async fn block_user(
         }
         // Unblock of an unknown npub is false from the SDK — still 200.
     }
-    Ok(Json(json!({ "ok": true, "npub": npub, "blocked": !req.unblock })))
+    Ok(Json(
+        json!({ "ok": true, "npub": npub, "blocked": !req.unblock }),
+    ))
 }
 
-async fn list_blocked(
-    State(state): State<AppState>,
-    _auth: Auth,
-) -> Result<Json<Value>, ApiError> {
+async fn list_blocked(State(state): State<AppState>, _auth: Auth) -> Result<Json<Value>, ApiError> {
     state.require_ready().await?;
     let blocked = if let Some(bot) = state.bot().await {
         bot.blocked_users()
@@ -876,6 +879,99 @@ async fn delete_message(
     Ok(Json(json!({ "ok": true, "id": message_id })))
 }
 
+#[derive(Deserialize)]
+struct CommunityIdRequest {
+    #[serde(default)]
+    community_id: String,
+}
+
+async fn list_pending_invites(
+    State(state): State<AppState>,
+    _auth: Auth,
+) -> Result<Json<Value>, ApiError> {
+    state.require_ready().await?;
+    let invites = if let Some(bot) = state.bot().await {
+        bot.pending_invites().map_err(|err| {
+            eprintln!("[vector-bridge] list pending invites failed: {err}");
+            ApiError::internal()
+        })?
+    } else {
+        Vec::new()
+    };
+    Ok(Json(json!({ "invites": invites })))
+}
+
+async fn accept_pending_invite(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<CommunityIdRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let community_id = parse_community_id(&req.community_id)?;
+    state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        let summary = bot.accept_invite(&community_id).await.map_err(|err| {
+            let msg = err.to_string();
+            if msg.contains("no pending invite") {
+                ApiError::bad_request("no pending invite for that community_id")
+            } else {
+                eprintln!("[vector-bridge] accept invite failed: {err}");
+                ApiError::internal()
+            }
+        })?;
+        let name = summary
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let joined_id = summary
+            .get("community_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&community_id)
+            .to_string();
+        let channels = match summary.get("channels").cloned() {
+            Some(Value::Array(rows)) if !rows.is_empty() => rows,
+            _ => channel_values(&bot, &joined_id).await,
+        };
+        return Ok(Json(json!({
+            "ok": true,
+            "community_id": joined_id,
+            "name": name,
+            "channels": channels,
+        })));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "community_id": community_id,
+        "name": "",
+        "channels": [],
+    })))
+}
+
+async fn decline_pending_invite(
+    State(state): State<AppState>,
+    _auth: Auth,
+    JsonBody(req): JsonBody<CommunityIdRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let community_id = parse_community_id(&req.community_id)?;
+    state.require_ready().await?;
+    if let Some(bot) = state.bot().await {
+        let invites = bot.pending_invites().map_err(|err| {
+            eprintln!("[vector-bridge] list pending invites failed: {err}");
+            ApiError::internal()
+        })?;
+        if !invite_has_community(&invites, &community_id) {
+            return Err(ApiError::bad_request(
+                "no pending invite for that community_id",
+            ));
+        }
+        delete_pending_invite(&community_id).map_err(|err| {
+            eprintln!("[vector-bridge] decline invite failed: {err}");
+            ApiError::internal()
+        })?;
+    }
+    Ok(Json(json!({ "ok": true, "community_id": community_id })))
+}
+
 async fn test_ready(State(state): State<AppState>, _auth: Auth) -> Json<Value> {
     state.mark_ready(STUB_NPUB).await;
     Json(json!({ "ok": true }))
@@ -887,6 +983,37 @@ const STUB_CHANNEL_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 pub(crate) fn is_channel_id(raw: &str) -> bool {
     raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Concord community id: same 64-hex shape as a channel id.
+fn parse_community_id(raw: &str) -> Result<String, ApiError> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(ApiError::bad_request("community_id is required"));
+    }
+    if is_channel_id(s) {
+        return Ok(s.to_ascii_lowercase());
+    }
+    Err(ApiError::bad_request(
+        "community_id must be 64 hex characters",
+    ))
+}
+
+fn invite_has_community(invites: &[Value], community_id: &str) -> bool {
+    invites.iter().any(|row| {
+        row.get("community_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.eq_ignore_ascii_case(community_id))
+    })
+}
+
+async fn channel_values(bot: &VectorBot, community_id: &str) -> Vec<Value> {
+    bot.community(community_id)
+        .channels()
+        .await
+        .into_iter()
+        .map(|ch| json!({ "channel_id": ch.id(), "name": ch.name() }))
+        .collect()
 }
 
 /// `npub1…` → DM; 64-char hex → Concord channel. Matches SDK `channel_kind_for`.
@@ -1145,5 +1272,16 @@ mod tests {
             "invalid_npub"
         );
         assert_eq!(parse_send_target("").unwrap_err().code(), "bad_request");
+    }
+
+    #[test]
+    fn parse_community_id_requires_64_hex() {
+        assert_eq!(parse_community_id("").unwrap_err().code(), "bad_request");
+        assert_eq!(
+            parse_community_id("not-hex").unwrap_err().code(),
+            "bad_request"
+        );
+        let mixed = "A".repeat(64);
+        assert_eq!(parse_community_id(&mixed).unwrap(), "a".repeat(64));
     }
 }

@@ -278,16 +278,49 @@ class TestBlockCommandParse:
         assert vector_adapter._parse_block_command("block npub1abc") is None
         assert vector_adapter._parse_block_command("/approve") is None
 
-    def test_can_manage_blocks_home_only(self, monkeypatch):
+    def test_home_operator_only(self, monkeypatch):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
         monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
         monkeypatch.delenv("VECTOR_ALLOW_ALL_USERS", raising=False)
-        assert not vector_adapter._can_manage_blocks(PEER_NPUB)
+        assert not vector_adapter._is_home_operator(PEER_NPUB)
         monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
-        assert vector_adapter._can_manage_blocks(NPUB)
-        assert not vector_adapter._can_manage_blocks(PEER_NPUB)
+        assert vector_adapter._is_home_operator(NPUB)
+        assert not vector_adapter._is_home_operator(PEER_NPUB)
         monkeypatch.setenv("VECTOR_ALLOW_ALL_USERS", "1")
-        assert not vector_adapter._can_manage_blocks(PEER_NPUB)
+        assert not vector_adapter._is_home_operator(PEER_NPUB)
+
+
+class TestInviteCommandParse:
+    def test_parse_invite_variants(self):
+        cid = "aa" * 32
+        assert vector_adapter._parse_invite_command("/invites") == ("invites", "")
+        assert vector_adapter._parse_invite_command("/INVITES") == ("invites", "")
+        assert vector_adapter._parse_invite_command(f"/join {cid}") == ("join", cid)
+        assert vector_adapter._parse_invite_command(f"/decline {cid}") == (
+            "decline",
+            cid,
+        )
+        assert vector_adapter._parse_invite_command("/join") == ("join", "")
+        assert vector_adapter._parse_invite_command("join " + cid) is None
+        assert vector_adapter._parse_invite_command("/approve") is None
+        assert vector_adapter._parse_invite_command("/block npub1abc") is None
+
+    def test_format_pending_invites_empty_and_rows(self):
+        assert vector_adapter._format_pending_invites([]) == "No parked invites."
+        body = vector_adapter._format_pending_invites(
+            [
+                {
+                    "community_id": "aa" * 32,
+                    "name": "Ada's house",
+                    "inviter_npub": PEER_NPUB,
+                }
+            ]
+        )
+        assert "Parked invites (1)" in body
+        assert "Ada's house" in body
+        assert "aa" * 32 in body
+        assert "/join" in body
+        assert "/decline" in body
 
 
 class TestKnownChannels:
@@ -687,6 +720,9 @@ class MockSidecar:
         self.blocks: list = []
         self.deletes: list = []
         self.blocked: list = []
+        self.pending_invites: list = []
+        self.invite_accepts: list = []
+        self.invite_declines: list = []
         self.health_headers: list = []
         self.send_headers: list = []
         self.edit_headers: list = []
@@ -768,6 +804,8 @@ class MockSidecar:
                     )
                 if path == "/block":
                     return self._json(200, {"blocked": sidecar.blocked})
+                if path == "/invites":
+                    return self._json(200, {"invites": sidecar.pending_invites})
                 if path == "/events":
                     sidecar.events_headers.append(dict(self.headers))
                     self.send_response(200)
@@ -849,6 +887,36 @@ class MockSidecar:
                     return self._json(
                         200, {"ok": True, "id": data.get("message_id") or ""}
                     )
+                if path == "/invites/accept":
+                    sidecar.invite_accepts.append(data)
+                    cid = data.get("community_id") or ""
+                    sidecar.pending_invites = [
+                        row
+                        for row in sidecar.pending_invites
+                        if (row.get("community_id") if isinstance(row, dict) else None)
+                        != cid
+                    ]
+                    return self._json(
+                        200,
+                        {
+                            "ok": True,
+                            "community_id": cid,
+                            "name": "Ada's house",
+                            "channels": [
+                                {"channel_id": CHANNEL_ID, "name": "general"}
+                            ],
+                        },
+                    )
+                if path == "/invites/decline":
+                    sidecar.invite_declines.append(data)
+                    cid = data.get("community_id") or ""
+                    sidecar.pending_invites = [
+                        row
+                        for row in sidecar.pending_invites
+                        if (row.get("community_id") if isinstance(row, dict) else None)
+                        != cid
+                    ]
+                    return self._json(200, {"ok": True, "community_id": cid})
                 if path == "/communities":
                     sidecar.communities.append(data)
                     return self._json(
@@ -1422,6 +1490,151 @@ class TestInboundMapping:
         )
         assert len(captured) == 1
         assert captured[0].text == f"/block {spam}"
+
+    def test_home_invites_command_lists_parked(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        community_id = "cc" * 32
+        sidecar = MockSidecar(token=token)
+        sidecar.pending_invites = [
+            {
+                "community_id": community_id,
+                "name": "Ada's house",
+                "inviter_npub": NPUB,
+                "version": 2,
+            }
+        ]
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(
+                monkeypatch,
+                tmp_path,
+                bridge_port=port,
+                npub=NPUB,
+                allowed_users=PEER_NPUB,
+            )
+            monkeypatch.setenv("VECTOR_HOME_CHANNEL", PEER_NPUB)
+            adapter._sidecar_token = token
+            adapter._running = True
+            captured = []
+            sent = []
+
+            async def capture(event):
+                captured.append(event)
+
+            adapter.handle_message = capture  # type: ignore[method-assign]
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    orig_send = adapter.send
+
+                    async def wrap_send(chat_id, content, **kwargs):
+                        sent.append(content)
+                        return await orig_send(chat_id, content, **kwargs)
+
+                    adapter.send = wrap_send  # type: ignore[method-assign]
+                    await adapter._handle_message_event(
+                        _message_event(PEER_NPUB, "/invites", msg_id="cmd-invites")
+                    )
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert captured == []
+            assert sent and "Ada's house" in sent[0]
+            assert community_id in sent[0]
+        finally:
+            sidecar.stop()
+
+    def test_home_join_and_decline_parked_invite(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        community_id = "cc" * 32
+        sidecar = MockSidecar(token=token)
+        sidecar.pending_invites = [
+            {
+                "community_id": community_id,
+                "name": "Ada's house",
+                "inviter_npub": NPUB,
+            }
+        ]
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(
+                monkeypatch,
+                tmp_path,
+                bridge_port=port,
+                npub=NPUB,
+                allowed_users=PEER_NPUB,
+            )
+            monkeypatch.setenv("VECTOR_HOME_CHANNEL", PEER_NPUB)
+            adapter._sidecar_token = token
+            adapter._running = True
+            captured = []
+            sent = []
+
+            async def capture(event):
+                captured.append(event)
+
+            adapter.handle_message = capture  # type: ignore[method-assign]
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    orig_send = adapter.send
+
+                    async def wrap_send(chat_id, content, **kwargs):
+                        sent.append(content)
+                        return await orig_send(chat_id, content, **kwargs)
+
+                    adapter.send = wrap_send  # type: ignore[method-assign]
+                    await adapter._handle_message_event(
+                        _message_event(
+                            PEER_NPUB,
+                            f"/join {community_id}",
+                            msg_id="cmd-join",
+                        )
+                    )
+                    await adapter._handle_message_event(
+                        _message_event(
+                            PEER_NPUB,
+                            f"/decline {community_id}",
+                            msg_id="cmd-decline",
+                        )
+                    )
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert captured == []
+            assert sidecar.invite_accepts == [{"community_id": community_id}]
+            assert sidecar.invite_declines == [{"community_id": community_id}]
+            assert sent and "I joined" in sent[0]
+            assert CHANNEL_ID in sent[0]
+            assert any("Declined" in body for body in sent)
+            assert CHANNEL_ID in adapter._notified_channel_ids
+        finally:
+            sidecar.stop()
+
+    def test_allowlisted_non_home_invite_command_is_a_turn(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_adapter(
+            monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
+        )
+        monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "/invites", msg_id="cmd-invites-no")
+            )
+        )
+        assert len(captured) == 1
+        assert captured[0].text == "/invites"
 
     def test_hex_peer_normalized_to_npub(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)
@@ -2276,6 +2489,41 @@ class TestMockedSidecarHttp:
                 {"npub": PEER_NPUB, "unblock": True},
             ]
             assert sidecar.block_headers[0].get("X-Hermes-Sidecar-Token") == token
+        finally:
+            sidecar.stop()
+
+    def test_pending_invite_http(self, monkeypatch, tmp_path):
+        token = "a" * 64
+        community_id = "cc" * 32
+        sidecar = MockSidecar(token=token)
+        sidecar.pending_invites = [
+            {
+                "community_id": community_id,
+                "name": "Ada's house",
+                "inviter_npub": PEER_NPUB,
+                "version": 2,
+            }
+        ]
+        port = sidecar.start()
+        try:
+            adapter = _make_adapter(monkeypatch, tmp_path, bridge_port=port)
+            adapter._sidecar_token = token
+            adapter._running = True
+
+            async def go():
+                adapter._http_client = httpx.AsyncClient(timeout=5.0, trust_env=False)
+                try:
+                    rows = await adapter.list_pending_invites()
+                    assert rows[0]["community_id"] == community_id
+                    data = await adapter.accept_invite(community_id)
+                    assert data and data["ok"] is True
+                    assert await adapter.decline_invite(community_id) is True
+                finally:
+                    await adapter._http_client.aclose()
+
+            asyncio.run(go())
+            assert sidecar.invite_accepts == [{"community_id": community_id}]
+            assert sidecar.invite_declines == [{"community_id": community_id}]
         finally:
             sidecar.stop()
 

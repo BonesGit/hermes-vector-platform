@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use vector_sdk::vector_core::state;
 use vector_sdk::vector_core::{sign_builder, ClientRelayExt};
-use vector_sdk::{DISCOVERY_RELAYS, VectorBot};
+use vector_sdk::{VectorBot, DISCOVERY_RELAYS};
 
 #[derive(Clone, Copy)]
 enum ImageSlot {
@@ -215,8 +215,8 @@ async fn discovery_kind0_relays() -> Vec<String> {
 }
 
 async fn publish_kind0_to_discovery(content: String) -> Result<usize, String> {
-    let builder = EventBuilder::new(Kind::Metadata, content)
-        .tag(Tag::custom("client", vec!["vector"]));
+    let builder =
+        EventBuilder::new(Kind::Metadata, content).tag(Tag::custom("client", vec!["vector"]));
     let event = sign_builder(builder).await?;
     let client = state::nostr_client().ok_or_else(|| "no client connected".to_string())?;
     let relays = discovery_kind0_relays().await;
@@ -344,12 +344,6 @@ mod tests {
     fn slash_on_publishes_profile_without_a_name() {
         assert!(should_publish_own_profile(true, "", "", None, None));
         assert!(!should_publish_own_profile(false, "", "", None, None));
-        assert!(should_publish_own_profile(
-            false,
-            "Hermes",
-            "",
-            None,
-            None
-        ));
+        assert!(should_publish_own_profile(false, "Hermes", "", None, None));
     }
 }

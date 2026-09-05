@@ -391,9 +391,7 @@ async fn community_display_name(bot: &VectorBot, community_id: &str) -> String {
         .list_communities()
         .await
         .into_iter()
-        .find(|v| {
-            v.get("community_id").and_then(|i| i.as_str()) == Some(community_id)
-        })
+        .find(|v| v.get("community_id").and_then(|i| i.as_str()) == Some(community_id))
         .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_default()
 }

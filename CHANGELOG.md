@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Channel::delete`. Adapter `delete_message` retracts a bot bubble (Hermes
   ephemeral TTL / stream-preview cleanup). Inbound `BotEvent::Delete` is
   SSE `message_delete`: forget local pointers, no Hermes turn.
+- Parked **community invites**. Untrusted / `VECTOR_INVITE_POLICY=manual`
+  invites stay silent (no home DM). Only `VECTOR_HOME_CHANNEL` can type
+  `/invites`, `/join <community_id>`, `/decline <community_id>` in that DM
+  (not the Vector `/` picker). Sidecar `GET /invites`,
+  `POST /invites/accept`, `POST /invites/decline`. Accepting does not add
+  the inviter to `VECTOR_ALLOWED_USERS`.
 
 ### Changed
 

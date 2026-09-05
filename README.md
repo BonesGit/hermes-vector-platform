@@ -180,7 +180,7 @@ Concord communities are E2E encrypted group spaces with channels. A **fresh comm
 3. Hermes only runs a turn on **@mention** (`@npub1…`, `nostr:npub1…`, `@VECTOR_BOT_NAME`), **reply to a bot message**, or a **registered slash command** (`/approve`, `/deny`, …). `@everyone` is ignored.
 4. Who may trigger that turn: `VECTOR_ALLOWED_USERS` (DM list, also groups), `VECTOR_GROUP_ALLOWED_USERS` (group-only, no DMs), or any member if the channel is in `VECTOR_GROUP_ALLOW_ALL`. Hermes session key is `agent:main:vector:group:<channel-hex>`.
 
-The Vector app does not display channel ids. When the bot joins (trusted invite, `VECTOR_CREATE_COMMUNITY`, or connect-time membership sync) it logs the full 64-hex `channel_id` and DMs `VECTOR_HOME_CHANNEL` a copy-pasteable notice. Restart does not re-DM the same id (`sdk/notified-channels.json`). Parked (untrusted) invites stay silent — no DM, no channel id.
+The Vector app does not display channel ids. When the bot joins (trusted invite, `VECTOR_CREATE_COMMUNITY`, connect-time membership sync, or a home-DM `/join`) it logs the full 64-hex `channel_id` and DMs `VECTOR_HOME_CHANNEL` a copy-pasteable notice. Restart does not re-DM the same id (`sdk/notified-channels.json`). Parked (untrusted) invites stay **silent** — no home DM when they land. List, join, or decline them from the home DM with `/invites`, `/join <community_id>`, `/decline <community_id>` (not on the `/` picker).
 
 **Bot-owned home room:** set `VECTOR_CREATE_COMMUNITY=on`. After Ready the sidecar creates or reuses a private community, persists `sdk/home-community.json` (restart will not create a second one), and direct-invites `VECTOR_ALLOWED_USERS`. No public invite URL, and the new channel is **not** written into `VECTOR_GROUP_ALLOW_ALL`. Direct-invited allowlisted members can already @mention; anyone else needs `VECTOR_GROUP_ALLOWED_USERS` or the channel id in `VECTOR_GROUP_ALLOW_ALL`.
 
@@ -226,6 +226,19 @@ the **`VECTOR_HOME_CHANNEL` DM** (your npub talking to the bot), type:
 These are **not** on the Vector `/` picker. The sidecar also exposes
 `POST /block` `{npub, unblock?}` and `GET /block`. Blocking the bot or
 yourself is refused.
+
+**Parked community invites** (untrusted inviter, or `VECTOR_INVITE_POLICY=manual`).
+They stay silent — the home channel is never pinged when something parks.
+Only from the **`VECTOR_HOME_CHANNEL` DM**, type:
+
+| Command | Effect |
+|---------|--------|
+| `/invites` | List parked rows (`community_id`, name, inviter). |
+| `/join <community_id>` | Accept and join. Replies with `channel_id:` lines (same as a trusted auto-join). Does **not** add the inviter to `VECTOR_ALLOWED_USERS`. |
+| `/decline <community_id>` | Drop the parked row without joining. |
+
+Not on the Vector `/` picker. Sidecar: `GET /invites`,
+`POST /invites/accept` `{community_id}`, `POST /invites/decline` `{community_id}`.
 
 **Retract a bot message:** Hermes calls `delete_message` → `POST /delete`
 `{to, message_id}` → `Channel::delete` (DM or Concord). Used for ephemeral
@@ -291,7 +304,7 @@ If inbound is silent: check `~/.hermes/logs/vector-bridge.log`, that `/health` i
 1. Create a community in the Vector app and direct-invite the bot. Confirm `vector-bridge.log` shows `community invite` (auto-join if you are allowlisted). You should get a DM from the bot with `channel_id: <64-hex>` (needed for `VECTOR_GROUP_ALLOW_ALL`).
 2. In that channel, `@mention` the bot (or reply to a bot message, or `/approve` / `/deny` from the `/` picker). Hermes session key is `agent:main:vector:group:<channel-hex>`. Unmentioned chatter must not start a turn.
 3. Drop a file in the channel (no mention on that send — Vector has none). Default: it is **not** downloaded yet. Reply to that file bubble and `@mention` the bot: mention-only stores it (no turn); add a question in the reply to start a turn with `media_urls`. `VECTOR_COMMUNITY_DOWNLOAD_ALL=on` saves files on arrival. Ask Hermes to send a file back — it should land in the channel, not a DM.
-4. A random npub inviting the bot into another community must stay parked (not on the whitelist) — no join DM.
+4. A random npub inviting the bot into another community must stay parked (not on the whitelist) — no join DM. From the home DM, `/invites` lists it; `/join <community_id>` / `/decline <community_id>` act on it.
 
 ## Security notes
 
@@ -318,7 +331,7 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 | Missed DMs while the sidecar was down | Not sent to the agent. After Ready the sidecar reacts ❌ on allowlisted DMs newer than `sdk/missed-seen.json`. First boot only seeds the cursor. `VECTOR_MISSED_REACT=off` disables. Missed **community** messages are ignored (no ❌, no turn). Agent react/unreact and optional 👀/✅/❌ acks: see `VECTOR_REACTIONS` above. |
 | Group messages ignored | The bot must have **joined** (trusted inviter). Then the sender needs `VECTOR_ALLOWED_USERS`, `VECTOR_GROUP_ALLOWED_USERS`, or the channel in `VECTOR_GROUP_ALLOW_ALL`. Mentions (`@bot npub` / `@VECTOR_BOT_NAME`), a reply to the bot, or a registered slash command (`/approve`, `/deny`, …) are required; `@everyone` is ignored. Pairing is not sent in groups. Group files download when you **reply to the file and @mention** the bot (or set `VECTOR_COMMUNITY_DOWNLOAD_ALL=on`). |
 | Slash `/approve` missing from the Vector picker | Sidecar must be rebuilt after this feature (`hermes gateway setup` / `cargo build --release` in `bridge/`). `VECTOR_SLASH_COMMANDS` must not be `off`. Kind-10304 publishes in the background after `BotEvent::Ready` (does not block gateway start). Type `/` in a chat with the bot. Typed `/approve` in a DM works even without the picker. |
-| Bot not joining a community | Inviter npub must be in `VECTOR_TRUSTED_INVITERS` or `VECTOR_ALLOWED_USERS`. `VECTOR_INVITE_POLICY=manual` parks all invites. Check `/health` `pending_invites`. |
+| Bot not joining a community | Inviter npub must be in `VECTOR_TRUSTED_INVITERS` or `VECTOR_ALLOWED_USERS`. `VECTOR_INVITE_POLICY=manual` parks all invites. Parked invites do not ping home — type `/invites` in the `VECTOR_HOME_CHANNEL` DM, or check `/health` `pending_invites`. |
 | Cron `deliver=vector` fails | Gateway must be running. Cron reads `~/.hermes/runtime/vector-sidecar.json` (`0600`, port + token). |
 | Gateway / sidecar status | `hermes gateway status`; `~/.hermes/logs/vector-bridge.log`. Logger is `hermes_plugins.vector_platform.adapter`. |
 

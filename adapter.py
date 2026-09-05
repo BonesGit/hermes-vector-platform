@@ -14,9 +14,10 @@ Required env vars / config.extra keys:
                                  grants community turns; pairing is DM-only)
     VECTOR_HOME_CHANNEL          Operator npub for cron + join notices
 
-Profile, communities, reactions, and pairing live in config.yaml ``vector:``
-(see ``_apply_yaml_config``). Sidecar plumbing (port/host/bin/data dir) stays
-getenv overrides with defaults. Legacy VECTOR_* env for those keys still wins.
+Profile, communities, reactions, pairing, and prebuilt sidecar fetch live in
+config.yaml ``vector:`` (see ``_apply_yaml_config``). Sidecar plumbing
+(port/host/bin/data dir) stays getenv overrides with defaults. Legacy
+VECTOR_* env for those keys still wins.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import json
 import logging
 import mimetypes
 import os
+import platform
 import random
 import re
 import secrets
@@ -95,6 +97,11 @@ INBOX_NAME_MAX = 180
 DOWNLOAD_TIMEOUT = 120.0
 SEND_FILE_TIMEOUT = 120.0
 DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+DEFAULT_RELEASE_REPO = "BonesGit/hermes-vector-platform"
+PREBUILT_MAX_BYTES = 80 * 1024 * 1024
+PREBUILT_DOWNLOAD_TIMEOUT = 60.0
+_RELEASE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_RELEASE_TAG_RE = re.compile(r"^v?[A-Za-z0-9._-]+$")
 
 
 def _ensure_hermes_connect_timeout_floor() -> None:
@@ -117,11 +124,210 @@ def _ensure_hermes_connect_timeout_floor() -> None:
 
 
 def resolve_bridge_bin() -> Path:
-    """Return VECTOR_BRIDGE_BIN if set, else the in-tree release binary path."""
+    """Sidecar path: override, in-tree release build, then versioned prebuilt."""
     override = (os.getenv("VECTOR_BRIDGE_BIN") or "").strip()
     if override:
         return Path(override)
+    if _DEFAULT_BRIDGE_BIN.is_file():
+        return _DEFAULT_BRIDGE_BIN
+    prebuilt = _prebuilt_bridge_bin()
+    if prebuilt.is_file() and _prebuilt_version_matches():
+        return prebuilt
     return _DEFAULT_BRIDGE_BIN
+
+
+def bridge_release_target() -> Optional[str]:
+    """Rust target triple for a GitHub Release asset, or None if unsupported."""
+    machine = platform.machine().lower()
+    if machine in ("amd64", "x86_64", "x64"):
+        arch = "x86_64"
+    elif machine in ("arm64", "aarch64"):
+        arch = "aarch64"
+    else:
+        return None
+    if sys.platform == "linux":
+        return f"{arch}-unknown-linux-gnu"
+    if sys.platform == "darwin":
+        return f"{arch}-apple-darwin"
+    return None
+
+
+def _hermes_home() -> Path:
+    try:
+        return Path(get_hermes_home())
+    except Exception:
+        return Path.home() / ".hermes"
+
+
+def _prebuilt_bin_dir() -> Path:
+    return _hermes_home() / "plugin-data" / "vector-platform" / "bin"
+
+
+def _prebuilt_bridge_bin() -> Path:
+    return _prebuilt_bin_dir() / "vector-bridge"
+
+
+def _prebuilt_version_stamp() -> Path:
+    return _prebuilt_bin_dir() / ".version"
+
+
+def _prebuilt_yaml() -> dict:
+    """``vector.prebuilt`` from config.yaml. Empty when the block is absent."""
+    block = _read_vector_yaml_block()
+    prebuilt = block.get("prebuilt")
+    return prebuilt if isinstance(prebuilt, dict) else {}
+
+
+def _release_repo() -> str:
+    raw = str(_prebuilt_yaml().get("repo") or "").strip()
+    if raw and _RELEASE_REPO_RE.fullmatch(raw):
+        return raw
+    return DEFAULT_RELEASE_REPO
+
+
+def _release_tag() -> str:
+    raw = str(_prebuilt_yaml().get("tag") or "").strip()
+    if raw and _RELEASE_TAG_RE.fullmatch(raw):
+        return raw if raw.startswith("v") else f"v{raw}"
+    return f"v{PLUGIN_VERSION}"
+
+
+def _skip_prebuilt_download() -> bool:
+    cfg = _prebuilt_yaml()
+    if "download" not in cfg:
+        return False
+    return _yaml_on_off(cfg.get("download")) == "off"
+
+
+def _prebuilt_version_matches() -> bool:
+    stamp = _prebuilt_version_stamp()
+    if not stamp.is_file():
+        return False
+    try:
+        return stamp.read_text(encoding="utf-8").strip() == _release_tag()
+    except OSError:
+        return False
+
+
+def _github_release_url(asset: str) -> str:
+    return (
+        f"https://github.com/{_release_repo()}/releases/download/"
+        f"{_release_tag()}/{asset}"
+    )
+
+
+def _parse_sha256sums(text: str, asset: str) -> Optional[str]:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[-1].lstrip("*").split("/")[-1]
+        if name != asset:
+            continue
+        digest = parts[0].lower()
+        if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+            return digest
+    return None
+
+
+def _http_get_bytes(url: str, *, max_bytes: int = PREBUILT_MAX_BYTES) -> bytes:
+    headers = {"User-Agent": f"hermes-vector-platform/{PLUGIN_VERSION}"}
+    with httpx.Client(
+        timeout=PREBUILT_DOWNLOAD_TIMEOUT,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            buf = bytearray()
+            for chunk in resp.iter_bytes(chunk_size=65536):
+                if len(buf) + len(chunk) > max_bytes:
+                    raise ValueError(
+                        f"download from {url} exceeded {max_bytes} bytes"
+                    )
+                buf.extend(chunk)
+            return bytes(buf)
+
+
+def _try_install_prebuilt_bridge(io) -> Optional[Path]:
+    """Download a versioned GitHub Release binary. None if skipped or failed."""
+    if _skip_prebuilt_download():
+        return None
+    target = bridge_release_target()
+    if target is None:
+        io.print_info(
+            f"No prebuilt vector-bridge for {sys.platform}/{platform.machine()}; "
+            "will try cargo if available."
+        )
+        return None
+
+    asset = f"vector-bridge-{target}"
+    dest = _prebuilt_bridge_bin()
+    try:
+        io.print_info(
+            f"Downloading {asset} from GitHub Release {_release_tag()}..."
+        )
+        sums = _http_get_bytes(
+            _github_release_url("SHA256SUMS"), max_bytes=64 * 1024
+        ).decode("utf-8")
+        expected = _parse_sha256sums(sums, asset)
+        if not expected:
+            io.print_info(
+                f"SHA256SUMS has no entry for {asset}; will try cargo if available."
+            )
+            return None
+        raw = _http_get_bytes(_github_release_url(asset))
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != expected:
+            io.print_error(
+                f"Checksum mismatch for {asset}: got {digest}, expected {expected}"
+            )
+            return None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(dest.parent), prefix=".vector-bridge.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+                fh.flush()
+            os.chmod(tmp_name, 0o755)
+            os.replace(tmp_name, dest)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        _prebuilt_version_stamp().write_text(
+            _release_tag() + "\n", encoding="utf-8"
+        )
+        io.print_success(f"Installed prebuilt vector-bridge at {dest}")
+        if sys.platform == "darwin":
+            io.print_info(
+                "If macOS blocks the binary: "
+                f"xattr -d com.apple.quarantine {dest}"
+            )
+        return dest
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        if status == 404:
+            io.print_info(
+                f"No GitHub Release asset for {_release_tag()}/{asset}; "
+                "will try cargo if available."
+            )
+        else:
+            io.print_info(
+                f"Prebuilt download failed (HTTP {status}); "
+                "will try cargo if available."
+            )
+        return None
+    except Exception as e:
+        io.print_info(f"Prebuilt download failed ({e}); will try cargo if available.")
+        return None
 
 
 def resolve_data_dir() -> Path:
@@ -1050,8 +1256,8 @@ class VectorAdapter(BasePlatformAdapter):
         if not bin_path.is_file():
             msg = (
                 "vector-bridge binary not found at "
-                f"{bin_path}. Run `hermes gateway setup` (builds the sidecar) "
-                "or set VECTOR_BRIDGE_BIN. "
+                f"{bin_path}. Run `hermes gateway setup` (downloads a prebuilt "
+                "sidecar, or cargo-builds one) or set VECTOR_BRIDGE_BIN. "
                 "Do not expect hermes gateway start to compile Rust."
             )
             logger.error("Vector: %s", msg)
@@ -3453,7 +3659,7 @@ class VectorAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 def check_requirements() -> bool:
-    """Side-effect free: VECTOR_NPUB set and vector-bridge binary present."""
+    """Side-effect free: VECTOR_NPUB set and a matching vector-bridge present."""
     npub = (os.getenv("VECTOR_NPUB") or "").strip()
     if not npub:
         return False
@@ -4088,6 +4294,38 @@ def _apply_yaml_config(yaml_cfg: dict, vector_cfg: dict) -> Optional[dict]:
             seeded[extra_key] = count
             _set_env_if_unset(env_key, count, skip=skip)
 
+    prebuilt = vector_cfg.get("prebuilt")
+    if isinstance(prebuilt, dict):
+        if "download" in prebuilt:
+            download = _yaml_on_off(prebuilt.get("download"))
+            if download is not None:
+                seeded["prebuilt_download"] = download
+            else:
+                logger.warning(
+                    "Vector: ignoring vector.prebuilt.download=%r "
+                    "(want true/false)",
+                    prebuilt.get("download"),
+                )
+        repo = str(prebuilt.get("repo") or "").strip()
+        if repo:
+            if _RELEASE_REPO_RE.fullmatch(repo):
+                seeded["prebuilt_repo"] = repo
+            else:
+                logger.warning(
+                    "Vector: ignoring vector.prebuilt.repo=%r "
+                    "(want owner/name)",
+                    repo,
+                )
+        tag = str(prebuilt.get("tag") or "").strip()
+        if tag:
+            if _RELEASE_TAG_RE.fullmatch(tag):
+                seeded["prebuilt_tag"] = tag if tag.startswith("v") else f"v{tag}"
+            else:
+                logger.warning(
+                    "Vector: ignoring vector.prebuilt.tag=%r",
+                    tag,
+                )
+
     behavior = str(vector_cfg.get("unauthorized_dm_behavior") or "").strip().lower()
     if behavior == "ignore":
         _set_env_if_unset("VECTOR_PAIRING", "off", skip=skip)
@@ -4255,7 +4493,7 @@ def _merge_display_pyyaml(
 
 
 def _ensure_bridge_binary(io) -> Optional[Path]:
-    """Return vector-bridge path, cargo-building in bridge/ if the default is missing."""
+    """Return vector-bridge: existing file, GitHub prebuilt, then cargo build."""
     bin_path = resolve_bridge_bin()
     if bin_path.is_file():
         io.print_info(f"Using vector-bridge at {bin_path}")
@@ -4265,15 +4503,22 @@ def _ensure_bridge_binary(io) -> Optional[Path]:
     if override and Path(override) != _DEFAULT_BRIDGE_BIN:
         io.print_error(f"VECTOR_BRIDGE_BIN={override} does not exist.")
         io.print_info(
-            "Unset VECTOR_BRIDGE_BIN to let setup build "
-            "bridge/target/release/vector-bridge, or point it at a built binary."
+            "Unset VECTOR_BRIDGE_BIN to let setup download or build "
+            "vector-bridge, or point it at a built binary."
         )
         return None
+
+    prebuilt = _try_install_prebuilt_bridge(io)
+    if prebuilt is not None and prebuilt.is_file():
+        return prebuilt
 
     cargo = shutil.which("cargo")
     if not cargo:
         io.print_error("cargo not found. Install Rust 1.75+ from https://rustup.rs")
         io.print_info("  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
+        io.print_info(
+            "Or wait for a GitHub Release with a prebuilt sidecar for this platform."
+        )
         io.print_info("Then re-run: hermes gateway setup")
         return None
 

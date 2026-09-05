@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-05
+
+SSE replay that cannot drop DMs, `config.yaml` `vector:` as the product
+config surface, a real installable package, and GitHub Release sidecars
+for Linux and macOS.
+
 ### Fixed
 
 - **Inbound DMs could be lost silently during an SSE gap.** The sidecar
@@ -60,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `plugin.yaml` now declares only `VECTOR_NPUB`, `VECTOR_ALLOWED_USERS`, and
   `VECTOR_HOME_CHANNEL`. Profile, communities, reactions, slash commands,
-  replay, and pairing live in `config.yaml` `vector:`
+  replay, pairing, and prebuilt sidecar fetch live in `config.yaml` `vector:`
   (`apply_yaml_config_fn`). Env still wins if a legacy `VECTOR_*` key is set.
 - Pairing off is `vector.unauthorized_dm_behavior: ignore` (Hermes shared
   key). Adapter pre-filter still honors leftover `VECTOR_PAIRING=off`.
@@ -74,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Prebuilt `vector-bridge` from GitHub Releases.** `hermes gateway setup`
+  downloads `vector-bridge-<triple>` plus `SHA256SUMS` for Linux and macOS
+  (`x86_64` and `aarch64`) matching the plugin version, verifies the hash,
+  and installs under `plugin-data/vector-platform/bin/`. Rust is only
+  needed when no asset exists, the OS is unsupported, or
+  `vector.prebuilt.download` is `false`. Optional `vector.prebuilt.repo`
+  / `tag` pick a different Release (`tag` defaults to `v` + plugin
+  version). Tag a `v*` release (or `workflow_dispatch`) to build assets
+  via `.github/workflows/release-sidecar.yml`.
 - Message **edit**. Sidecar `POST /edit` `{to, message_id, body}` calls
   `Channel::edit` (Concord) or `edit_dm` (DMs, so we keep the kind-16
   `edit_id`). Adapter `edit_message` always returns the **original** rumor

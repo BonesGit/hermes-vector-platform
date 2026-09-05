@@ -12,8 +12,8 @@ The plugin is a **first-class Vector bot identity** (its own nsec/npub), not an 
 ## Prerequisites
 
 - Hermes Agent with the platform plugin registry (current `main`)
-- Rust **≥ 1.75** (`cargo`, `rustc`). The sidecar depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk) `=0.9.0` (the last publish whose git SHA is on [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector) `master`). No local Vector checkout.
 - **Your** Vector npub (hex / `npub1` / `nostr:npub1`) to allowlist during setup
+- A matching GitHub Release (Linux / macOS, x86_64 or aarch64), **or** Rust **≥ 1.75** to compile the sidecar locally. The crate depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk) `=0.9.0` (the last publish whose git SHA is on [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector) `master`). No local Vector checkout.
 
 The bot identity is created or imported by `hermes gateway setup`. You do not need one before install.
 
@@ -24,7 +24,7 @@ Clone this repository into the Hermes plugins directory:
 ```bash
 git clone https://github.com/BonesGit/hermes-vector-platform ~/.hermes/plugins/vector-platform
 hermes plugins enable vector-platform
-hermes gateway setup    # builds vector-bridge, create/import identity
+hermes gateway setup    # downloads vector-bridge (or cargo-builds), create/import identity
 hermes gateway restart
 ```
 
@@ -36,7 +36,7 @@ hermes plugins list
 
 ### pip (optional)
 
-Ships the adapter, `plugin.yaml`, and the sidecar **sources**. You still need Rust — there is no prebuilt `vector-bridge`. Prefer an editable install so `hermes gateway setup` can write `bridge/target/release/` in the checkout rather than in site-packages.
+Ships the adapter, `plugin.yaml`, and the sidecar **sources** (cargo fallback). Setup downloads a checksum-verified `vector-bridge` from GitHub Releases for Linux and macOS; Rust is only required when no asset matches, `vector.prebuilt.download` is `false`, or you are on another OS. Prefer an editable install if you plan to compile locally, so cargo can write `bridge/target/release/` in the checkout rather than in site-packages.
 
 ```bash
 pip install -e /path/to/hermes-vector-platform
@@ -55,7 +55,7 @@ hermes gateway restart
 
 Setup will:
 
-1. Resolve `vector-bridge` (`VECTOR_BRIDGE_BIN` or `bridge/target/release/vector-bridge`). If missing, `cd bridge && cargo build --release` (Rust ≥ 1.75). Build happens **only** in setup, never at `hermes gateway start`.
+1. Resolve `vector-bridge` (`VECTOR_BRIDGE_BIN`, an in-tree `bridge/target/release/vector-bridge`, or a version-matching prebuilt under `plugin-data/vector-platform/bin/`). If missing, download `vector-bridge-<triple>` + `SHA256SUMS` from the `v{plugin version}` GitHub Release (Linux / macOS, x86_64 and aarch64). Cargo (`cd bridge && cargo build --release --locked`, Rust ≥ 1.75) is the fallback. Download and build happen **only** in setup, never at `hermes gateway start`.
 2. Run `--check` (read-only) against `VECTOR_DATA_DIR` (default `plugin-data/vector-platform/sdk`).
 3. Create a new identity, or import an existing one (nsec **or** 12-word mnemonic). Secrets go through a temp `0600` file, never the sidecar env. **Do not** save nsec or mnemonic to `.env`.
 4. Require **your** Vector npub (`hex` / `npub1` / `nostr:npub1`) as `VECTOR_HOME_CHANNEL` and the first `VECTOR_ALLOWED_USERS` entry.
@@ -131,7 +131,7 @@ Sidecar plumbing stays getenv overrides (not in `plugin.yaml`, not written by th
 
 ## `config.yaml` (`vector:`)
 
-Profile, communities, reactions, replay, and pairing live here. Env still overrides if set. Setup writes non-default answers; omit a key to keep the code default.
+Profile, communities, reactions, replay, pairing, and prebuilt sidecar fetch live here. Env still overrides if set for the older `VECTOR_*` keys. Setup writes non-default answers; omit a key to keep the code default. The wizard does not prompt `replay` or `prebuilt` and will not clobber them.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -147,6 +147,10 @@ vector:
   replay:                            # how much backlog a reconnect is allowed to cost
     max_messages: 5                  # items replayed per reconnect, newest first; 0 = never replay
     max_age_secs: 600                # skip messages older than this; 0 = no age limit
+  prebuilt:                          # GitHub Release sidecar; omit = download the matching tag
+    download: true                   # false = cargo only (Linux / macOS still download by default)
+    # repo: BonesGit/hermes-vector-platform
+    # tag: v0.4.0                    # omit = v{plugin version}
   communities:
     create: false                    # true = bot-owned private home room after Ready
     name: Hermes                     # only used when create is true
@@ -341,7 +345,8 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 |---------|--------|
 | Plugin not listed | `hermes plugins enable vector-platform` then `hermes plugins list` |
 | Invalid npub / allowlist ignored | hex, `npub1…`, or `nostr:npub1`. Bech32 charset is `qpzry9x8gf2tvdw0s3jn54khce6mua7l` — no `1`, `b`, `i`, `o` in the payload. `normalize_npub()` is the source of truth (not a loose regex). |
-| `vector-bridge` binary not found | `VECTOR_BRIDGE_BIN` or `bridge/target/release/vector-bridge`. Run `hermes gateway setup` (`cd bridge && cargo build --release`). `hermes gateway start` does **not** compile Rust. |
+| `vector-bridge` binary not found | Run `hermes gateway setup`. It downloads a Release asset into `plugin-data/vector-platform/bin/` (Linux / macOS) or `cargo build --release --locked` in `bridge/`. `VECTOR_BRIDGE_BIN` overrides. `hermes gateway start` does **not** download or compile. |
+| macOS “cannot be opened” / killed on start | Gatekeeper quarantine on the downloaded binary. `xattr -d com.apple.quarantine ~/.hermes/plugin-data/vector-platform/bin/vector-bridge` |
 | Identity missing / “will not mint” | `identity.nsec` is missing from `VECTOR_DATA_DIR` (default `~/.hermes/plugin-data/vector-platform/sdk`). Restore it or re-run setup and import. Start never mints. Deleting `identity.mnemonic` does **not** cause this. |
 | Port 8096 in use | `ss -ltnp \| rg 8096` or set `VECTOR_BRIDGE_PORT`. A leftover `vector-bridge` is reaped on connect; a foreign process is a retryable fatal. |
 | Lost the bot / contacts don't recognize it | Restoring needs `identity.nsec` **or** `identity.mnemonic`. Replacing the nsec **is** a new bot (new npub, lost DMs). Identities minted before mnemonic-on-create, or imported from nsec only, have no seed file. |

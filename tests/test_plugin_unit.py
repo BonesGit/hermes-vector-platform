@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -48,6 +49,20 @@ class TestPluginVersion:
     def test_plugin_version_set(self):
         assert vector_adapter.PLUGIN_VERSION
         assert vector_adapter.PLUGIN_VERSION[0].isdigit()
+
+    def test_declared_versions_match(self):
+        """plugin.yaml, pyproject, Cargo.toml, and PLUGIN_VERSION stay in lockstep."""
+        version = vector_adapter.PLUGIN_VERSION
+        plugin_yaml = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+        pyproject = (PLUGIN_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        cargo = (PLUGIN_ROOT / "bridge" / "Cargo.toml").read_text(encoding="utf-8")
+        cargo_lock = (PLUGIN_ROOT / "bridge" / "Cargo.lock").read_text(
+            encoding="utf-8"
+        )
+        assert f"version: {version}" in plugin_yaml
+        assert f'version = "{version}"' in pyproject
+        assert f'version = "{version}"' in cargo.split("[dependencies]", 1)[0]
+        assert f'name = "vector-bridge"\nversion = "{version}"' in cargo_lock
 
 
 class TestPackaging:
@@ -632,6 +647,153 @@ class TestRequirements:
         fake.write_text("")
         monkeypatch.setenv("VECTOR_BRIDGE_BIN", str(fake))
         assert vector_adapter.check_requirements() is True
+
+
+class TestBridgeReleaseTarget:
+    def test_linux_x86_64(self, monkeypatch):
+        monkeypatch.setattr(vector_adapter.sys, "platform", "linux")
+        monkeypatch.setattr(vector_adapter.platform, "machine", lambda: "x86_64")
+        assert (
+            vector_adapter.bridge_release_target() == "x86_64-unknown-linux-gnu"
+        )
+
+    def test_linux_amd64_alias(self, monkeypatch):
+        monkeypatch.setattr(vector_adapter.sys, "platform", "linux")
+        monkeypatch.setattr(vector_adapter.platform, "machine", lambda: "AMD64")
+        assert (
+            vector_adapter.bridge_release_target() == "x86_64-unknown-linux-gnu"
+        )
+
+    def test_darwin_arm64(self, monkeypatch):
+        monkeypatch.setattr(vector_adapter.sys, "platform", "darwin")
+        monkeypatch.setattr(vector_adapter.platform, "machine", lambda: "arm64")
+        assert vector_adapter.bridge_release_target() == "aarch64-apple-darwin"
+
+    def test_darwin_x86_64(self, monkeypatch):
+        monkeypatch.setattr(vector_adapter.sys, "platform", "darwin")
+        monkeypatch.setattr(vector_adapter.platform, "machine", lambda: "x86_64")
+        assert vector_adapter.bridge_release_target() == "x86_64-apple-darwin"
+
+    def test_windows_none(self, monkeypatch):
+        monkeypatch.setattr(vector_adapter.sys, "platform", "win32")
+        monkeypatch.setattr(vector_adapter.platform, "machine", lambda: "AMD64")
+        assert vector_adapter.bridge_release_target() is None
+
+    def test_unknown_arch(self, monkeypatch):
+        monkeypatch.setattr(vector_adapter.sys, "platform", "linux")
+        monkeypatch.setattr(vector_adapter.platform, "machine", lambda: "riscv64")
+        assert vector_adapter.bridge_release_target() is None
+
+
+class TestResolveBridgeBin:
+    def test_override_wins(self, monkeypatch, tmp_path):
+        custom = tmp_path / "custom"
+        monkeypatch.setenv("VECTOR_BRIDGE_BIN", str(custom))
+        assert vector_adapter.resolve_bridge_bin() == custom
+
+    def test_in_tree_beats_prebuilt(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
+        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        in_tree = tmp_path / "in-tree"
+        in_tree.write_text("")
+        prebuilt_dir = tmp_path / "bin"
+        prebuilt_dir.mkdir()
+        (prebuilt_dir / "vector-bridge").write_text("pre")
+        (prebuilt_dir / ".version").write_text(
+            f"v{vector_adapter.PLUGIN_VERSION}\n"
+        )
+        monkeypatch.setattr(vector_adapter, "_DEFAULT_BRIDGE_BIN", in_tree)
+        monkeypatch.setattr(
+            vector_adapter, "_prebuilt_bin_dir", lambda: prebuilt_dir
+        )
+        assert vector_adapter.resolve_bridge_bin() == in_tree
+
+    def test_versioned_prebuilt_when_in_tree_missing(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
+        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        missing = tmp_path / "missing-in-tree"
+        prebuilt_dir = tmp_path / "bin"
+        prebuilt_dir.mkdir()
+        binary = prebuilt_dir / "vector-bridge"
+        binary.write_text("pre")
+        (prebuilt_dir / ".version").write_text(
+            f"v{vector_adapter.PLUGIN_VERSION}\n"
+        )
+        monkeypatch.setattr(vector_adapter, "_DEFAULT_BRIDGE_BIN", missing)
+        monkeypatch.setattr(
+            vector_adapter, "_prebuilt_bin_dir", lambda: prebuilt_dir
+        )
+        assert vector_adapter.resolve_bridge_bin() == binary
+
+    def test_stale_prebuilt_ignored(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
+        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        missing = tmp_path / "missing-in-tree"
+        prebuilt_dir = tmp_path / "bin"
+        prebuilt_dir.mkdir()
+        (prebuilt_dir / "vector-bridge").write_text("old")
+        (prebuilt_dir / ".version").write_text("v0.0.1\n")
+        monkeypatch.setattr(vector_adapter, "_DEFAULT_BRIDGE_BIN", missing)
+        monkeypatch.setattr(
+            vector_adapter, "_prebuilt_bin_dir", lambda: prebuilt_dir
+        )
+        assert vector_adapter.resolve_bridge_bin() == missing
+
+
+class TestReleaseCoords:
+    def test_default_repo_and_tag(self, monkeypatch):
+        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        assert vector_adapter._release_repo() == "BonesGit/hermes-vector-platform"
+        assert vector_adapter._release_tag() == f"v{vector_adapter.PLUGIN_VERSION}"
+
+    def test_yaml_repo_and_tag(self, monkeypatch):
+        monkeypatch.setattr(
+            vector_adapter,
+            "_read_vector_yaml_block",
+            lambda: {"prebuilt": {"repo": "Acme/vector-fork", "tag": "v1.2.3"}},
+        )
+        assert vector_adapter._release_repo() == "Acme/vector-fork"
+        assert vector_adapter._release_tag() == "v1.2.3"
+
+    def test_rejects_malformed_repo(self, monkeypatch):
+        monkeypatch.setattr(
+            vector_adapter,
+            "_read_vector_yaml_block",
+            lambda: {"prebuilt": {"repo": "../evil/repo"}},
+        )
+        assert vector_adapter._release_repo() == "BonesGit/hermes-vector-platform"
+
+    def test_tag_gains_v_prefix(self, monkeypatch):
+        monkeypatch.setattr(
+            vector_adapter,
+            "_read_vector_yaml_block",
+            lambda: {"prebuilt": {"tag": "0.4.0"}},
+        )
+        assert vector_adapter._release_tag() == "v0.4.0"
+
+
+class TestParseSha256Sums:
+    def test_two_space_and_star_prefix(self):
+        digest = "a" * 64
+        asset = "vector-bridge-x86_64-unknown-linux-gnu"
+        assert (
+            vector_adapter._parse_sha256sums(f"{digest}  {asset}\n", asset)
+            == digest
+        )
+        assert (
+            vector_adapter._parse_sha256sums(f"{digest} *{asset}\n", asset)
+            == digest
+        )
+
+    def test_missing_asset(self):
+        digest = "b" * 64
+        text = f"{digest}  vector-bridge-other\n"
+        assert (
+            vector_adapter._parse_sha256sums(
+                text, "vector-bridge-x86_64-unknown-linux-gnu"
+            )
+            is None
+        )
 
 
 class TestRegister:
@@ -3461,6 +3623,33 @@ class TestApplyYamlConfig:
         assert "replay_max_age_secs" not in seeded
         assert "VECTOR_SSE_REPLAY_MAX_AGE_SECS" not in os.environ
 
+    def test_prebuilt_block_seeds_extra_not_env(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_BRIDGE_RELEASE_REPO", raising=False)
+        monkeypatch.delenv("VECTOR_BRIDGE_RELEASE_TAG", raising=False)
+        monkeypatch.delenv("VECTOR_BRIDGE_SKIP_DOWNLOAD", raising=False)
+        seeded = vector_adapter._apply_yaml_config(
+            {},
+            {
+                "prebuilt": {
+                    "download": False,
+                    "repo": "Acme/vector-fork",
+                    "tag": "0.9.0",
+                }
+            },
+        )
+        assert seeded["prebuilt_download"] == "off"
+        assert seeded["prebuilt_repo"] == "Acme/vector-fork"
+        assert seeded["prebuilt_tag"] == "v0.9.0"
+        assert "VECTOR_BRIDGE_RELEASE_REPO" not in os.environ
+        assert "VECTOR_BRIDGE_RELEASE_TAG" not in os.environ
+        assert "VECTOR_BRIDGE_SKIP_DOWNLOAD" not in os.environ
+
+    def test_prebuilt_rejects_malformed_repo(self, monkeypatch):
+        seeded = vector_adapter._apply_yaml_config(
+            {}, {"prebuilt": {"repo": "../evil/repo"}}
+        )
+        assert (seeded or {}).get("prebuilt_repo") is None
+
 
 class TestStandaloneSend:
     def test_reads_runtime_record_and_sends_token(self, monkeypatch, tmp_path):
@@ -3677,6 +3866,9 @@ class TestWizardHelpers:
         missing = tmp_path / "no-bridge"
         monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: missing)
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
+        monkeypatch.setattr(
+            vector_adapter, "_try_install_prebuilt_bridge", lambda _io: None
+        )
         monkeypatch.setattr(vector_adapter.shutil, "which", lambda _name: None)
         errors = []
         io = SimpleNamespace(
@@ -3687,6 +3879,104 @@ class TestWizardHelpers:
         assert vector_adapter._ensure_bridge_binary(io) is None
         assert errors
         assert "cargo" in errors[0].lower() or "rustup" in errors[0].lower()
+
+    def test_ensure_bridge_binary_downloads_before_cargo(self, monkeypatch, tmp_path):
+        missing = tmp_path / "no-bridge"
+        downloaded = tmp_path / "downloaded"
+        downloaded.write_text("ok")
+        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: missing)
+        monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
+        monkeypatch.setattr(
+            vector_adapter, "_try_install_prebuilt_bridge", lambda _io: downloaded
+        )
+        cargo_calls = []
+        monkeypatch.setattr(
+            vector_adapter.subprocess,
+            "run",
+            lambda *a, **k: cargo_calls.append((a, k)) or MagicMock(),
+        )
+        io = SimpleNamespace(
+            print_info=lambda *_a, **_k: None,
+            print_error=lambda *_a, **_k: None,
+            print_success=lambda *_a, **_k: None,
+        )
+        assert vector_adapter._ensure_bridge_binary(io) == downloaded
+        assert cargo_calls == []
+
+    def test_try_install_skips_when_yaml_download_false(self, monkeypatch):
+        monkeypatch.setattr(
+            vector_adapter,
+            "_read_vector_yaml_block",
+            lambda: {"prebuilt": {"download": False}},
+        )
+        io = SimpleNamespace(
+            print_info=lambda *_a, **_k: None,
+            print_error=lambda *_a, **_k: None,
+            print_success=lambda *_a, **_k: None,
+        )
+        assert vector_adapter._try_install_prebuilt_bridge(io) is None
+
+    def test_try_install_writes_verified_binary(self, monkeypatch, tmp_path):
+        payload = b"sidecar-bytes"
+        digest = hashlib.sha256(payload).hexdigest()
+        asset = "vector-bridge-x86_64-unknown-linux-gnu"
+        dest_dir = tmp_path / "bin"
+        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        monkeypatch.setattr(
+            vector_adapter,
+            "bridge_release_target",
+            lambda: "x86_64-unknown-linux-gnu",
+        )
+        monkeypatch.setattr(vector_adapter, "_prebuilt_bin_dir", lambda: dest_dir)
+        monkeypatch.setattr(vector_adapter, "_release_tag", lambda: "v0.4.0")
+        monkeypatch.setattr(vector_adapter.sys, "platform", "linux")
+
+        def fake_get(url, *, max_bytes=None):
+            if url.endswith("SHA256SUMS"):
+                return f"{digest}  {asset}\n".encode()
+            if url.endswith(asset):
+                return payload
+            raise AssertionError(url)
+
+        monkeypatch.setattr(vector_adapter, "_http_get_bytes", fake_get)
+        io = SimpleNamespace(
+            print_info=lambda *_a, **_k: None,
+            print_error=lambda *_a, **_k: None,
+            print_success=lambda *_a, **_k: None,
+        )
+        path = vector_adapter._try_install_prebuilt_bridge(io)
+        assert path == dest_dir / "vector-bridge"
+        assert path.read_bytes() == payload
+        assert path.stat().st_mode & 0o111
+        assert (dest_dir / ".version").read_text(encoding="utf-8").strip() == "v0.4.0"
+
+    def test_try_install_rejects_bad_checksum(self, monkeypatch, tmp_path):
+        payload = b"sidecar-bytes"
+        dest_dir = tmp_path / "bin"
+        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        monkeypatch.setattr(
+            vector_adapter,
+            "bridge_release_target",
+            lambda: "x86_64-unknown-linux-gnu",
+        )
+        monkeypatch.setattr(vector_adapter, "_prebuilt_bin_dir", lambda: dest_dir)
+        monkeypatch.setattr(vector_adapter, "_release_tag", lambda: "v0.4.0")
+
+        def fake_get(url, *, max_bytes=None):
+            if url.endswith("SHA256SUMS"):
+                return f"{'c' * 64}  vector-bridge-x86_64-unknown-linux-gnu\n".encode()
+            return payload
+
+        monkeypatch.setattr(vector_adapter, "_http_get_bytes", fake_get)
+        errors = []
+        io = SimpleNamespace(
+            print_info=lambda *_a, **_k: None,
+            print_error=lambda msg, *a, **k: errors.append(msg),
+            print_success=lambda *_a, **_k: None,
+        )
+        assert vector_adapter._try_install_prebuilt_bridge(io) is None
+        assert any("checksum" in e.lower() for e in errors)
+        assert not (dest_dir / "vector-bridge").exists()
 
 
 def _fake_setup_io(*, prompts=None, yes_no=None, env=None):

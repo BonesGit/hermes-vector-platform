@@ -23,14 +23,28 @@ Changelog = "https://github.com/BonesGit/hermes-vector-platform/blob/master/CHAN
 dev = ["pytest>=7"]
 
 [project.entry-points."hermes_agent.plugins"]
-vector-platform = "adapter:register"
+vector-platform = "hermes_vector_platform:register"
 
+# Map this package onto the repo root so a pip install still has
+# adapter.py + plugin.yaml + bridge/ next to each other — the same layout
+# Hermes uses for a git-clone into ~/.hermes/plugins/vector-platform.
+# Do not declare a top-level module named adapter: that put a generic
+# `adapter` in site-packages and silently dropped package-data.
 [tool.setuptools]
-py-modules = ["adapter"]
-include-package-data = true
+packages = ["hermes_vector_platform"]
+include-package-data = false
+
+[tool.setuptools.package-dir]
+hermes_vector_platform = "."
 
 [tool.setuptools.package-data]
-"*" = ["bridge/*", "plugin.yaml"]
+hermes_vector_platform = [
+  "plugin.yaml",
+  "bridge/Cargo.toml",
+  "bridge/Cargo.lock",
+  "bridge/.gitignore",
+  "bridge/src/*.rs",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

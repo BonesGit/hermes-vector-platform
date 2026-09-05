@@ -50,6 +50,27 @@ class TestPluginVersion:
         assert vector_adapter.PLUGIN_VERSION[0].isdigit()
 
 
+class TestPackaging:
+    """The wheel must ship sidecar sources, not a bare `adapter` module."""
+
+    def test_pyproject_is_a_namespaced_package(self):
+        text = (PLUGIN_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        assert 'vector-platform = "hermes_vector_platform:register"' in text
+        assert 'py-modules = [' not in text
+        assert 'packages = ["hermes_vector_platform"]' in text
+        assert 'hermes_vector_platform = "."' in text
+        assert '"plugin.yaml"' in text
+        assert '"bridge/src/*.rs"' in text
+        assert '"bridge/Cargo.toml"' in text
+        assert '"bridge/Cargo.lock"' in text
+
+    def test_manifest_includes_bridge_sources(self):
+        text = (PLUGIN_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+        assert "graft bridge/src" in text
+        assert "include plugin.yaml" in text
+        assert "prune bridge/target" in text
+
+
 class TestNormalizeNpub:
     def test_hex(self):
         assert vector_adapter.normalize_npub(HEX_PUBKEY) == NPUB

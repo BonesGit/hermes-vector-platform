@@ -36,14 +36,14 @@ hermes plugins list
 
 ### pip (optional)
 
-Same tree still needs Rust — `pip install -e` does not ship a prebuilt sidecar.
+Ships the adapter, `plugin.yaml`, and the sidecar **sources**. You still need Rust — there is no prebuilt `vector-bridge`. Prefer an editable install so `hermes gateway setup` can write `bridge/target/release/` in the checkout rather than in site-packages.
 
 ```bash
 pip install -e /path/to/hermes-vector-platform
 hermes plugins enable vector-platform
 ```
 
-Entry point group: `hermes_agent.plugins` → `vector-platform = adapter:register`.
+Entry point group: `hermes_agent.plugins` → `vector-platform = hermes_vector_platform:register`. A non-editable `pip install .` also includes `bridge/src` and `plugin.yaml`; it used to ship only a bare `adapter` module.
 
 ## Setup
 

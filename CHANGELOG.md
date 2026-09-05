@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     disappearing. `VECTOR_SSE_REPLAY_MAX` /
     `VECTOR_SSE_REPLAY_MAX_AGE_SECS` still override, same as the other
     legacy `VECTOR_*` keys.
+- **`pip install` (non-editable) shipped only `adapter.py`.** `package-data`
+  was inert under `py-modules = ["adapter"]`, so a wheel or `pip install .`
+  had no `plugin.yaml` and no sidecar sources — `hermes gateway setup`
+  could not `cargo build`. The install is now the `hermes_vector_platform`
+  package (repo-root mapped), which includes `plugin.yaml` and `bridge/src`.
+  The entry point is `hermes_vector_platform:register` instead of a bare
+  `adapter:register` that collided in site-packages. Git-clone into
+  `~/.hermes/plugins/vector-platform` is unchanged.
 
 ### Removed
 

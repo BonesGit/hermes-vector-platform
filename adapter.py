@@ -5109,10 +5109,10 @@ def register(ctx) -> None:
         is_connected=is_connected,
         required_env=["VECTOR_NPUB"],
         install_hint=(
-            "Requires a built vector-bridge (Rust 1.75+). "
             "Run: hermes plugins enable vector-platform "
-            "&& hermes gateway setup  (builds the sidecar). "
-            "Do not expect hermes gateway start to compile Rust."
+            "&& hermes gateway setup. "
+            "Setup downloads vector-bridge (Linux/macOS) or cargo-builds it. "
+            "hermes gateway start does not download or compile."
         ),
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,

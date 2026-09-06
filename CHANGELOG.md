@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Install no longer prompts for `VECTOR_NPUB`.** That value is an output of
+  `hermes gateway setup`, not a credential you paste at `hermes plugins
+  install`. It moved from `requires_env` to `optional_env` so the installer
+  does not ask for a bot npub that does not exist yet (people were pasting
+  their personal Vector npub). `register_platform(required_env=…)` and
+  `check_fn` still require it at runtime.
+- README install path matches current Hermes plugin UX (one-click Desktop
+  link, `hermes plugins install --enable`, opt-in `plugins.enabled`, then
+  `hermes gateway setup`). New `after-install.md` is what the CLI renders
+  after a git install.
+
 ## [0.4.0] — 2026-09-05
 
 SSE replay that cannot drop DMs, `config.yaml` `vector:` as the product

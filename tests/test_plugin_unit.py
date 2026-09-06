@@ -65,6 +65,18 @@ class TestPluginVersion:
         assert f'name = "vector-bridge"\nversion = "{version}"' in cargo_lock
 
 
+class TestInstallManifest:
+    def test_bot_npub_is_not_requires_env(self):
+        """VECTOR_NPUB is written by gateway setup, not asked at plugin install."""
+        plugin_yaml = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+        requires, _, _ = plugin_yaml.partition("optional_env:")
+        assert "requires_env:" not in requires
+        assert "VECTOR_NPUB" in plugin_yaml
+        after = PLUGIN_ROOT / "after-install.md"
+        assert after.is_file()
+        assert "hermes gateway setup" in after.read_text(encoding="utf-8")
+
+
 class TestPackaging:
     """The wheel must ship sidecar sources, not a bare `adapter` module."""
 
@@ -83,6 +95,7 @@ class TestPackaging:
         text = (PLUGIN_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
         assert "graft bridge/src" in text
         assert "include plugin.yaml" in text
+        assert "include after-install.md" in text
         assert "prune bridge/target" in text
 
 
@@ -824,6 +837,7 @@ class TestRegister:
         assert kwargs["standalone_sender_fn"] is vector_adapter._standalone_send
         assert kwargs["setup_fn"] is vector_adapter.interactive_setup
         assert kwargs.get("ensure_deps_fn") is None
+        assert "hermes gateway setup" in kwargs["install_hint"]
         assert kwargs["max_message_length"] == 4000
         assert "markdown" in kwargs["platform_hint"].lower()
         assert "mention" in kwargs["platform_hint"].lower()

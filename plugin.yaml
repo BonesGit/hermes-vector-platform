@@ -2,19 +2,26 @@ name: vector-platform
 label: Vector
 kind: platform
 version: 0.4.0
+manifest_version: 2
+api_version: 1
+license: MIT
+homepage: https://github.com/BonesGit/hermes-vector-platform
+tags: [gateway, vector, nostr]
 description: >
   Vector (vectorapp.io) gateway adapter for Hermes Agent.
   Spawns a local Rust sidecar wrapping vector-sdk and relays
   DMs over HTTP/SSE. The plugin is a first-class Vector bot
   identity (its own nsec/npub), not an impersonation of a human.
 author: BonesGit
-requires_env:
+# VECTOR_NPUB is written by `hermes gateway setup`. Do not list it under
+# requires_env — install would prompt for a bot npub that does not exist yet,
+# and people often paste their personal Vector npub by mistake.
+optional_env:
   - name: VECTOR_NPUB
-    description: "Bot public key (npub1…); written by hermes gateway setup"
-    prompt: "Vector bot npub"
+    description: "Bot public key (npub1…); written by hermes gateway setup. Not your personal Vector npub."
+    prompt: "Vector bot npub (leave empty — setup writes this)"
     url: "https://vectorapp.io"
     password: false
-optional_env:
   - name: VECTOR_ALLOWED_USERS
     description: "Comma-separated npubs allowed to DM the bot. Also grants community turns (union). Pairing is DM-only."
     prompt: "Allowed npubs (DMs)"

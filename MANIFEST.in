@@ -1,6 +1,7 @@
 include LICENSE
 include README.md
 include CHANGELOG.md
+include after-install.md
 include plugin.yaml
 include adapter.py
 include __init__.py

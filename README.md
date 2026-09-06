@@ -5,45 +5,37 @@
 
 Standalone **Vector** ([vectorapp.io](https://vectorapp.io)) messaging gateway for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-The plugin is a **first-class Vector bot identity** (its own nsec/npub), not an impersonation of a human Vector account. Hermes talks to Vector users through a local Rust sidecar wrapping `vector-sdk`.
+This is a **user-installed platform plugin** — not bundled with Hermes. After enable + setup, Hermes is a first-class Vector bot (its own nsec/npub), talking through a local Rust sidecar that wraps [`vector-sdk`](https://crates.io/crates/vector_sdk). It does not log in as your personal Vector account.
 
-> **User plugin, not in-tree Hermes.** Install into `~/.hermes/plugins/vector-platform` and enable it. Platform name is `vector` (toolset `hermes-vector`). Plugin name is `vector-platform`.
+| | |
+|---|---|
+| Plugin id | `vector-platform` |
+| Platform name | `vector` (toolset `hermes-vector`) |
+| Installs to | `~/.hermes/plugins/vector-platform/` |
 
-## Prerequisites
-
-- Hermes Agent with the platform plugin registry (current `main`)
-- **Your** Vector npub (hex / `npub1` / `nostr:npub1`) to allowlist during setup
-- A matching GitHub Release (Linux / macOS, x86_64 or aarch64), **or** Rust **≥ 1.75** to compile the sidecar locally. The crate depends on crates.io [`vector_sdk`](https://crates.io/crates/vector_sdk) `=0.9.0` (the last publish whose git SHA is on [VectorPrivacy/Vector](https://github.com/VectorPrivacy/Vector) `master`). No local Vector checkout.
-
-The bot identity is created or imported by `hermes gateway setup`. You do not need one before install.
+Hermes plugin docs: [user guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins) · [platform adapters](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-platform-adapters)
 
 ## Install
 
-Clone this repository into the Hermes plugins directory:
+You need [Hermes Agent](https://hermes-agent.nousresearch.com/) and the [Vector](https://vectorapp.io) app (have **your** npub ready — hex, `npub1…`, or `nostr:npub1…`). Setup creates the bot identity. Linux and macOS (x86_64 / aarch64) get a prebuilt `vector-bridge`; otherwise you need Rust **≥ 1.75** so setup can compile it.
+
+Third-party platform plugins stay **off until you enable them**. Bundled channels (Telegram, Discord, …) auto-load; this one does not.
+
+### Desktop
+
+<a href="hermes://plugin/install?repo=BonesGit/hermes-vector-platform&enable=1">Install in Hermes</a>
+
+The link opens a confirmation dialog (repo id, install-time security scan, component checkboxes). Nothing installs until you confirm. Same dialog: **Settings → Plugins → Install from Git**. Then run setup below.
+
+### CLI
 
 ```bash
-git clone https://github.com/BonesGit/hermes-vector-platform ~/.hermes/plugins/vector-platform
-hermes plugins enable vector-platform
-hermes gateway setup    # downloads vector-bridge (or cargo-builds), create/import identity
+hermes plugins install BonesGit/hermes-vector-platform --enable
+hermes gateway setup      # pick Vector
 hermes gateway restart
 ```
 
-Confirm discovery:
-
-```bash
-hermes plugins list
-```
-
-### pip (optional)
-
-Ships the adapter, `plugin.yaml`, and the sidecar **sources** (cargo fallback). Setup downloads a checksum-verified `vector-bridge` from GitHub Releases for Linux and macOS; Rust is only required when no asset matches, `vector.prebuilt.download` is `false`, or you are on another OS. Prefer an editable install if you plan to compile locally, so cargo can write `bridge/target/release/` in the checkout rather than in site-packages.
-
-```bash
-pip install -e /path/to/hermes-vector-platform
-hermes plugins enable vector-platform
-```
-
-Entry point group: `hermes_agent.plugins` → `vector-platform = hermes_vector_platform:register`. A non-editable `pip install .` also includes `bridge/src` and `plugin.yaml`; it used to ship only a bare `adapter` module.
+`--enable` adds `vector-platform` to `plugins.enabled` in `~/.hermes/config.yaml` with no prompt. Without it, install asks `Enable 'vector-platform' now? [y/N]` (default no). Confirm with `hermes plugins list`.
 
 ## Setup
 
@@ -53,16 +45,16 @@ hermes gateway setup
 hermes gateway restart
 ```
 
-Setup will:
+That is the whole first-run path. Setup will:
 
 1. Resolve `vector-bridge` (`VECTOR_BRIDGE_BIN`, an in-tree `bridge/target/release/vector-bridge`, or a version-matching prebuilt under `plugin-data/vector-platform/bin/`). If missing, download `vector-bridge-<triple>` + `SHA256SUMS` from the `v{plugin version}` GitHub Release (Linux / macOS, x86_64 and aarch64). Cargo (`cd bridge && cargo build --release --locked`, Rust ≥ 1.75) is the fallback. Download and build happen **only** in setup, never at `hermes gateway start`.
 2. Run `--check` (read-only) against `VECTOR_DATA_DIR` (default `plugin-data/vector-platform/sdk`).
 3. Create a new identity, or import an existing one (nsec **or** 12-word mnemonic). Secrets go through a temp `0600` file, never the sidecar env. **Do not** save nsec or mnemonic to `.env`.
 4. Require **your** Vector npub (`hex` / `npub1` / `nostr:npub1`) as `VECTOR_HOME_CHANNEL` and the first `VECTOR_ALLOWED_USERS` entry.
 5. Save only `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, and `VECTOR_ALLOWED_USERS` to `.env`. Profile, communities, and pairing go in `config.yaml` `vector:`.
-6. Merge `display.platforms.vector` (and the `vector:` block) into `~/.hermes/config.yaml` (see below).
+6. Merge `display.platforms.vector` (and the `vector:` block) into `~/.hermes/config.yaml`.
 
-Share the bot npub with contacts. Restart the gateway.
+Then share the **bot** npub (`VECTOR_NPUB`) with contacts and DM it from the Vector app. That npub is Hermes, not you.
 
 ### Identity files
 
@@ -306,6 +298,12 @@ pytest -q            # needs Hermes on PYTHONPATH, HERMES_AGENT_ROOT, or ~/.herm
 cd bridge && cargo test --locked
 ```
 
+If your Hermes has Plugin Doctor:
+
+```bash
+hermes plugins doctor . --ci
+```
+
 Tests load `adapter.py` as a free module and do **not** construct `Platform("vector")` — `_missing_()` only succeeds once the registry has the plugin.
 
 HTTP sidecar tests set `VECTOR_STUB=1` so they bind localhost HTTP **without** `VectorBot::build` (no live relays). Adapter unit tests mock that HTTP sidecar (no live Vector network). Production `connect()` does **not** set `VECTOR_STUB`. Production serve requires `VECTOR_DATA_DIR` with an existing `identity.nsec` (`--setup` already wrote it) and runs `VectorBot` with `InvitePolicy::Whitelist` (from `VECTOR_ALLOWED_USERS` / `vector.communities.trusted_inviters`) unless `invite_policy: manual`. Do not set `VECTOR_STUB` in the gateway.
@@ -343,7 +341,8 @@ Operator checks — use this table and `hermes gateway status`. There is **no** 
 
 | Symptom | Check |
 |---------|--------|
-| Plugin not listed | `hermes plugins enable vector-platform` then `hermes plugins list` |
+| Plugin not listed | `hermes plugins enable vector-platform` then `hermes plugins list`. User-installed platforms are opt-in (`plugins.enabled`). |
+| Install asked for `VECTOR_NPUB` | Older manifests listed it under `requires_env`. Skip (Enter) and run `hermes gateway setup`. Current installs do not prompt. |
 | Invalid npub / allowlist ignored | hex, `npub1…`, or `nostr:npub1`. Bech32 charset is `qpzry9x8gf2tvdw0s3jn54khce6mua7l` — no `1`, `b`, `i`, `o` in the payload. `normalize_npub()` is the source of truth (not a loose regex). |
 | `vector-bridge` binary not found | Run `hermes gateway setup`. It downloads a Release asset into `plugin-data/vector-platform/bin/` (Linux / macOS) or `cargo build --release --locked` in `bridge/`. `VECTOR_BRIDGE_BIN` overrides. `hermes gateway start` does **not** download or compile. |
 | macOS “cannot be opened” / killed on start | Gatekeeper quarantine on the downloaded binary. `xattr -d com.apple.quarantine ~/.hermes/plugin-data/vector-platform/bin/vector-bridge` |

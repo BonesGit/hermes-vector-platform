@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Setup wizard defaults pairing codes to no.** Enter writes
+  `vector.unauthorized_dm_behavior: ignore` (unknown npubs are dropped,
+  no pairing DM). Answer Y to keep the approve-via-code path.
+
 ## [0.5.0] — 2026-09-05
 
 Install works on current Hermes, first start is not silent, and setup

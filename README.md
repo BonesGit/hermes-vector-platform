@@ -183,9 +183,7 @@ Session titles use the peer’s public kind-0 **name** (then `display_name`) via
 
 ## Default-deny inbox
 
-`VECTOR_ALLOWED_USERS` + Hermes pairing codes (default **on**). Setup requires the operator npub as the first allowlisted user. `hermes pairing approve` writes back into `VECTOR_ALLOWED_USERS`.
-
-Set `vector.unauthorized_dm_behavior: ignore` in `config.yaml` to drop unauthorized senders **before** `handle_message`, so pairing codes are not sent. Leave pairing on unless you want a closed allowlist with no CLI approve path.
+`VECTOR_ALLOWED_USERS` plus optional Hermes pairing codes. Setup requires the operator npub as the first allowlisted user. The wizard defaults pairing **off** (`vector.unauthorized_dm_behavior: ignore`) so unknown npubs are dropped before `handle_message`. Answer Y to send pairing codes instead; `hermes pairing approve` writes back into `VECTOR_ALLOWED_USERS`. Omitting the YAML key still means pairing on (the code default).
 
 **Communities:** invite the bot from a trusted npub (`VECTOR_ALLOWED_USERS`, or `vector.communities.trusted_inviters`) and it auto-joins. It then listens in that room — no channel id in `.env`. A turn still needs an @mention, a reply-to-bot, or a registered slash command (`@everyone` never counts). The sender is allowed if they have DM access (`VECTOR_ALLOWED_USERS`), they are in `vector.communities.group_allowed_users` (group-only, no DM), or the channel is in `vector.communities.open_channels`. Pairing is **not** offered in a channel.
 

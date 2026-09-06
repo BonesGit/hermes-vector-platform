@@ -4972,7 +4972,7 @@ def _run_interactive_setup(io) -> None:
         return
 
     pairing_on = io.prompt_yes_no(
-        "Enable pairing codes for unknown npubs?", True
+        "Enable pairing codes for unknown npubs?", False
     )
 
     extra_args: List[str] = []

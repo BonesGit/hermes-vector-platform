@@ -4174,7 +4174,6 @@ class TestInteractiveSetup:
                 "Bot display name": "Hermes",
                 "Your Vector npub": HEX_PUBKEY,
             },
-            yes_no={"Enable pairing codes": True},
         )
         vector_adapter._run_interactive_setup(io)
         assert io.saved["VECTOR_NPUB"] == NPUB
@@ -4193,7 +4192,7 @@ class TestInteractiveSetup:
         assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "new"
         assert cfg["display"]["platforms"]["vector"]["interim_assistant_messages"] is False
         assert cfg["vector"]["bot"]["name"] == "Hermes"
-        assert "unauthorized_dm_behavior" not in cfg.get("vector", {})
+        assert cfg["vector"]["unauthorized_dm_behavior"] == "ignore"
         assert "communities" not in cfg.get("vector", {})
         assert any("Share this npub" in m for m in io.logs["info"])
         assert any("DMs your Vector account a hello" in m for m in io.logs["info"])
@@ -4296,6 +4295,7 @@ class TestInteractiveSetup:
         cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert cfg["vector"]["bot"]["name"] == "Hermes"
         assert cfg["vector"]["bot"]["about"] == "Public bio"
+        assert "unauthorized_dm_behavior" not in cfg.get("vector", {})
 
     def test_import_nsec_uses_temp_0600_file_not_env(self, monkeypatch, tmp_path):
         fake_bin = tmp_path / "vector-bridge"
@@ -4332,7 +4332,7 @@ class TestInteractiveSetup:
                 "Your Vector npub": f"nostr:{PEER_NPUB}",
             },
             yes_no={
-                "Import this identity as the Hermes bot?": True,
+                "as the Hermes bot": True,
                 "Enable pairing codes": False,
             },
         )
@@ -4466,7 +4466,7 @@ class TestInteractiveSetup:
         )
         io = _fake_setup_io(
             prompts={"Identity [create / nsec / mnemonic]": "nsec"},
-            yes_no={"Import this identity as the Hermes bot?": False},
+            yes_no={"as the Hermes bot": False},
         )
         vector_adapter._run_interactive_setup(io)
         assert io.saved == {}
@@ -4504,7 +4504,7 @@ class TestInteractiveSetup:
             },
             yes_no={
                 "Reconfigure identity anyway?": True,
-                "Import this identity as the Hermes bot?": True,
+                "as the Hermes bot": True,
                 "Enable pairing codes": True,
             },
         )

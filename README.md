@@ -25,7 +25,13 @@ Third-party platform plugins stay **off until you enable them**. Bundled channel
 
 <a href="hermes://plugin/install?repo=BonesGit/hermes-vector-platform&enable=1">Install in Hermes</a>
 
-The link opens a confirmation dialog (repo id, install-time security scan, component checkboxes). Nothing installs until you confirm. Same dialog: **Settings → Plugins → Install from Git**. Then run setup below.
+Or copy this into a browser with Hermes Desktop installed:
+
+```
+hermes://plugin/install?repo=BonesGit/hermes-vector-platform&enable=1
+```
+The link opens a confirmation dialog (repo id, install-time security scan, component checkboxes). Nothing installs until you confirm. 
+Same dialog: **Settings → Plugins → Install from Git**. Then run setup below.
 
 ### CLI
 

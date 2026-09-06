@@ -1,6 +1,6 @@
 [package]
 name = "vector-bridge"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 rust-version = "1.75"
 description = "Hermes Vector platform sidecar (HTTP + VectorBot)"

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-09-05
+
+Python-only patch. Sidecar binaries are the same as 0.5.1.
+
+### Fixed
+
+- **`hermes plugins update` then gateway start could drop Vector** when the
+  plugin version advanced but the sidecar source did not. Runtime treated a
+  stale `plugin-data/vector-platform/bin/.version` stamp as "no binary".
+  Gateway start now uses the installed prebuilt anyway. Setup (including
+  skip-reconfigure) still re-downloads when the stamp does not match.
+
 ## [0.5.1] — 2026-09-05
 
 Python-only patch. Sidecar binaries are the same as 0.5.0.

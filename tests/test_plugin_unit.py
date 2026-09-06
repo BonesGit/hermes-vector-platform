@@ -740,19 +740,21 @@ class TestResolveBridgeBin:
         )
         assert vector_adapter.resolve_bridge_bin() == binary
 
-    def test_stale_prebuilt_ignored(self, monkeypatch, tmp_path):
+    def test_stale_prebuilt_used_at_runtime(self, monkeypatch, tmp_path):
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
         monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
         missing = tmp_path / "missing-in-tree"
         prebuilt_dir = tmp_path / "bin"
         prebuilt_dir.mkdir()
-        (prebuilt_dir / "vector-bridge").write_text("old")
+        binary = prebuilt_dir / "vector-bridge"
+        binary.write_text("old")
         (prebuilt_dir / ".version").write_text("v0.0.1\n")
         monkeypatch.setattr(vector_adapter, "_DEFAULT_BRIDGE_BIN", missing)
         monkeypatch.setattr(
             vector_adapter, "_prebuilt_bin_dir", lambda: prebuilt_dir
         )
-        assert vector_adapter.resolve_bridge_bin() == missing
+        assert vector_adapter.resolve_bridge_bin() == binary
+        assert vector_adapter.resolve_bridge_bin(require_current=True) == missing
 
 
 class TestReleaseCoords:
@@ -2546,7 +2548,7 @@ class TestConnectMissingBinary:
     def test_missing_binary_is_fatal_not_retryable(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)
         missing = tmp_path / "no-such-vector-bridge"
-        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: missing)
+        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda **_k: missing)
         spawned = []
         monkeypatch.setattr(
             vector_adapter.VectorAdapter,
@@ -3969,7 +3971,7 @@ class TestWizardHelpers:
     def test_ensure_bridge_binary_skips_cargo_when_present(self, monkeypatch, tmp_path):
         fake = tmp_path / "vector-bridge"
         fake.write_text("")
-        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: fake)
+        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda **_k: fake)
         cargo_calls = []
         monkeypatch.setattr(
             vector_adapter.subprocess,
@@ -3982,7 +3984,7 @@ class TestWizardHelpers:
 
     def test_ensure_bridge_binary_hints_when_cargo_missing(self, monkeypatch, tmp_path):
         missing = tmp_path / "no-bridge"
-        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: missing)
+        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda **_k: missing)
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
         monkeypatch.setattr(
             vector_adapter, "_try_install_prebuilt_bridge", lambda _io: None
@@ -4002,7 +4004,7 @@ class TestWizardHelpers:
         missing = tmp_path / "no-bridge"
         downloaded = tmp_path / "downloaded"
         downloaded.write_text("ok")
-        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: missing)
+        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda **_k: missing)
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
         monkeypatch.setattr(
             vector_adapter, "_try_install_prebuilt_bridge", lambda _io: downloaded
@@ -4402,7 +4404,7 @@ class TestInteractiveSetup:
             yes_no={"Reconfigure Vector?": False},
         )
         vector_adapter._run_interactive_setup(io)
-        assert called == []
+        assert called == ["build"]
         assert io.saved == {}
         cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert cfg["display"]["platforms"]["vector"]["tool_progress"] == "new"
@@ -4426,7 +4428,7 @@ class TestInteractiveSetup:
             yes_no={"Reconfigure Vector?": False},
         )
         vector_adapter._run_interactive_setup(io)
-        assert called == []
+        assert called == ["build"]
         assert (data_dir / "identity.nsec").read_text() == "nsec1original\n"
         assert not bak.exists()
         assert any("identity.nsec.bak" in m for m in io.logs["warn"])

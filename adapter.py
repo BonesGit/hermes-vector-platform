@@ -61,7 +61,7 @@ logger = logging.getLogger("hermes_plugins.vector_platform.adapter")
 # ---------------------------------------------------------------------------
 # Plugin identity / paths
 # ---------------------------------------------------------------------------
-PLUGIN_VERSION = "0.5.1"
+PLUGIN_VERSION = "0.5.2"
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _BRIDGE_DIR = _PLUGIN_ROOT / "bridge"
 _DEFAULT_BRIDGE_BIN = _BRIDGE_DIR / "target" / "release" / "vector-bridge"
@@ -124,15 +124,23 @@ def _ensure_hermes_connect_timeout_floor() -> None:
     )
 
 
-def resolve_bridge_bin() -> Path:
-    """Sidecar path: override, in-tree release build, then versioned prebuilt."""
+def resolve_bridge_bin(*, require_current: bool = False) -> Path:
+    """Sidecar path: override, in-tree release build, then installed prebuilt.
+
+    Runtime (``require_current=False``) uses a prebuilt even when ``.version``
+    lags the plugin, so a Python-only ``hermes plugins update`` does not
+    disable Vector. Setup passes ``require_current=True`` and re-downloads
+    when the stamp does not match ``v{plugin version}``.
+    """
     override = (os.getenv("VECTOR_BRIDGE_BIN") or "").strip()
     if override:
         return Path(override)
     if _DEFAULT_BRIDGE_BIN.is_file():
         return _DEFAULT_BRIDGE_BIN
     prebuilt = _prebuilt_bridge_bin()
-    if prebuilt.is_file() and _prebuilt_version_matches():
+    if prebuilt.is_file() and (
+        not require_current or _prebuilt_version_matches()
+    ):
         return prebuilt
     return _DEFAULT_BRIDGE_BIN
 
@@ -1307,6 +1315,17 @@ class VectorAdapter(BasePlatformAdapter):
             self._set_fatal_error("vector_bridge_missing", msg, retryable=False)
             self._release_platform_lock()
             return False
+        if (
+            not (os.getenv("VECTOR_BRIDGE_BIN") or "").strip()
+            and bin_path == _prebuilt_bridge_bin()
+            and not _prebuilt_version_matches()
+        ):
+            logger.warning(
+                "Vector: installed sidecar stamp is not %s; "
+                "run `hermes gateway setup` to refresh. Using %s for now.",
+                _release_tag(),
+                bin_path,
+            )
 
         if not _identity_nsec_present(self.data_dir):
             nsec_path = Path(self.data_dir) / "identity.nsec"
@@ -4558,8 +4577,12 @@ def _merge_display_pyyaml(
 
 
 def _ensure_bridge_binary(io) -> Optional[Path]:
-    """Return vector-bridge: existing file, GitHub prebuilt, then cargo build."""
-    bin_path = resolve_bridge_bin()
+    """Return vector-bridge: current file, GitHub prebuilt, then cargo build.
+
+    A stale prebuilt stamp is not "current" — download again. Runtime
+    ``resolve_bridge_bin()`` still uses that file so gateway start works.
+    """
+    bin_path = resolve_bridge_bin(require_current=True)
     if bin_path.is_file():
         io.print_info(f"Using vector-bridge at {bin_path}")
         return bin_path
@@ -4794,6 +4817,7 @@ def _run_interactive_setup(io) -> None:
             f"Vector: already configured (npub: {_truncate_npub(existing_npub)})"
         )
         if not io.prompt_yes_no("Reconfigure Vector?", False):
+            _ensure_bridge_binary(io)
             _maybe_merge_display(io)
             return
 

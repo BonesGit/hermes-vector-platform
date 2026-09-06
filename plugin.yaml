@@ -1,7 +1,7 @@
 name: vector-platform
 label: Vector
 kind: platform
-version: 0.4.0
+version: 0.5.0
 description: >
   Vector (vectorapp.io) gateway adapter for Hermes Agent.
   Spawns a local Rust sidecar wrapping vector-sdk and relays

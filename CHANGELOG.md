@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-05
+
+Install works on current Hermes, first start is not silent, and setup
+only asks for identity plus **your** Vector npub.
+
 ### Fixed
 
 - **`hermes plugins install` failed on current Hermes** with

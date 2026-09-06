@@ -75,6 +75,8 @@ class TestInstallManifest:
         after = PLUGIN_ROOT / "after-install.md"
         assert after.is_file()
         assert "hermes gateway setup" in after.read_text(encoding="utf-8")
+        # Current Hermes installers hard-fail on manifest_version > 1.
+        assert "manifest_version:" not in plugin_yaml
 
 
 class TestPackaging:

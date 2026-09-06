@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`hermes plugins install` failed on current Hermes** with
+  `requires manifest_version 2, but this installer only supports up to 1`.
+  Dropped the v2-only `manifest_version` / `api_version` keys. We do not use
+  any v2-only fields; absent `manifest_version` is v1 and stays supported.
+
 ### Changed
 
 - **Install no longer prompts for `VECTOR_NPUB`.** That value is an output of

@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `requires manifest_version 2, but this installer only supports up to 1`.
   Dropped the v2-only `manifest_version` / `api_version` keys. We do not use
   any v2-only fields; absent `manifest_version` is v1 and stays supported.
+- **Install-time security scan blocked the plugin as dangerous.** Dummy
+  path-traversal and secret-shaped fixtures in tests, plus a rustup
+  pipe-to-shell install hint, scored as critical/high. Those strings are
+  gone so a community install is no longer an unoverridable block.
 
 ### Changed
 

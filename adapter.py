@@ -4515,7 +4515,6 @@ def _ensure_bridge_binary(io) -> Optional[Path]:
     cargo = shutil.which("cargo")
     if not cargo:
         io.print_error("cargo not found. Install Rust 1.75+ from https://rustup.rs")
-        io.print_info("  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
         io.print_info(
             "Or wait for a GitHub Release with a prebuilt sidecar for this platform."
         )

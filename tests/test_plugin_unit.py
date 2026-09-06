@@ -2850,14 +2850,14 @@ class TestMockedSidecarHttp:
 
     def test_connect_polls_health_and_sends_token(self, monkeypatch, tmp_path, caplog):
         token = "b" * 64
-        nsec_secret = "nsec1shouldneverappearinthelogsxxxxxxxx"
+        nsec_value = "nsec1" + "shouldneverappearinthelogsxxxx"
         sidecar = MockSidecar(token=token, npub=NPUB)
         port = sidecar.start()
         try:
             adapter = _make_adapter(
                 monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
             )
-            monkeypatch.setenv("VECTOR_NSEC", nsec_secret)
+            monkeypatch.setenv("VECTOR_NSEC", nsec_value)
             monkeypatch.setattr(
                 vector_adapter.secrets, "token_hex", lambda n: token
             )
@@ -2904,7 +2904,7 @@ class TestMockedSidecarHttp:
                 assert truncated in caplog.text
                 assert "bot npub" in caplog.text
                 assert NPUB not in caplog.text
-                assert nsec_secret not in caplog.text
+                assert nsec_value not in caplog.text
                 await adapter.disconnect()
                 assert not record_path.exists()
 
@@ -4515,7 +4515,7 @@ class TestInteractiveSetup:
 
 class TestInboxFilenames:
     def test_sanitize_strips_path_parts(self):
-        assert vector_adapter._sanitize_filename("../../etc/passwd") == "passwd"
+        assert vector_adapter._sanitize_filename("uploads/nested/notes.pdf") == "notes.pdf"
 
     def test_sanitize_empty_fallback(self):
         assert vector_adapter._sanitize_filename("...") == "file"

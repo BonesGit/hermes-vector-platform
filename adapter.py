@@ -4261,29 +4261,20 @@ def _build_setup_vector_yaml(
     bot_name: str,
     bot_about: str,
     pairing_on: bool,
-    group_users: List[str],
-    open_chats: List[str],
-    create_home: bool,
-    community_name: str,
 ) -> Dict[str, Any]:
-    """Wizard answers as a top-level ``vector:`` mapping. Empties clear keys."""
+    """Wizard answers as a top-level ``vector:`` mapping. Empties clear keys.
+
+    Communities are not part of the wizard — operators set them in
+    ``config.yaml`` ``vector.communities`` if needed. Omitting ``communities``
+    here leaves any existing block untouched.
+    """
     bot: Dict[str, Any] = {}
     if bot_name:
         bot["name"] = bot_name
     if bot_about:
         bot["about"] = bot_about
-    communities: Dict[str, Any] = {}
-    if group_users:
-        communities["group_allowed_users"] = list(group_users)
-    if open_chats:
-        communities["open_channels"] = list(open_chats)
-    if create_home:
-        communities["create"] = True
-        if community_name:
-            communities["name"] = community_name
     return {
         "bot": bot or None,
-        "communities": communities or None,
         "unauthorized_dm_behavior": None if pairing_on else "ignore",
     }
 
@@ -4912,8 +4903,6 @@ def _run_interactive_setup(io) -> None:
     existing_vector = _read_vector_yaml_block()
     bot_yaml = existing_vector.get("bot")
     bot_yaml = bot_yaml if isinstance(bot_yaml, dict) else {}
-    comm_yaml = existing_vector.get("communities")
-    comm_yaml = comm_yaml if isinstance(comm_yaml, dict) else {}
     bot_name = (
         io.prompt(
             "Bot display name (optional, public; blank = do not publish)",
@@ -4985,63 +4974,6 @@ def _run_interactive_setup(io) -> None:
     pairing_on = io.prompt_yes_no(
         "Enable pairing codes for unknown npubs?", True
     )
-
-    existing_group_users = _yaml_list_to_csv(comm_yaml.get("group_allowed_users")) or (
-        io.get_env_value("VECTOR_GROUP_ALLOWED_USERS") or ""
-    ).strip()
-    io.print_info(
-        "Group-only npubs can @mention the bot in those rooms without DM access. "
-        "People already in VECTOR_ALLOWED_USERS can talk in groups automatically. "
-        "Leave blank to skip."
-    )
-    group_users_raw = (
-        io.prompt(
-            "Group-only npubs (comma-separated)",
-            default=existing_group_users or None,
-        )
-        or ""
-    ).strip()
-    group_users: List[str] = []
-    for part in group_users_raw.split(","):
-        npub = normalize_npub(part.strip())
-        if npub and npub not in group_users:
-            group_users.append(npub)
-        elif part.strip() and not npub:
-            io.print_warning(f"Skipping invalid group-only npub: {part.strip()[:20]}")
-
-    existing_open = _yaml_list_to_csv(comm_yaml.get("open_channels")) or (
-        io.get_env_value("VECTOR_GROUP_ALLOW_ALL") or ""
-    ).strip()
-    io.print_info(
-        "Open channels: any member may @mention or reply to the bot "
-        "(@everyone is ignored). Leave blank unless you want a whole room open."
-    )
-    open_raw = (
-        io.prompt(
-            "Open community channel ids (64-hex)",
-            default=existing_open or None,
-        )
-        or ""
-    ).strip()
-    open_chats: List[str] = []
-    for part in open_raw.split(","):
-        cid = normalize_channel_id(part)
-        if not part.strip():
-            continue
-        if not cid:
-            io.print_warning(f"Skipping invalid open channel id: {part.strip()[:20]}")
-            continue
-        if cid not in open_chats:
-            open_chats.append(cid)
-
-    create_home = io.prompt_yes_no(
-        "Also create a private home community owned by the bot?", False
-    )
-    community_name = ""
-    if create_home:
-        community_name = (
-            io.prompt("Home community name", default="Hermes") or "Hermes"
-        ).strip() or "Hermes"
 
     extra_args: List[str] = []
     temp_secret: Optional[Path] = None
@@ -5126,10 +5058,6 @@ def _run_interactive_setup(io) -> None:
             bot_name=bot_name,
             bot_about=bot_about,
             pairing_on=pairing_on,
-            group_users=group_users,
-            open_chats=open_chats,
-            create_home=create_home,
-            community_name=community_name,
         ),
     )
 
@@ -5144,17 +5072,6 @@ def _run_interactive_setup(io) -> None:
         "After gateway start the bot DMs your Vector account a hello "
         "(VECTOR_HOME_CHANNEL). Reply there to talk."
     )
-    io.print_info(
-        "Communities: invite the bot from a trusted npub; it auto-joins and "
-        "listens. @mention or reply to take a turn. Group-only npubs and "
-        "open channel ids live under vector.communities in config.yaml."
-    )
-    if create_home:
-        io.print_info(
-            "Home community create is on in config.yaml — the gateway will "
-            "create or reuse a private home community after Ready (no public "
-            "invite link)."
-        )
     backup_bits = [str(data_dir / "identity.nsec")]
     mnemonic_path = data_dir / "identity.mnemonic"
     if mnemonic_path.is_file():

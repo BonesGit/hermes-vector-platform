@@ -57,7 +57,7 @@ That is the whole first-run path. Setup will:
 2. Run `--check` (read-only) against `VECTOR_DATA_DIR` (default `plugin-data/vector-platform/sdk`).
 3. Create a new identity, or import an existing one (nsec **or** 12-word mnemonic). Secrets go through a temp `0600` file, never the sidecar env. **Do not** save nsec or mnemonic to `.env`.
 4. Require **your** Vector npub (`hex` / `npub1` / `nostr:npub1`) as `VECTOR_HOME_CHANNEL` and the first `VECTOR_ALLOWED_USERS` entry.
-5. Save only `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, and `VECTOR_ALLOWED_USERS` to `.env`. Profile, communities, and pairing go in `config.yaml` `vector:`.
+5. Save only `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, and `VECTOR_ALLOWED_USERS` to `.env`. Profile and pairing go in `config.yaml` `vector:`. Communities stay off the wizard — set `vector.communities` later if you want groups.
 6. Merge `display.platforms.vector` (and the `vector:` block) into `~/.hermes/config.yaml`.
 
 Then open the Vector app. On first gateway start the bot DMs **your** npub (`VECTOR_HOME_CHANNEL`) a hello so the chat appears. Reply there. Share the **bot** npub (`VECTOR_NPUB`) with anyone else who should reach it.

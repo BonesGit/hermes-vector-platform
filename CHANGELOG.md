@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Setup wizard no longer asks about communities.** Group-only npubs, open
+  channel ids, and “create a home community” are off the first-run path.
+  Identity, your npub, pairing, and optional kind-0 profile remain.
+  `vector.communities` in `config.yaml` still works if you want groups later.
 - **Install no longer prompts for `VECTOR_NPUB`.** That value is an output of
   `hermes gateway setup`, not a credential you paste at `hermes plugins
   install`. It moved from `requires_env` to `optional_env` so the installer

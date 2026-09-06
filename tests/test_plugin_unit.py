@@ -4198,6 +4198,58 @@ class TestInteractiveSetup:
         assert any("Share this npub" in m for m in io.logs["info"])
         assert any("DMs your Vector account a hello" in m for m in io.logs["info"])
         assert any("identity.mnemonic" in m for m in io.logs["info"])
+        asked = " ".join(
+            io.logs["info"] + io.logs["header"] + io.logs["ok"] + io.logs["warn"]
+        )
+        assert "Group-only" not in asked
+        assert "Open community" not in asked
+        assert "home community" not in asked.lower()
+
+    def test_reconfigure_leaves_existing_communities_untouched(
+        self, monkeypatch, tmp_path
+    ):
+        fake_bin = tmp_path / "vector-bridge"
+        fake_bin.write_text("")
+        monkeypatch.setattr(
+            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+        )
+        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            vector_adapter, "resolve_data_dir", lambda: tmp_path / "sdk"
+        )
+        existing = {
+            "vector": {
+                "communities": {
+                    "create": True,
+                    "name": "Hermes",
+                    "open_channels": ["aa" * 32],
+                    "group_allowed_users": [PEER_NPUB],
+                }
+            }
+        }
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(existing), encoding="utf-8"
+        )
+
+        def fake_cli(_bin, _data, args, timeout=60):
+            if "--check" in args:
+                return {"status": "not_registered"}, 0, ""
+            if "--setup" in args:
+                return {"status": "created", "npub": NPUB}, 0, ""
+            return None, 1, "unexpected"
+
+        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        io = _fake_setup_io(
+            prompts={
+                "Identity [create / nsec / mnemonic]": "create",
+                "Bot display name": "Hermes",
+                "Your Vector npub": HEX_PUBKEY,
+            },
+            yes_no={"Enable pairing codes": True},
+        )
+        vector_adapter._run_interactive_setup(io)
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+        assert cfg["vector"]["communities"] == existing["vector"]["communities"]
 
     def test_setup_copies_avatar_into_data_dir(self, monkeypatch, tmp_path):
         fake_bin = tmp_path / "vector-bridge"

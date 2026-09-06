@@ -93,6 +93,7 @@ LAST_INBOUND_CHATS_MAX = 200
 SENT_IDS_MAX = 1000
 RUNTIME_RECORD_NAME = "vector-sidecar.json"
 NOTIFIED_CHANNELS_FILE = "notified-channels.json"
+WELCOME_SENT_FILE = "welcome-sent.json"
 INBOX_NAME_MAX = 180
 DOWNLOAD_TIMEOUT = 120.0
 SEND_FILE_TIMEOUT = 120.0
@@ -984,6 +985,48 @@ def _save_notified_channel_ids(data_dir: Path, ids: set) -> None:
         logger.debug("Vector: could not persist notified channel ids: %s", e)
 
 
+def _format_operator_welcome(bot_npub: str) -> str:
+    """First-run DM to VECTOR_HOME_CHANNEL. Opens the chat in the Vector app."""
+    bot = (bot_npub or "").strip()
+    lines = [
+        "Hermes is online on Vector.",
+        "Reply here to talk. Share this bot npub with anyone else who should reach me:",
+        "",
+        bot or "(bot npub not yet known)",
+        "",
+        "Communities: invite this npub from your Vector app; I auto-join trusted inviters.",
+    ]
+    return "\n".join(lines)
+
+
+def _welcome_already_sent(data_dir: Path, bot_npub: str, home_npub: str) -> bool:
+    path = Path(data_dir) / WELCOME_SENT_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    return (
+        normalize_npub(str(raw.get("bot") or "")) == bot_npub
+        and normalize_npub(str(raw.get("to") or "")) == home_npub
+    )
+
+
+def _save_welcome_sent(data_dir: Path, bot_npub: str, home_npub: str) -> None:
+    path = Path(data_dir) / WELCOME_SENT_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"bot": bot_npub, "to": home_npub}) + "\n",
+            encoding="utf-8",
+        )
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+    except OSError as e:
+        logger.debug("Vector: could not persist welcome marker: %s", e)
+
+
 def _truncate_npub(npub: str) -> str:
     npub = (npub or "").strip()
     if len(npub) > 16:
@@ -1382,6 +1425,7 @@ class VectorAdapter(BasePlatformAdapter):
             self._running = True
             self._sse_task = asyncio.create_task(self._sse_listener())
             self._health_task = asyncio.create_task(self._health_monitor())
+            await self._maybe_send_operator_welcome()
             if _create_community_enabled():
                 await self._ensure_home_community()
             await self._sync_joined_channels()
@@ -2264,6 +2308,36 @@ class VectorAdapter(BasePlatformAdapter):
     def _mark_channels_notified(self, channel_ids) -> None:
         self._notified_channel_ids.update(channel_ids)
         _save_notified_channel_ids(self.data_dir, self._notified_channel_ids)
+
+    async def _maybe_send_operator_welcome(self) -> None:
+        """Once per bot+operator pair, DM VECTOR_HOME_CHANNEL a hello.
+
+        That npub is the account entered during ``hermes gateway setup``. The
+        Vector app will not show the bot until someone sends a gift-wrapped
+        DM; this outbound hello opens the thread so first-run is not silent.
+        Restarts skip it. A failed send leaves the marker unset so the next
+        connect retries. Does not start a Hermes turn.
+        """
+        home = _home_operator_npub()
+        bot = normalize_npub(self._npub or "") or (self._npub or "").strip()
+        if not home or not bot or home == bot:
+            return
+        if _welcome_already_sent(self.data_dir, bot, home):
+            return
+        if not (self._running and self._http_client):
+            return
+        result = await self.send(home, _format_operator_welcome(bot))
+        if not result.success:
+            logger.warning(
+                "Vector: first-run hello to VECTOR_HOME_CHANNEL failed: %s",
+                result.error,
+            )
+            return
+        _save_welcome_sent(self.data_dir, bot, home)
+        logger.info(
+            "Vector: sent first-run hello to %s",
+            _truncate_npub(home),
+        )
 
     async def _notify_joined_channels(
         self,
@@ -5066,6 +5140,10 @@ def _run_interactive_setup(io) -> None:
     else:
         io.print_success(f"Existing account found! Bot npub: {bot_npub}")
     io.print_info("Share this npub with contacts.")
+    io.print_info(
+        "After gateway start the bot DMs your Vector account a hello "
+        "(VECTOR_HOME_CHANNEL). Reply there to talk."
+    )
     io.print_info(
         "Communities: invite the bot from a trusted npub; it auto-joins and "
         "listens. @mention or reply to take a turn. Group-only npubs and "

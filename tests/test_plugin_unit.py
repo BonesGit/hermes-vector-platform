@@ -1568,6 +1568,108 @@ class TestJoinedChannelNotice:
         assert called == [1]
 
 
+class TestOperatorWelcome:
+    def test_format_includes_bot_npub(self):
+        body = vector_adapter._format_operator_welcome(NPUB)
+        assert "Hermes is online on Vector." in body
+        assert NPUB in body
+        assert "Reply here" in body
+
+    def test_sends_once_to_home(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", PEER_NPUB)
+        adapter._running = True
+        adapter._http_client = MagicMock()
+        sent = []
+
+        async def fake_send(chat_id, content, reply_to=None, metadata=None):
+            sent.append((chat_id, content))
+            return vector_adapter.SendResult(success=True, message_id="w1")
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        asyncio.run(adapter._maybe_send_operator_welcome())
+        asyncio.run(adapter._maybe_send_operator_welcome())
+        assert len(sent) == 1
+        assert sent[0][0] == PEER_NPUB
+        assert NPUB in sent[0][1]
+        marker = Path(adapter.data_dir) / vector_adapter.WELCOME_SENT_FILE
+        saved = json.loads(marker.read_text(encoding="utf-8"))
+        assert saved["bot"] == NPUB
+        assert saved["to"] == PEER_NPUB
+        if os.name == "posix":
+            assert oct(marker.stat().st_mode)[-3:] == "600"
+
+    def test_skips_without_home(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        monkeypatch.delenv("VECTOR_HOME_CHANNEL", raising=False)
+        adapter._running = True
+        adapter._http_client = MagicMock()
+        sent = []
+
+        async def fake_send(*_a, **_k):
+            sent.append(1)
+            return vector_adapter.SendResult(success=True)
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        asyncio.run(adapter._maybe_send_operator_welcome())
+        assert sent == []
+        assert not (Path(adapter.data_dir) / vector_adapter.WELCOME_SENT_FILE).exists()
+
+    def test_skips_self_dm(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", NPUB)
+        adapter._running = True
+        adapter._http_client = MagicMock()
+        sent = []
+
+        async def fake_send(*_a, **_k):
+            sent.append(1)
+            return vector_adapter.SendResult(success=True)
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        asyncio.run(adapter._maybe_send_operator_welcome())
+        assert sent == []
+
+    def test_failed_send_retries(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", PEER_NPUB)
+        adapter._running = True
+        adapter._http_client = MagicMock()
+        calls = []
+
+        async def fail_then_ok(chat_id, content, **_k):
+            calls.append(chat_id)
+            if len(calls) == 1:
+                return vector_adapter.SendResult(success=False, error="relay")
+            return vector_adapter.SendResult(success=True, message_id="w2")
+
+        monkeypatch.setattr(adapter, "send", fail_then_ok)
+        asyncio.run(adapter._maybe_send_operator_welcome())
+        assert not (Path(adapter.data_dir) / vector_adapter.WELCOME_SENT_FILE).exists()
+        asyncio.run(adapter._maybe_send_operator_welcome())
+        assert len(calls) == 2
+        saved = json.loads(
+            (Path(adapter.data_dir) / vector_adapter.WELCOME_SENT_FILE).read_text()
+        )
+        assert saved["to"] == PEER_NPUB
+
+    def test_new_bot_npub_sends_again(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", PEER_NPUB)
+        adapter._running = True
+        adapter._http_client = MagicMock()
+        vector_adapter._save_welcome_sent(adapter.data_dir, "npub1otherbotxxxxxxxxxxxx", PEER_NPUB)
+        sent = []
+
+        async def fake_send(chat_id, content, **_k):
+            sent.append(chat_id)
+            return vector_adapter.SendResult(success=True, message_id="w3")
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        asyncio.run(adapter._maybe_send_operator_welcome())
+        assert sent == [PEER_NPUB]
+
+
 class TestInboundMapping:
     def test_chat_id_user_id_are_peer_npub(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path, npub=NPUB)
@@ -4094,6 +4196,7 @@ class TestInteractiveSetup:
         assert "unauthorized_dm_behavior" not in cfg.get("vector", {})
         assert "communities" not in cfg.get("vector", {})
         assert any("Share this npub" in m for m in io.logs["info"])
+        assert any("DMs your Vector account a hello" in m for m in io.logs["info"])
         assert any("identity.mnemonic" in m for m in io.logs["info"])
 
     def test_setup_copies_avatar_into_data_dir(self, monkeypatch, tmp_path):

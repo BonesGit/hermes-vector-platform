@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pipe-to-shell install hint, scored as critical/high. Those strings are
   gone so a community install is no longer an unoverridable block.
 
+### Added
+
+- **First-run hello DM** to `VECTOR_HOME_CHANNEL` (the npub entered during
+  setup) once the sidecar is Ready. Opens the chat in the Vector app so
+  first start is not silent. Marker `sdk/welcome-sent.json`; a failed send
+  retries on the next connect. Does not start a Hermes turn.
+
 ### Changed
 
 - **Install no longer prompts for `VECTOR_NPUB`.** That value is an output of

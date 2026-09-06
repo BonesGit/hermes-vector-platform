@@ -60,7 +60,7 @@ That is the whole first-run path. Setup will:
 5. Save only `VECTOR_NPUB`, `VECTOR_HOME_CHANNEL`, and `VECTOR_ALLOWED_USERS` to `.env`. Profile, communities, and pairing go in `config.yaml` `vector:`.
 6. Merge `display.platforms.vector` (and the `vector:` block) into `~/.hermes/config.yaml`.
 
-Then share the **bot** npub (`VECTOR_NPUB`) with contacts and DM it from the Vector app. That npub is Hermes, not you.
+Then open the Vector app. On first gateway start the bot DMs **your** npub (`VECTOR_HOME_CHANNEL`) a hello so the chat appears. Reply there. Share the **bot** npub (`VECTOR_NPUB`) with anyone else who should reach it.
 
 ### Identity files
 

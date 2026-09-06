@@ -4778,7 +4778,7 @@ def _confirm_import_as_bot(io) -> bool:
         "This identity will be tagged as a bot and will receive agent replies. "
         "Do not import your personal daily-driver nsec unless you intend that."
     )
-    return io.prompt_yes_no("Import this identity as the Hermes bot?", False)
+    return io.prompt_yes_no("Continue to import the identity as the Hermes bot?", False)
 
 
 def _run_interactive_setup(io) -> None:

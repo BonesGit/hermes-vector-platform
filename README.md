@@ -5,7 +5,7 @@
 
 Standalone **Vector** ([vectorapp.io](https://vectorapp.io)) messaging gateway for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-This is a **user-installed platform plugin** — not bundled with Hermes. After enable + setup, Hermes is a first-class Vector bot (its own nsec/npub), talking through a local Rust sidecar that wraps [`vector-sdk`](https://crates.io/crates/vector_sdk). It does not log in as your personal Vector account.
+This is a **user-installed platform plugin**. After enable + setup, Hermes is a first-class Vector bot (its own nsec/npub), talking through a local Rust sidecar that wraps [`vector-sdk`](https://crates.io/crates/vector_sdk). It does not log in as your personal Vector account.
 
 | | |
 |---|---|
@@ -15,30 +15,26 @@ This is a **user-installed platform plugin** — not bundled with Hermes. After 
 
 Hermes plugin docs: [user guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins) · [platform adapters](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-platform-adapters)
 
+<img src="https://raw.githubusercontent.com/VectorPrivacy/Vector/0ca50a9e7aa4aa3879199994a63acd1c574b7708/assets/github_header_readme.png">
+
 ## Install
 
 You need [Hermes Agent](https://hermes-agent.nousresearch.com/) and the [Vector](https://vectorapp.io) app (have **your** npub ready — hex, `npub1…`, or `nostr:npub1…`). Setup creates the bot identity. Linux and macOS (x86_64 / aarch64) get a prebuilt `vector-bridge`; otherwise you need Rust **≥ 1.75** so setup can compile it.
 
 Third-party platform plugins stay **off until you enable them**. Bundled channels (Telegram, Discord, …) auto-load; this one does not.
 
-### Desktop
+### Plugin Catalog
 
-<a href="hermes://plugin/install?repo=BonesGit/hermes-vector-platform&enable=1">Install in Hermes</a>
+<a href="https://hermes-agent.nousresearch.com/docs/plugins/vector-platform">Hermes Agent Plugin Catalog</a>
 
-Or copy this into a browser with Hermes Desktop installed:
-
+```bash
+hermes plugin install vector-platform
 ```
-hermes://plugin/install?repo=BonesGit/hermes-vector-platform&enable=1
-```
-The link opens a confirmation dialog (repo id, install-time security scan, component checkboxes). Nothing installs until you confirm. 
-Same dialog: **Settings → Plugins → Install from Git**. Then run setup below.
 
-### CLI
+### CLI from repo
 
 ```bash
 hermes plugins install BonesGit/hermes-vector-platform --enable
-hermes gateway setup      # pick Vector
-hermes gateway restart
 ```
 
 `--enable` adds `vector-platform` to `plugins.enabled` in `~/.hermes/config.yaml` with no prompt. Without it, install asks `Enable 'vector-platform' now? [y/N]` (default no). Confirm with `hermes plugins list`.
@@ -146,9 +142,9 @@ vector:
     max_messages: 5                  # items replayed per reconnect, newest first; 0 = never replay
     max_age_secs: 600                # skip messages older than this; 0 = no age limit
   prebuilt:                          # GitHub Release sidecar; omit = download the matching tag
-    download: true                   # false = cargo only (Linux / macOS still download by default)
+    download: true                   # false = cargo only (Linux / macOS download by default)
     # repo: BonesGit/hermes-vector-platform
-    # tag: v0.4.0                    # omit = v{plugin version}
+    # tag: v0.5.2                    # omit = v{plugin version}
   communities:
     create: false                    # true = bot-owned private home room after Ready
     name: Hermes                     # only used when create is true

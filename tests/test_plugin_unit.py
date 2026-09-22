@@ -9,7 +9,10 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import sys
+import types
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -28,17 +31,86 @@ if str(HERMES_ROOT) not in sys.path:
 
 
 def _load_adapter():
-    """Load adapter.py as a free module (avoids package relative-import issues)."""
+    """Load adapter.py as a package submodule, the way Hermes loads the plugin.
+
+    Hermes sets ``__path__`` to the plugin root and imports ``register`` from
+    that package. Relative imports (``from .internal...``) need the same shape.
+    A free-module load leaves ``__package__`` empty and those imports fail.
+    """
+    parent_name = "vector_platform_under_test"
+    parent = types.ModuleType(parent_name)
+    parent.__path__ = [str(PLUGIN_ROOT)]  # type: ignore[attr-defined]
+    parent.__package__ = parent_name
+    sys.modules[parent_name] = parent
+
+    module_name = f"{parent_name}.adapter"
     path = PLUGIN_ROOT / "adapter.py"
-    spec = importlib.util.spec_from_file_location("vector_platform_adapter", path)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules["vector_platform_adapter"] = mod
+    mod.__package__ = parent_name
+    sys.modules[module_name] = mod
     spec.loader.exec_module(mod)
+    parent.adapter = mod  # type: ignore[attr-defined]
     return mod
 
 
+def _build_wheel(outdir: Path) -> str:
+    """Build an sdist-free wheel with setuptools.
+
+    The plugin venv used for pytest does not always have setuptools. CI's
+    setup-python interpreter does; otherwise fall back to another interpreter
+    that can import it. The wheel is pure Python, so the builder's version
+    only has to be able to run setuptools.
+    """
+    code = (
+        "import sys\n"
+        "from setuptools.build_meta import build_wheel\n"
+        "print(build_wheel(sys.argv[1]))\n"
+    )
+    interpreters = [sys.executable]
+    for candidate in ("/usr/bin/python3", "/usr/bin/python"):
+        if candidate not in interpreters and Path(candidate).is_file():
+            interpreters.append(candidate)
+    errors: list[str] = []
+    for exe in interpreters:
+        proc = subprocess.run(
+            [exe, "-c", code, str(outdir)],
+            cwd=PLUGIN_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip().splitlines()[-1]
+        errors.append(f"{exe}: {proc.stderr.strip()}")
+    raise AssertionError("could not build wheel\n" + "\n".join(errors))
+
+
 vector_adapter = _load_adapter()
+
+
+def _internal(name: str):
+    """The internal module whose globals a moved helper actually reads."""
+    return sys.modules[f"{vector_adapter.__package__}.internal.{name}"]
+
+
+def _patch_hermes_home(monkeypatch, home):
+    """Point every get_hermes_home binding tests rely on at ``home``."""
+    import hermes_constants
+
+    fake = lambda: home  # noqa: E731
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", fake)
+    monkeypatch.setattr(_internal("paths"), "get_hermes_home", fake)
+    monkeypatch.setattr(vector_adapter, "get_hermes_home", fake)
+
+
+def _patch_files_root(monkeypatch, root):
+    """Inbox paths are resolved in both the adapter and the groups helper."""
+    fake = lambda: root  # noqa: E731
+    monkeypatch.setattr(vector_adapter, "resolve_files_root", fake)
+    monkeypatch.setattr(_internal("paths"), "resolve_files_root", fake)
+    monkeypatch.setattr(_internal("groups"), "resolve_files_root", fake)
 
 # fiatjaf's well-known pubkey (32-byte payload, valid bech32 checksum)
 HEX_PUBKEY = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
@@ -86,8 +158,10 @@ class TestPackaging:
         text = (PLUGIN_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         assert 'vector-platform = "hermes_vector_platform:register"' in text
         assert 'py-modules = [' not in text
-        assert 'packages = ["hermes_vector_platform"]' in text
+        assert '"hermes_vector_platform"' in text
+        assert '"hermes_vector_platform.internal"' in text
         assert 'hermes_vector_platform = "."' in text
+        assert '"hermes_vector_platform.internal" = "internal"' in text
         assert '"plugin.yaml"' in text
         assert '"bridge/src/*.rs"' in text
         assert '"bridge/Cargo.toml"' in text
@@ -99,6 +173,21 @@ class TestPackaging:
         assert "include plugin.yaml" in text
         assert "include after-install.md" in text
         assert "prune bridge/target" in text
+        assert "recursive-include internal *.py" in text
+
+    def test_wheel_ships_internal_package_plugin_yaml_and_bridge(self, tmp_path):
+        """Non-editable installs must include internal modules, not only adapter.py."""
+        wheel_name = _build_wheel(tmp_path)
+        with zipfile.ZipFile(tmp_path / wheel_name) as zf:
+            names = zf.namelist()
+        assert any(name.endswith("plugin.yaml") for name in names)
+        assert any(
+            name.endswith("bridge/Cargo.toml") or name.endswith("bridge/src/main.rs")
+            for name in names
+        )
+        shipped = {Path(name).name for name in names if name.endswith(".py")}
+        for src in sorted((PLUGIN_ROOT / "internal").glob("*.py")):
+            assert src.name in shipped, src.name
 
 
 class TestNormalizeNpub:
@@ -483,7 +572,7 @@ class TestProfileDisplayName:
 
 class TestRuntimeRecord:
     def test_write_is_0600_payload_and_delete_unlinks(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         token = "tok" + "ab" * 30
         vector_adapter._write_runtime_record(8096, token, 1234, NPUB)
         path = tmp_path / "runtime" / "vector-sidecar.json"
@@ -497,7 +586,7 @@ class TestRuntimeRecord:
         vector_adapter._delete_runtime_record()  # missing_ok
 
     def test_replace_of_world_readable_file_is_still_0600(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         path = tmp_path / "runtime" / "vector-sidecar.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("stale", encoding="utf-8")
@@ -708,7 +797,7 @@ class TestResolveBridgeBin:
 
     def test_in_tree_beats_prebuilt(self, monkeypatch, tmp_path):
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
-        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        monkeypatch.setattr(_internal("bridge_bin"), "_read_vector_yaml_block", lambda: {})
         in_tree = tmp_path / "in-tree"
         in_tree.write_text("")
         prebuilt_dir = tmp_path / "bin"
@@ -717,15 +806,15 @@ class TestResolveBridgeBin:
         (prebuilt_dir / ".version").write_text(
             f"v{vector_adapter.PLUGIN_VERSION}\n"
         )
-        monkeypatch.setattr(vector_adapter, "_DEFAULT_BRIDGE_BIN", in_tree)
+        monkeypatch.setattr(_internal("bridge_bin"), "_DEFAULT_BRIDGE_BIN", in_tree)
         monkeypatch.setattr(
-            vector_adapter, "_prebuilt_bin_dir", lambda: prebuilt_dir
+            _internal("bridge_bin"), "_prebuilt_bin_dir", lambda: prebuilt_dir
         )
         assert vector_adapter.resolve_bridge_bin() == in_tree
 
     def test_versioned_prebuilt_when_in_tree_missing(self, monkeypatch, tmp_path):
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
-        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        monkeypatch.setattr(_internal("bridge_bin"), "_read_vector_yaml_block", lambda: {})
         missing = tmp_path / "missing-in-tree"
         prebuilt_dir = tmp_path / "bin"
         prebuilt_dir.mkdir()
@@ -734,24 +823,24 @@ class TestResolveBridgeBin:
         (prebuilt_dir / ".version").write_text(
             f"v{vector_adapter.PLUGIN_VERSION}\n"
         )
-        monkeypatch.setattr(vector_adapter, "_DEFAULT_BRIDGE_BIN", missing)
+        monkeypatch.setattr(_internal("bridge_bin"), "_DEFAULT_BRIDGE_BIN", missing)
         monkeypatch.setattr(
-            vector_adapter, "_prebuilt_bin_dir", lambda: prebuilt_dir
+            _internal("bridge_bin"), "_prebuilt_bin_dir", lambda: prebuilt_dir
         )
         assert vector_adapter.resolve_bridge_bin() == binary
 
     def test_stale_prebuilt_used_at_runtime(self, monkeypatch, tmp_path):
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
-        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        monkeypatch.setattr(_internal("bridge_bin"), "_read_vector_yaml_block", lambda: {})
         missing = tmp_path / "missing-in-tree"
         prebuilt_dir = tmp_path / "bin"
         prebuilt_dir.mkdir()
         binary = prebuilt_dir / "vector-bridge"
         binary.write_text("old")
         (prebuilt_dir / ".version").write_text("v0.0.1\n")
-        monkeypatch.setattr(vector_adapter, "_DEFAULT_BRIDGE_BIN", missing)
+        monkeypatch.setattr(_internal("bridge_bin"), "_DEFAULT_BRIDGE_BIN", missing)
         monkeypatch.setattr(
-            vector_adapter, "_prebuilt_bin_dir", lambda: prebuilt_dir
+            _internal("bridge_bin"), "_prebuilt_bin_dir", lambda: prebuilt_dir
         )
         assert vector_adapter.resolve_bridge_bin() == binary
         assert vector_adapter.resolve_bridge_bin(require_current=True) == missing
@@ -759,13 +848,13 @@ class TestResolveBridgeBin:
 
 class TestReleaseCoords:
     def test_default_repo_and_tag(self, monkeypatch):
-        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        monkeypatch.setattr(_internal("bridge_bin"), "_read_vector_yaml_block", lambda: {})
         assert vector_adapter._release_repo() == "BonesGit/hermes-vector-platform"
         assert vector_adapter._release_tag() == f"v{vector_adapter.PLUGIN_VERSION}"
 
     def test_yaml_repo_and_tag(self, monkeypatch):
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("bridge_bin"),
             "_read_vector_yaml_block",
             lambda: {"prebuilt": {"repo": "Acme/vector-fork", "tag": "v1.2.3"}},
         )
@@ -774,7 +863,7 @@ class TestReleaseCoords:
 
     def test_rejects_malformed_repo(self, monkeypatch):
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("bridge_bin"),
             "_read_vector_yaml_block",
             lambda: {"prebuilt": {"repo": "../evil/repo"}},
         )
@@ -782,7 +871,7 @@ class TestReleaseCoords:
 
     def test_tag_gains_v_prefix(self, monkeypatch):
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("bridge_bin"),
             "_read_vector_yaml_block",
             lambda: {"prebuilt": {"tag": "0.4.0"}},
         )
@@ -1212,7 +1301,7 @@ def _patch_platform(monkeypatch) -> MagicMock:
 
 def _make_adapter(monkeypatch, tmp_path, **extra):
     _patch_platform(monkeypatch)
-    monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+    _patch_hermes_home(monkeypatch, tmp_path)
     monkeypatch.setattr(
         vector_adapter.BasePlatformAdapter,
         "_acquire_platform_lock",
@@ -1234,6 +1323,8 @@ def _make_adapter(monkeypatch, tmp_path, **extra):
     if not fake_bin.exists():
         fake_bin.write_text("")
     monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda: fake_bin)
+    monkeypatch.setattr(_internal("sidecar"), "resolve_bridge_bin", lambda: fake_bin)
+    monkeypatch.setattr(_internal("sidecar"), "BRIDGE_TERM_WAIT", 0)
     monkeypatch.setattr(
         vector_adapter, "bridge_port_is_listening", lambda *_a, **_k: False
     )
@@ -3085,7 +3176,7 @@ class TestInboundDedup:
 
     def test_lru_evicts_oldest(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)
-        monkeypatch.setattr(vector_adapter, "INBOUND_DEDUP_MAX", 2)
+        monkeypatch.setattr(_internal("inbound"), "INBOUND_DEDUP_MAX", 2)
         captured = []
 
         async def capture(event):
@@ -3126,7 +3217,7 @@ class TestSpawnEnv:
             captured["kwargs"] = kwargs
             return FakeBridgeProc()
 
-        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", fake_popen)
         proc = adapter._spawn_bridge()
         assert proc.pid == -1
         kwargs = captured["kwargs"]
@@ -3158,7 +3249,7 @@ class TestSpawnEnv:
             captured["kwargs"] = kwargs
             return FakeBridgeProc()
 
-        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", fake_popen)
         adapter._spawn_bridge()
         assert captured["kwargs"]["env"]["VECTOR_BOT_NAME"] == "Ada"
         adapter._close_bridge_log()
@@ -3172,7 +3263,7 @@ class TestSpawnEnv:
             captured["kwargs"] = kwargs
             return FakeBridgeProc()
 
-        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", fake_popen)
         adapter._spawn_bridge()
         assert captured["kwargs"]["env"]["VECTOR_BOT_ABOUT"] == "kind-0 bio"
         adapter._close_bridge_log()
@@ -3188,7 +3279,7 @@ class TestSpawnEnv:
             captured["kwargs"] = kwargs
             return FakeBridgeProc()
 
-        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", fake_popen)
         adapter._spawn_bridge()
         assert captured["kwargs"]["env"]["VECTOR_BOT_AVATAR"] == str(pic.resolve())
         adapter._close_bridge_log()
@@ -3204,7 +3295,7 @@ class TestSpawnEnv:
             captured["kwargs"] = kwargs
             return FakeBridgeProc()
 
-        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", fake_popen)
         adapter._spawn_bridge()
         assert captured["kwargs"]["env"]["VECTOR_BOT_BANNER"] == str(pic.resolve())
         adapter._close_bridge_log()
@@ -3257,7 +3348,7 @@ class TestConnectMissingBinary:
         def boom(*_a, **_k):
             raise PermissionError("not executable")
 
-        monkeypatch.setattr(vector_adapter.subprocess, "Popen", boom)
+        monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", boom)
         ok = asyncio.run(adapter.connect())
         assert ok is False
         assert adapter.has_fatal_error
@@ -3316,7 +3407,7 @@ class TestMultiplexSecretScope:
                 captured["kwargs"] = kwargs
                 return FakeBridgeProc()
 
-            monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+            monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", fake_popen)
             adapter._spawn_bridge()
             env = captured["kwargs"]["env"]
             assert env["VECTOR_NPUB"] == NPUB
@@ -3710,7 +3801,7 @@ class TestMockedSidecarHttp:
             )
             monkeypatch.setenv("VECTOR_NSEC", nsec_value)
             monkeypatch.setattr(
-                vector_adapter.secrets, "token_hex", lambda n: token
+                _internal("sidecar").secrets, "token_hex", lambda n: token
             )
             caplog.set_level(
                 logging.INFO, logger="hermes_plugins.vector_platform.adapter"
@@ -3776,7 +3867,7 @@ class TestMockedSidecarHttp:
                 monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
             )
             monkeypatch.setattr(
-                vector_adapter.secrets, "token_hex", lambda n: token
+                _internal("sidecar").secrets, "token_hex", lambda n: token
             )
             captured = []
 
@@ -3832,7 +3923,7 @@ class TestMockedSidecarHttp:
             adapter = _make_adapter(
                 monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
             )
-            monkeypatch.setattr(vector_adapter.secrets, "token_hex", lambda n: token)
+            monkeypatch.setattr(_internal("sidecar").secrets, "token_hex", lambda n: token)
             captured = []
 
             async def capture(event):
@@ -3878,7 +3969,7 @@ class TestMockedSidecarHttp:
             adapter = _make_adapter(
                 monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
             )
-            monkeypatch.setattr(vector_adapter.secrets, "token_hex", lambda n: token)
+            monkeypatch.setattr(_internal("sidecar").secrets, "token_hex", lambda n: token)
             adapter._sse_last_event_id = "sse-42"
 
             async def idle_health(self):
@@ -3919,7 +4010,7 @@ class TestMockedSidecarHttp:
             adapter = _make_adapter(
                 monkeypatch, tmp_path, bridge_port=port, startup_timeout=5
             )
-            monkeypatch.setattr(vector_adapter.secrets, "token_hex", lambda n: token)
+            monkeypatch.setattr(_internal("sidecar").secrets, "token_hex", lambda n: token)
 
             async def idle_health(self):
                 try:
@@ -3959,7 +4050,7 @@ class TestMockedSidecarHttp:
             captured["env"] = kwargs["env"]
             return FakeBridgeProc()
 
-        monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", fake_popen)
         monkeypatch.setenv("VECTOR_STUB", "1")
         adapter._spawn_bridge()
         assert "VECTOR_STUB" not in captured["env"]
@@ -3999,13 +4090,13 @@ class TestOrphanReap:
     def test_reap_skips_foreign_listener(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)
         monkeypatch.setattr(
-            vector_adapter, "_find_listener_pids", lambda _port: [9999]
+            _internal("sidecar"), "_find_listener_pids", lambda _port: [9999]
         )
         monkeypatch.setattr(
-            vector_adapter, "_pid_is_vector_bridge", lambda _pid: False
+            _internal("sidecar"), "_pid_is_vector_bridge", lambda _pid: False
         )
         killed = []
-        monkeypatch.setattr(vector_adapter.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+        monkeypatch.setattr(_internal("sidecar").os, "kill", lambda pid, sig: killed.append((pid, sig)))
         asyncio.run(adapter._reap_orphan_sidecar())
         assert killed == []
 
@@ -4015,15 +4106,15 @@ class TestOrphanReap:
         rec.parent.mkdir(parents=True, exist_ok=True)
         rec.write_text("{}", encoding="utf-8")
         monkeypatch.setattr(
-            vector_adapter, "_find_listener_pids", lambda _port: [4242]
+            _internal("sidecar"), "_find_listener_pids", lambda _port: [4242]
         )
         monkeypatch.setattr(
-            vector_adapter, "_pid_is_vector_bridge", lambda _pid: True
+            _internal("sidecar"), "_pid_is_vector_bridge", lambda _pid: True
         )
-        monkeypatch.setattr(vector_adapter, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(_internal("sidecar"), "_pid_alive", lambda _pid: False)
         killed = []
         monkeypatch.setattr(
-            vector_adapter.os, "kill", lambda pid, sig: killed.append((pid, sig))
+            _internal("sidecar").os, "kill", lambda pid, sig: killed.append((pid, sig))
         )
         asyncio.run(adapter._reap_orphan_sidecar())
         assert killed == [(4242, signal.SIGTERM)]
@@ -4048,7 +4139,7 @@ class TestOrphanReap:
         monkeypatch.setattr(
             vector_adapter.VectorAdapter, "_reap_orphan_sidecar", fake_reap
         )
-        monkeypatch.setattr(vector_adapter.subprocess, "Popen", boom)
+        monkeypatch.setattr(_internal("sidecar").subprocess, "Popen", boom)
         ok = asyncio.run(adapter.connect())
         assert reaped == [True]
         assert ok is False
@@ -4547,7 +4638,7 @@ class TestStandaloneSend:
         sidecar = MockSidecar(token=token)
         port = sidecar.start()
         try:
-            monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+            _patch_hermes_home(monkeypatch, tmp_path)
             rec_path = tmp_path / "runtime" / "vector-sidecar.json"
             rec_path.parent.mkdir(parents=True, exist_ok=True)
             rec_path.write_text(
@@ -4591,7 +4682,7 @@ class TestStandaloneSend:
         sidecar = MockSidecar(token=token)
         port = sidecar.start()
         try:
-            monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+            _patch_hermes_home(monkeypatch, tmp_path)
             self._write_live_record(tmp_path, port, token)
             pconfig = MagicMock()
             pconfig.extra = {}
@@ -4611,7 +4702,7 @@ class TestStandaloneSend:
         sidecar = MockSidecar(token=token)
         port = sidecar.start()
         try:
-            monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+            _patch_hermes_home(monkeypatch, tmp_path)
             self._write_live_record(tmp_path, port, token)
             pconfig = MagicMock()
             pconfig.extra = {}
@@ -4628,7 +4719,7 @@ class TestStandaloneSend:
             sidecar.stop()
 
     def test_missing_record_errors(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         pconfig = MagicMock()
         pconfig.extra = {}
         result = asyncio.run(
@@ -4638,7 +4729,7 @@ class TestStandaloneSend:
         assert "running sidecar" in result["error"]
 
     def test_stale_pid_errors(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         monkeypatch.setattr(vector_adapter, "_sidecar_pid_alive", lambda _pid: False)
         rec_path = tmp_path / "runtime" / "vector-sidecar.json"
         rec_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4741,7 +4832,7 @@ class TestWizardHelpers:
     def test_ensure_bridge_binary_skips_cargo_when_present(self, monkeypatch, tmp_path):
         fake = tmp_path / "vector-bridge"
         fake.write_text("")
-        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda **_k: fake)
+        monkeypatch.setattr(_internal("setup"), "resolve_bridge_bin", lambda **_k: fake)
         cargo_calls = []
         monkeypatch.setattr(
             vector_adapter.subprocess,
@@ -4754,10 +4845,10 @@ class TestWizardHelpers:
 
     def test_ensure_bridge_binary_hints_when_cargo_missing(self, monkeypatch, tmp_path):
         missing = tmp_path / "no-bridge"
-        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda **_k: missing)
+        monkeypatch.setattr(_internal("setup"), "resolve_bridge_bin", lambda **_k: missing)
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
         monkeypatch.setattr(
-            vector_adapter, "_try_install_prebuilt_bridge", lambda _io: None
+            _internal("setup"), "_try_install_prebuilt_bridge", lambda _io: None
         )
         monkeypatch.setattr(vector_adapter.shutil, "which", lambda _name: None)
         errors = []
@@ -4774,10 +4865,10 @@ class TestWizardHelpers:
         missing = tmp_path / "no-bridge"
         downloaded = tmp_path / "downloaded"
         downloaded.write_text("ok")
-        monkeypatch.setattr(vector_adapter, "resolve_bridge_bin", lambda **_k: missing)
+        monkeypatch.setattr(_internal("setup"), "resolve_bridge_bin", lambda **_k: missing)
         monkeypatch.delenv("VECTOR_BRIDGE_BIN", raising=False)
         monkeypatch.setattr(
-            vector_adapter, "_try_install_prebuilt_bridge", lambda _io: downloaded
+            _internal("setup"), "_try_install_prebuilt_bridge", lambda _io: downloaded
         )
         cargo_calls = []
         monkeypatch.setattr(
@@ -4795,7 +4886,7 @@ class TestWizardHelpers:
 
     def test_try_install_skips_when_yaml_download_false(self, monkeypatch):
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("bridge_bin"),
             "_read_vector_yaml_block",
             lambda: {"prebuilt": {"download": False}},
         )
@@ -4811,14 +4902,14 @@ class TestWizardHelpers:
         digest = hashlib.sha256(payload).hexdigest()
         asset = "vector-bridge-x86_64-unknown-linux-gnu"
         dest_dir = tmp_path / "bin"
-        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        monkeypatch.setattr(_internal("bridge_bin"), "_read_vector_yaml_block", lambda: {})
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("bridge_bin"),
             "bridge_release_target",
             lambda: "x86_64-unknown-linux-gnu",
         )
-        monkeypatch.setattr(vector_adapter, "_prebuilt_bin_dir", lambda: dest_dir)
-        monkeypatch.setattr(vector_adapter, "_release_tag", lambda: "v0.4.0")
+        monkeypatch.setattr(_internal("bridge_bin"), "_prebuilt_bin_dir", lambda: dest_dir)
+        monkeypatch.setattr(_internal("bridge_bin"), "_release_tag", lambda: "v0.4.0")
         monkeypatch.setattr(vector_adapter.sys, "platform", "linux")
 
         def fake_get(url, *, max_bytes=None):
@@ -4828,7 +4919,7 @@ class TestWizardHelpers:
                 return payload
             raise AssertionError(url)
 
-        monkeypatch.setattr(vector_adapter, "_http_get_bytes", fake_get)
+        monkeypatch.setattr(_internal("bridge_bin"), "_http_get_bytes", fake_get)
         io = SimpleNamespace(
             print_info=lambda *_a, **_k: None,
             print_error=lambda *_a, **_k: None,
@@ -4843,21 +4934,21 @@ class TestWizardHelpers:
     def test_try_install_rejects_bad_checksum(self, monkeypatch, tmp_path):
         payload = b"sidecar-bytes"
         dest_dir = tmp_path / "bin"
-        monkeypatch.setattr(vector_adapter, "_read_vector_yaml_block", lambda: {})
+        monkeypatch.setattr(_internal("bridge_bin"), "_read_vector_yaml_block", lambda: {})
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("bridge_bin"),
             "bridge_release_target",
             lambda: "x86_64-unknown-linux-gnu",
         )
-        monkeypatch.setattr(vector_adapter, "_prebuilt_bin_dir", lambda: dest_dir)
-        monkeypatch.setattr(vector_adapter, "_release_tag", lambda: "v0.4.0")
+        monkeypatch.setattr(_internal("bridge_bin"), "_prebuilt_bin_dir", lambda: dest_dir)
+        monkeypatch.setattr(_internal("bridge_bin"), "_release_tag", lambda: "v0.4.0")
 
         def fake_get(url, *, max_bytes=None):
             if url.endswith("SHA256SUMS"):
                 return f"{'c' * 64}  vector-bridge-x86_64-unknown-linux-gnu\n".encode()
             return payload
 
-        monkeypatch.setattr(vector_adapter, "_http_get_bytes", fake_get)
+        monkeypatch.setattr(_internal("bridge_bin"), "_http_get_bytes", fake_get)
         errors = []
         io = SimpleNamespace(
             print_info=lambda *_a, **_k: None,
@@ -4915,11 +5006,11 @@ class TestInteractiveSetup:
         fake_bin = tmp_path / "vector-bridge"
         fake_bin.write_text("")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         monkeypatch.setattr(
-            vector_adapter, "resolve_data_dir", lambda: tmp_path / "sdk"
+            _internal("setup"), "resolve_data_dir", lambda: tmp_path / "sdk"
         )
         cli_calls = []
 
@@ -4939,7 +5030,7 @@ class TestInteractiveSetup:
                 return {"status": "created", "npub": NPUB}, 0, ""
             return None, 1, "unexpected"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Identity [create / nsec / mnemonic]": "create",
@@ -4982,11 +5073,11 @@ class TestInteractiveSetup:
         fake_bin = tmp_path / "vector-bridge"
         fake_bin.write_text("")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         monkeypatch.setattr(
-            vector_adapter, "resolve_data_dir", lambda: tmp_path / "sdk"
+            _internal("setup"), "resolve_data_dir", lambda: tmp_path / "sdk"
         )
         existing = {
             "vector": {
@@ -5009,7 +5100,7 @@ class TestInteractiveSetup:
                 return {"status": "created", "npub": NPUB}, 0, ""
             return None, 1, "unexpected"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Identity [create / nsec / mnemonic]": "create",
@@ -5026,11 +5117,11 @@ class TestInteractiveSetup:
         fake_bin = tmp_path / "vector-bridge"
         fake_bin.write_text("")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         data_dir = tmp_path / "sdk"
-        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        monkeypatch.setattr(_internal("setup"), "resolve_data_dir", lambda: data_dir)
         src = tmp_path / "me.jpg"
         src.write_bytes(b"jpeg")
 
@@ -5041,7 +5132,7 @@ class TestInteractiveSetup:
                 return {"status": "created", "npub": NPUB}, 0, ""
             return None, 1, "unexpected"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Identity [create / nsec / mnemonic]": "create",
@@ -5073,11 +5164,11 @@ class TestInteractiveSetup:
         fake_bin = tmp_path / "vector-bridge"
         fake_bin.write_text("")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         monkeypatch.setattr(
-            vector_adapter, "resolve_data_dir", lambda: tmp_path / "sdk"
+            _internal("setup"), "resolve_data_dir", lambda: tmp_path / "sdk"
         )
         seen_files = []
 
@@ -5095,7 +5186,7 @@ class TestInteractiveSetup:
                 return {"status": "restored", "npub": NPUB}, 0, ""
             return None, 1, "missing nsec-file"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Identity [create / nsec / mnemonic]": "nsec",
@@ -5125,11 +5216,11 @@ class TestInteractiveSetup:
         fake_bin = tmp_path / "vector-bridge"
         fake_bin.write_text("")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         monkeypatch.setattr(
-            vector_adapter, "resolve_data_dir", lambda: tmp_path / "sdk"
+            _internal("setup"), "resolve_data_dir", lambda: tmp_path / "sdk"
         )
         cli_calls = []
 
@@ -5142,7 +5233,7 @@ class TestInteractiveSetup:
                 return {"status": "existing", "npub": NPUB}, 0, ""
             return None, 1, "unexpected"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Identity [create / nsec / mnemonic]": "nsec",
@@ -5164,11 +5255,11 @@ class TestInteractiveSetup:
     def test_already_configured_can_skip(self, monkeypatch, tmp_path):
         called = []
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("setup"),
             "_ensure_bridge_binary",
             lambda _io: called.append("build") or tmp_path / "x",
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
+        _patch_hermes_home(monkeypatch, tmp_path)
         io = _fake_setup_io(
             env={"VECTOR_NPUB": NPUB},
             yes_no={"Reconfigure Vector?": False},
@@ -5187,12 +5278,12 @@ class TestInteractiveSetup:
         bak = data_dir / "identity.nsec.bak"
         bak.write_text("nsec1original\n")
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("setup"),
             "_ensure_bridge_binary",
             lambda _io: called.append("build") or tmp_path / "x",
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
-        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        _patch_hermes_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(_internal("setup"), "resolve_data_dir", lambda: data_dir)
         io = _fake_setup_io(
             env={"VECTOR_NPUB": NPUB},
             yes_no={"Reconfigure Vector?": False},
@@ -5207,10 +5298,10 @@ class TestInteractiveSetup:
         fake_bin = tmp_path / "vector-bridge"
         fake_bin.write_text("")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("setup"),
             "_run_bridge_cli",
             lambda *_a, **_k: ({"status": "not_registered"}, 0, ""),
         )
@@ -5229,10 +5320,10 @@ class TestInteractiveSetup:
         fake_bin = tmp_path / "vector-bridge"
         fake_bin.write_text("")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
         monkeypatch.setattr(
-            vector_adapter,
+            _internal("setup"),
             "_run_bridge_cli",
             lambda *_a, **_k: ({"status": "not_registered"}, 0, ""),
         )
@@ -5254,10 +5345,10 @@ class TestInteractiveSetup:
         nsec = data_dir / "identity.nsec"
         nsec.write_text("nsec1original\n")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
-        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        _patch_hermes_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(_internal("setup"), "resolve_data_dir", lambda: data_dir)
 
         def fake_cli(_bin, _data, args, timeout=60):
             if "--check" in args:
@@ -5266,7 +5357,7 @@ class TestInteractiveSetup:
                 return None, 1, "invalid nsec"
             return None, 1, "unexpected"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Identity [create / nsec / mnemonic]": "nsec",
@@ -5292,10 +5383,10 @@ class TestInteractiveSetup:
         data_dir.mkdir()
         (data_dir / "identity.nsec").write_text("not-an-nsec\n")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
-        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        _patch_hermes_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(_internal("setup"), "resolve_data_dir", lambda: data_dir)
         cli_calls = []
 
         def fake_cli(_bin, _data, args, timeout=60):
@@ -5310,7 +5401,7 @@ class TestInteractiveSetup:
                 return {"status": "created", "npub": NPUB}, 0, ""
             return None, 1, "unexpected"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Identity [create / nsec / mnemonic]": "create",
@@ -5336,9 +5427,9 @@ class TestInteractiveSetup:
         nsec = data_dir / "identity.nsec"
         nsec.write_text("nsec1original\n")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        monkeypatch.setattr(_internal("setup"), "resolve_data_dir", lambda: data_dir)
         cli_calls = []
 
         def fake_cli(_bin, _data, args, timeout=60):
@@ -5347,7 +5438,7 @@ class TestInteractiveSetup:
                 return None, 124, "timed out after 30s"
             return {"status": "created", "npub": NPUB}, 0, ""
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             yes_no={"Replace the unreadable identity.nsec?": True},
         )
@@ -5365,10 +5456,10 @@ class TestInteractiveSetup:
         nsec = data_dir / "identity.nsec"
         nsec.write_text("nsec1original\n")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
-        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        _patch_hermes_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(_internal("setup"), "resolve_data_dir", lambda: data_dir)
 
         def fake_cli(_bin, _data, args, timeout=60):
             if "--check" in args:
@@ -5377,7 +5468,7 @@ class TestInteractiveSetup:
                 raise KeyboardInterrupt()
             return None, 1, "unexpected"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Identity [create / nsec / mnemonic]": "create",
@@ -5407,10 +5498,10 @@ class TestInteractiveSetup:
         bak = data_dir / "identity.nsec.bak"
         bak.write_text("nsec1original\n")
         monkeypatch.setattr(
-            vector_adapter, "_ensure_bridge_binary", lambda _io: fake_bin
+            _internal("setup"), "_ensure_bridge_binary", lambda _io: fake_bin
         )
-        monkeypatch.setattr(vector_adapter, "get_hermes_home", lambda: tmp_path)
-        monkeypatch.setattr(vector_adapter, "resolve_data_dir", lambda: data_dir)
+        _patch_hermes_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(_internal("setup"), "resolve_data_dir", lambda: data_dir)
         seen_nsec = []
 
         def fake_cli(_bin, data, args, timeout=60):
@@ -5422,7 +5513,7 @@ class TestInteractiveSetup:
                 return {"status": "existing", "npub": NPUB}, 0, ""
             return None, 1, "unexpected"
 
-        monkeypatch.setattr(vector_adapter, "_run_bridge_cli", fake_cli)
+        monkeypatch.setattr(_internal("setup"), "_run_bridge_cli", fake_cli)
         io = _fake_setup_io(
             prompts={
                 "Bot display name": "Hermes",
@@ -5459,9 +5550,7 @@ class TestInboundFiles:
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(monkeypatch, tmp_path)
         handled = []
         acks = []
@@ -5519,9 +5608,7 @@ class TestInboundFiles:
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(monkeypatch, tmp_path)
         handled = []
 
@@ -5566,9 +5653,7 @@ class TestInboundFiles:
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(monkeypatch, tmp_path)
         handled = []
 
@@ -5671,9 +5756,7 @@ class TestInboundFiles:
 
     def test_file_plus_caption_goes_to_agent(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(monkeypatch, tmp_path)
         handled = []
 
@@ -5716,9 +5799,7 @@ class TestInboundFiles:
     ):
         monkeypatch.setenv("VECTOR_PAIRING", "off")
         monkeypatch.setenv("VECTOR_ALLOWED_USERS", NPUB)
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(monkeypatch, tmp_path)
         downloads = []
 
@@ -5784,9 +5865,7 @@ class TestGroupFiles:
         return _message_event(PEER_NPUB, "", msg_id=msg_id, **data)
 
     def test_file_only_not_downloaded_by_default(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(
             monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
         )
@@ -5803,9 +5882,7 @@ class TestGroupFiles:
         assert pending.is_file()
 
     def test_reply_mention_only_downloads_no_turn(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(
             monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
         )
@@ -5833,9 +5910,7 @@ class TestGroupFiles:
         assert len(inbox) == 1
 
     def test_reply_mention_plus_text_takes_turn(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(
             monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
         )
@@ -5863,9 +5938,7 @@ class TestGroupFiles:
         assert acks == []
 
     def test_reply_without_mention_not_downloaded(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(
             monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
         )
@@ -5890,9 +5963,7 @@ class TestGroupFiles:
         assert acks == []
 
     def test_unauthorized_reply_mention_not_downloaded(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(
             monkeypatch, tmp_path, npub=NPUB, allowed_users=NPUB
         )
@@ -5916,9 +5987,7 @@ class TestGroupFiles:
         assert downloads == []
 
     def test_same_event_file_plus_mention_still_works(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(
             monkeypatch, tmp_path, npub=NPUB, allowed_users=PEER_NPUB
         )
@@ -5944,9 +6013,7 @@ class TestGroupFiles:
         assert acks == []
 
     def test_download_all_saves_file_only_silently(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(
             monkeypatch,
             tmp_path,
@@ -5966,9 +6033,7 @@ class TestGroupFiles:
         assert len(inbox) == 1
 
     def test_download_all_then_reply_mention_text_uses_saved(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            vector_adapter, "resolve_files_root", lambda: tmp_path / "files"
-        )
+        _patch_files_root(monkeypatch, tmp_path / "files")
         adapter = _make_adapter(
             monkeypatch,
             tmp_path,

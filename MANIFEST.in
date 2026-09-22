@@ -5,6 +5,7 @@ include after-install.md
 include plugin.yaml
 include adapter.py
 include __init__.py
+recursive-include internal *.py
 include pyproject.toml
 graft bridge/src
 include bridge/Cargo.toml

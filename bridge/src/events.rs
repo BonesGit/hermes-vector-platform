@@ -27,7 +27,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use vector_sdk::nostr::PublicKey;
 use vector_sdk::{Attachment, BotEvent, IncomingMessage, Message, Reaction, VectorBot};
 
-use crate::api::{ready_item, ApiError, AppState, Auth, JsonBody};
+use crate::api::{is_channel_id, ready_item, ApiError, AppState, Auth, JsonBody};
 
 /// How many recent items stay available for `Last-Event-ID` replay. This is a
 /// retention bound, not a work bound — see `DEFAULT_REPLAY_MAX`.
@@ -712,6 +712,19 @@ pub async fn inject(
     _auth: Auth,
     JsonBody(data): JsonBody<MessageEventData>,
 ) -> Result<Json<Value>, ApiError> {
+    if is_channel_id(&data.chat_id) {
+        state.remember_stub_history(
+            &data.chat_id,
+            json!({
+                "id": data.id,
+                "at_ms": data.at_ms,
+                "mine": data.is_mine,
+                "npub": data.npub,
+                "text": data.text,
+                "is_file": data.is_file,
+            }),
+        );
+    }
     if data.is_mine {
         eprintln!("[vector-bridge] dropping inject id={}", data.id);
         return Ok(Json(json!({ "ok": true })));

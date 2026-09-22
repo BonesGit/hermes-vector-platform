@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profile still needs its own `VECTOR_BRIDGE_PORT` when more than one Vector
   adapter binds in the same process — the default remains 8096.
 
+### Added
+
+- **Optional group-channel history on mention turns.** Off by default.
+  `VECTOR_GROUP_CONTEXT=1` (or `vector.group_context.enabled: true`) fetches
+  the Concord channel page ending at the triggering message and puts it on
+  `MessageEvent.channel_context` — the trigger stays in `event.text`. Speakers
+  are local kind-0 names (no relay fetch); the bot's own lines are marked
+  `[bot]`; authors who could not have started a turn are `[unverified]`.
+  Window: last 20 messages / ~8000 chars / 2 hours (`VECTOR_GROUP_CONTEXT_MAX`,
+  `_MAX_CHARS`, `_MAX_AGE_SECS`). `0` on any of those disables that cap (the
+  sidecar still returns at most 50 messages). A line past the char budget is
+  clipped. Does not start extra turns and does not catch up missed group
+  messages.
+
 ## [0.5.2] — 2026-09-05
 
 Python-only patch. Sidecar binaries are the same as 0.5.1.

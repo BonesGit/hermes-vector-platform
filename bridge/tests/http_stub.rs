@@ -592,6 +592,14 @@ fn get_profile_requires_npub_and_ready() {
     assert_eq!(body["about"], "");
     assert_eq!(body["bot"], false);
 
+    let (status, body) = get(
+        &server,
+        &format!("/profile?npub={VALID_NPUB}&local=true"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["name"], "");
+
     let (status, body) = get(&server, "/profile?npub=npub1abc", None);
     assert_eq!(status, 401, "{body}");
     assert_eq!(body["code"], "unauthorized");
@@ -1060,6 +1068,150 @@ fn communities_stub_create_list_invite() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["ok"], true);
     assert_eq!(body["community_id"], community_id);
+}
+
+#[test]
+fn channel_history_rejects_npub_and_requires_token() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+
+    let (status, body) = get(
+        &server,
+        &format!("/channels/{VALID_NPUB}/history"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let channel = "b".repeat(64);
+    let (status, body) = get(&server, &format!("/channels/{channel}/history"), None);
+    assert_eq!(status, 401, "{body}");
+}
+
+#[test]
+fn channel_history_stub_returns_injected_and_clamps_limit() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let channel = "b".repeat(64);
+
+    let (status, body) = get(
+        &server,
+        &format!("/channels/{channel}/history"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["messages"], json!([]));
+
+    for (id, text, mine) in [
+        ("h1", "oldest", false),
+        ("h2", "middle", true),
+        ("h3", "newest", false),
+    ] {
+        let (status, body) = post(
+            &server,
+            "/__test/inject",
+            Some(&server.token),
+            json!({
+                "id": id,
+                "chat_id": channel,
+                "npub": VALID_NPUB,
+                "is_group": true,
+                "is_mine": mine,
+                "text": text,
+                "at_ms": 1000,
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+
+    let (status, body) = get(
+        &server,
+        &format!("/channels/{channel}/history?limit=2"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 200, "{body}");
+    let msgs = body["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "{body}");
+    assert_eq!(msgs[0]["id"], "h2");
+    assert_eq!(msgs[0]["mine"], true);
+    assert_eq!(msgs[0]["text"], "middle");
+    assert_eq!(msgs[1]["id"], "h3");
+    assert_eq!(msgs[1]["npub"], VALID_NPUB);
+    assert_eq!(msgs[1]["is_file"], false);
+
+    let (status, body) = get(
+        &server,
+        &format!("/channels/{channel}/history?limit=999"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3, "{body}");
+}
+
+#[test]
+fn channel_history_sorts_and_pages_before_cursor() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let channel = "b".repeat(64);
+    let oldest = "11".repeat(32);
+    let middle = "22".repeat(32);
+    let newest = "33".repeat(32);
+    for (id, text, at_ms) in [
+        (newest.as_str(), "newest", 3000),
+        (oldest.as_str(), "oldest", 1000),
+        (middle.as_str(), "middle", 2000),
+    ] {
+        let (status, body) = post(
+            &server,
+            "/__test/inject",
+            Some(&server.token),
+            json!({
+                "id": id,
+                "chat_id": channel,
+                "npub": VALID_NPUB,
+                "is_group": true,
+                "text": text,
+                "at_ms": at_ms,
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+
+    let (status, body) = get(
+        &server,
+        &format!("/channels/{channel}/history?limit=3"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 200, "{body}");
+    let msgs = body["messages"].as_array().expect("messages array");
+    assert_eq!(msgs[0]["text"], "oldest");
+    assert_eq!(msgs[1]["text"], "middle");
+    assert_eq!(msgs[2]["text"], "newest");
+
+    let (status, body) = get(
+        &server,
+        &format!("/channels/{channel}/history?limit=10&before_at_ms=3000&before_id={newest}"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 200, "{body}");
+    let msgs = body["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "{body}");
+    assert_eq!(msgs[0]["text"], "oldest");
+    assert_eq!(msgs[1]["text"], "middle");
+
+    let (status, body) = get(
+        &server,
+        &format!("/channels/{channel}/history?before_id=not-hex&before_at_ms=1"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = get(
+        &server,
+        &format!("/channels/{channel}/history?before_at_ms=1"),
+        Some(&server.token),
+    );
+    assert_eq!(status, 400, "{body}");
 }
 
 #[test]

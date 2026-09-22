@@ -153,6 +153,11 @@ vector:
     group_allowed_users: []          # npubs who may @mention without DM access
     open_channels: []                # 64-hex channel ids; any member may @mention / reply
     trusted_inviters: []             # empty = VECTOR_ALLOWED_USERS
+  group_context:                     # inject recent channel lines on a mention turn
+    enabled: false                   # true / VECTOR_GROUP_CONTEXT=1
+    max_messages: 20                 # 0 = no client cap (sidecar still clamps at 50)
+    max_chars: 8000                  # 0 = no char cap
+    max_age_secs: 7200               # 2 hours; 0 = no age limit
 ```
 
 Display / tool-progress stays under `display.platforms.vector` (next section).
@@ -191,8 +196,10 @@ Concord communities are E2E encrypted group spaces with channels. A **fresh comm
 
 1. In the Vector app, create a community and **direct-invite** the bot npub (`VECTOR_NPUB`).
 2. The sidecar auto-accepts only if the inviter is in `vector.communities.trusted_inviters` or `VECTOR_ALLOWED_USERS`. Anyone else stays parked (`invite_policy: manual` parks everyone).
-3. Hermes only runs a turn on **@mention** (`@npub1…`, `nostr:npub1…`, `@` plus the bot's published name), **reply to a bot message**, or a **registered slash command** (`/approve`, `/deny`, …). `@everyone` is ignored.
+3. Hermes only runs a turn on **@mention** (`@npub1…`, `nostr:npub1…`, `@` plus the bot's published name), **reply to a bot message**, or a **registered slash command** (`/approve`, `/deny`, …). `@everyone` is ignored. That turn sees only the triggering line unless you opt into group history (next paragraph).
 4. Who may trigger that turn: `VECTOR_ALLOWED_USERS` (DM list, also groups), `vector.communities.group_allowed_users` (group-only, no DMs), or any member if the channel is in `vector.communities.open_channels`. Hermes session key is `agent:main:vector:group:<channel-hex>`.
+
+**Group history (off by default):** set `vector.group_context.enabled: true` or `VECTOR_GROUP_CONTEXT=1`. On a turn that already passed the mention/reply/slash gate, the adapter fetches the channel page ending at that message (`GET /channels/{id}/history?before_at_ms&before_id`) and attaches it as `channel_context`. The trigger stays the user message. Labels come from the sidecar's local profile cache (`GET /profile?local=true`), not a relay fetch; a missing kind-0 stays a truncated npub. The bot's own lines are `[bot]`. Message text is flattened to one line, and a line that crosses the char budget is clipped. `0` on `max_messages` or `max_chars` means no client cap (the sidecar still returns at most 50 messages). An older sidecar without the history route logs one warning and the turn still runs. This does not start turns for missed chatter and does not change DM sessions.
 
 The Vector app does not display channel ids. When the bot joins (trusted invite, `vector.communities.create`, connect-time membership sync, or a home-DM `/join`) it logs the full 64-hex `channel_id` and DMs `VECTOR_HOME_CHANNEL` a copy-pasteable notice. Restart does not re-DM the same id (`sdk/notified-channels.json`). Parked (untrusted) invites stay **silent** — no home DM when they land. List, join, or decline them from the home DM with `/invites`, `/join <community_id>`, `/decline <community_id>` (not on the `/` picker).
 

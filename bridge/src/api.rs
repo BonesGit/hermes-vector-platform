@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Query, Request, State};
+use axum::extract::{
+    DefaultBodyLimit, FromRequest, FromRequestParts, Path as PathParam, Query, Request, State,
+};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -21,13 +23,14 @@ use tokio::sync::RwLock;
 use vector_sdk::nostr::{PublicKey, ToBech32};
 use vector_sdk::vector_core::db::community::delete_pending_invite;
 use vector_sdk::vector_core::deletion::delete_own_reaction;
-use vector_sdk::{Attachment, SlimProfile, VectorBot};
+use vector_sdk::{Attachment, Cursor, Message, SlimProfile, VectorBot};
 
 use crate::events::{self, EventHub, SseItem};
 
 pub const MAX_BODY: usize = 64 * 1024;
 pub const TOKEN_HEADER: &str = "x-hermes-sidecar-token";
 const STUB_NPUB: &str = "npub1stub";
+pub(crate) const HISTORY_LIMIT_MAX: usize = 50;
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
@@ -43,6 +46,9 @@ struct Inner {
     /// (emoji, reaction rumor id). Unreact uses this instead of hoping
     /// `Channel::history` has already echoed the chip.
     own_reactions: Mutex<HashMap<(String, String), Vec<(String, String)>>>,
+    /// Stub-only channel history, filled by `/__test/inject`. Live mode reads
+    /// `Channel::history` and never looks here.
+    stub_history: Mutex<HashMap<String, Vec<Value>>>,
 }
 
 struct Health {
@@ -65,7 +71,48 @@ impl AppState {
             send_seq: AtomicU64::new(1),
             bot: RwLock::new(None),
             own_reactions: Mutex::new(HashMap::new()),
+            stub_history: Mutex::new(HashMap::new()),
         }))
+    }
+
+    pub(crate) fn remember_stub_history(&self, channel_id: &str, item: Value) {
+        let mut map = self
+            .0
+            .stub_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = map.entry(channel_id.to_ascii_lowercase()).or_default();
+        slot.push(item);
+        slot.sort_by(|a, b| history_item_key(a).cmp(&history_item_key(b)));
+        let extra = slot.len().saturating_sub(HISTORY_LIMIT_MAX);
+        if extra > 0 {
+            slot.drain(0..extra);
+        }
+    }
+
+    fn stub_channel_history(
+        &self,
+        channel_id: &str,
+        limit: usize,
+        before: Option<(u64, &str)>,
+    ) -> Vec<Value> {
+        let mut slot = {
+            let map = self
+                .0
+                .stub_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.get(&channel_id.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_default()
+        };
+        if let Some((at, id)) = before {
+            let cursor = (at, id.to_ascii_lowercase());
+            slot.retain(|item| history_item_key(item) < cursor);
+        }
+        slot.sort_by(|a, b| history_item_key(a).cmp(&history_item_key(b)));
+        let start = slot.len().saturating_sub(limit);
+        slot[start..].to_vec()
     }
 
     fn remember_own_reaction(&self, npub: &str, message_id: &str, emoji: &str, reaction_id: &str) {
@@ -192,6 +239,7 @@ pub fn router(state: AppState) -> Router {
         .route("/invites", get(list_pending_invites))
         .route("/invites/accept", post(accept_pending_invite))
         .route("/invites/decline", post(decline_pending_invite))
+        .route("/channels/{channel_id}/history", get(channel_history))
         .route("/__test/ready", post(test_ready))
         .route("/__test/inject", post(events::inject))
         .layer(DefaultBodyLimit::max(MAX_BODY))
@@ -636,6 +684,9 @@ fn optional_abs_file(raw: Option<&str>, bad: &'static str) -> Result<Option<Path
 struct GetProfileQuery {
     #[serde(default)]
     npub: String,
+    /// When set, read the sidecar's local profile cache. Omit to fetch relays.
+    #[serde(default)]
+    local: bool,
 }
 
 fn profile_json(npub: &str, p: Option<SlimProfile>) -> Value {
@@ -677,7 +728,11 @@ async fn get_profile(
     let npub = parse_npub(raw)?;
     state.require_ready().await?;
     let p = if let Some(bot) = state.bot().await {
-        bot.fetch_profile(&npub).await
+        if q.local {
+            bot.cached_profile(&npub).await
+        } else {
+            bot.fetch_profile(&npub).await
+        }
     } else {
         None
     };
@@ -983,6 +1038,94 @@ async fn decline_pending_invite(
         })?;
     }
     Ok(Json(json!({ "ok": true, "community_id": community_id })))
+}
+
+#[derive(Deserialize)]
+struct ChannelHistoryQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    before_at_ms: Option<u64>,
+    #[serde(default)]
+    before_id: Option<String>,
+}
+
+fn history_item_key(item: &Value) -> (u64, String) {
+    let at = item.get("at_ms").and_then(Value::as_u64).unwrap_or(0);
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (at, id)
+}
+
+fn history_before_cursor(query: &ChannelHistoryQuery) -> Result<Option<Cursor>, ApiError> {
+    match (&query.before_id, query.before_at_ms) {
+        (None, None) => Ok(None),
+        (Some(id), Some(at)) => {
+            if !is_channel_id(id) {
+                return Err(ApiError::bad_request(
+                    "before_id must be 64 hex characters",
+                ));
+            }
+            Ok(Some(Cursor {
+                at_ms: at,
+                id: id.to_ascii_lowercase(),
+            }))
+        }
+        _ => Err(ApiError::bad_request(
+            "before_at_ms and before_id are required together",
+        )),
+    }
+}
+
+fn clamp_history_limit(limit: Option<u32>) -> usize {
+    match limit {
+        None | Some(0) => HISTORY_LIMIT_MAX,
+        Some(n) => (n as usize).clamp(1, HISTORY_LIMIT_MAX),
+    }
+}
+
+fn history_item_from_message(msg: &Message) -> Value {
+    json!({
+        "id": msg.id,
+        "at_ms": msg.at,
+        "mine": msg.mine,
+        "npub": msg.npub.clone().unwrap_or_default(),
+        "text": msg.content,
+        "is_file": !msg.attachments.is_empty(),
+    })
+}
+
+async fn channel_history(
+    State(state): State<AppState>,
+    _auth: Auth,
+    PathParam(channel_id): PathParam<String>,
+    Query(query): Query<ChannelHistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !is_channel_id(&channel_id) {
+        return Err(ApiError::bad_request(
+            "channel_id must be 64 hex characters",
+        ));
+    }
+    state.require_ready().await?;
+    let limit = clamp_history_limit(query.limit);
+    let before = history_before_cursor(&query)?;
+    let channel_id = channel_id.to_ascii_lowercase();
+    let messages = if let Some(bot) = state.bot().await {
+        let page = match &before {
+            Some(cursor) => bot.channel(&channel_id).history_before(cursor, limit).await,
+            None => bot.channel(&channel_id).history(limit).await,
+        };
+        page.iter()
+            .map(history_item_from_message)
+            .collect::<Vec<_>>()
+    } else {
+        let cursor = before.as_ref().map(|c| (c.at_ms, c.id.as_str()));
+        state.stub_channel_history(&channel_id, limit, cursor)
+    };
+    Ok(Json(json!({ "messages": messages })))
 }
 
 async fn test_ready(State(state): State<AppState>, _auth: Auth) -> Json<Value> {
@@ -1296,5 +1439,13 @@ mod tests {
         );
         let mixed = "A".repeat(64);
         assert_eq!(parse_community_id(&mixed).unwrap(), "a".repeat(64));
+    }
+
+    #[test]
+    fn clamp_history_limit_caps_at_fifty() {
+        assert_eq!(clamp_history_limit(None), HISTORY_LIMIT_MAX);
+        assert_eq!(clamp_history_limit(Some(0)), HISTORY_LIMIT_MAX);
+        assert_eq!(clamp_history_limit(Some(2)), 2);
+        assert_eq!(clamp_history_limit(Some(999)), HISTORY_LIMIT_MAX);
     }
 }

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multiplexed secondary profiles inherited the default bot.** Platform
+  reads (`VECTOR_NPUB`, `VECTOR_BRIDGE_PORT`, allowlists, data dir, and the
+  rest of `VECTOR_*`) used `os.getenv`, which under one-gateway-multi-profile
+  is the default profile's environment (Hermes #50051 / #50094). Those reads
+  now go through the active profile secret scope. The sidecar child, which
+  has no scope of its own, gets that profile's `VECTOR_*` copied in and the
+  default profile's values stripped. `VECTOR_NSEC` is still never passed to
+  the sidecar; identity stays `identity.nsec` in the profile data dir. Each
+  profile still needs its own `VECTOR_BRIDGE_PORT` when more than one Vector
+  adapter binds in the same process — the default remains 8096.
+
 ## [0.5.2] — 2026-09-05
 
 Python-only patch. Sidecar binaries are the same as 0.5.1.

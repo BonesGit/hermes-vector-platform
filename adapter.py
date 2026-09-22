@@ -16,8 +16,12 @@ Required env vars / config.extra keys:
 
 Profile, communities, reactions, pairing, and prebuilt sidecar fetch live in
 config.yaml ``vector:`` (see ``_apply_yaml_config``). Sidecar plumbing
-(port/host/bin/data dir) stays getenv overrides with defaults. Legacy
-VECTOR_* env for those keys still wins.
+(port/host/bin/data dir) stays env overrides with defaults. Legacy VECTOR_*
+env for those keys still wins. Every VECTOR_* read goes through the active
+profile secret scope (``get_scoped_secret``), so a multiplexed secondary
+profile does not inherit the default profile's ``os.environ``. The nsec
+stays in ``identity.nsec`` under that profile's data dir — it is never
+read from the environment at runtime.
 """
 
 from __future__ import annotations
@@ -57,6 +61,28 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger("hermes_plugins.vector_platform.adapter")
+
+
+def _scoped_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Profile env read. A multiplexed secondary never borrows ``os.environ``.
+
+    Same contract as ``gateway.platforms._shared.get_scoped_secret`` (the
+    gateway config path fixed in Hermes #50094). Single-profile installs and
+    the default multiplex profile keep reading ``os.environ``. If that helper
+    cannot be imported, fall back to ``os.environ`` so an older Hermes still
+    loads the plugin.
+    """
+    try:
+        from gateway.platforms._shared import get_scoped_secret
+    except Exception:
+        val = os.environ.get(name)
+        return default if val is None else val
+    return get_scoped_secret(name, default)
+
+
+def _scoped_env_str(name: str, default: str = "") -> str:
+    val = _scoped_env(name, default)
+    return default if val is None else str(val)
 
 # ---------------------------------------------------------------------------
 # Plugin identity / paths
@@ -132,7 +158,7 @@ def resolve_bridge_bin(*, require_current: bool = False) -> Path:
     disable Vector. Setup passes ``require_current=True`` and re-downloads
     when the stamp does not match ``v{plugin version}``.
     """
-    override = (os.getenv("VECTOR_BRIDGE_BIN") or "").strip()
+    override = _scoped_env_str("VECTOR_BRIDGE_BIN").strip()
     if override:
         return Path(override)
     if _DEFAULT_BRIDGE_BIN.is_file():
@@ -341,7 +367,7 @@ def _try_install_prebuilt_bridge(io) -> Optional[Path]:
 
 def resolve_data_dir() -> Path:
     """Default VECTOR_DATA_DIR: plugin-data/vector-platform/sdk."""
-    override = (os.getenv("VECTOR_DATA_DIR") or "").strip()
+    override = _scoped_env_str("VECTOR_DATA_DIR").strip()
     if override:
         return Path(override)
     try:
@@ -773,7 +799,7 @@ def _channel_ids_from_csv(raw: str) -> set:
 
 def _channel_ids_from_env(name: str) -> set:
     """Canonical 64-hex channel ids from a comma-separated env var. No ``*``."""
-    return _channel_ids_from_csv(os.getenv(name) or "")
+    return _channel_ids_from_csv(_scoped_env_str(name))
 
 
 def _sync_group_allowed_chats_extra(extra: dict) -> None:
@@ -907,7 +933,7 @@ def _reply_to_bot(reply_to: Optional[str], sent_ids) -> bool:
 
 def _home_operator_npub() -> Optional[str]:
     """VECTOR_HOME_CHANNEL as npub, or None."""
-    return normalize_npub((os.getenv("VECTOR_HOME_CHANNEL") or "").strip())
+    return normalize_npub(_scoped_env_str("VECTOR_HOME_CHANNEL").strip())
 
 
 def _format_joined_notice(
@@ -1073,7 +1099,7 @@ def _group_chat_name(
 
 
 def _env_flag(name: str, default: str = "") -> str:
-    return (os.getenv(name) or default).strip().lower()
+    return (_scoped_env(name) or default).strip().lower()
 
 
 def _pairing_enabled() -> bool:
@@ -1104,7 +1130,7 @@ def _create_community_enabled() -> bool:
 def _npubs_from_env(name: str) -> set:
     """Canonical npubs from a comma-separated env var."""
     found: set = set()
-    raw = os.getenv(name) or ""
+    raw = _scoped_env_str(name)
     for part in raw.split(","):
         npub = normalize_npub(part.strip())
         if npub:
@@ -1219,30 +1245,35 @@ class VectorAdapter(BasePlatformAdapter):
         if getattr(config, "extra", None) is not extra:
             config.extra = extra
         _sync_group_allowed_chats_extra(extra)
-        self.bridge_port: int = int(extra.get("bridge_port", DEFAULT_BRIDGE_PORT))
+        self.bridge_port: int = _coerce_port(
+            extra.get("bridge_port", _scoped_env("VECTOR_BRIDGE_PORT")),
+            DEFAULT_BRIDGE_PORT,
+        )
         self.bridge_host: str = str(
             extra.get("bridge_host")
-            or os.getenv("VECTOR_BRIDGE_HOST")
+            or _scoped_env("VECTOR_BRIDGE_HOST")
             or DEFAULT_BRIDGE_HOST
         )
         self.bot_name: str = (
-            extra.get("bot_name") or os.getenv("VECTOR_BOT_NAME") or ""
+            extra.get("bot_name") or _scoped_env("VECTOR_BOT_NAME") or ""
         ).strip()
         self.bot_about: str = (
-            extra.get("bot_about") or os.getenv("VECTOR_BOT_ABOUT") or ""
+            extra.get("bot_about") or _scoped_env("VECTOR_BOT_ABOUT") or ""
         ).strip()
         raw_avatar = (
-            extra.get("bot_avatar") or os.getenv("VECTOR_BOT_AVATAR") or ""
+            extra.get("bot_avatar") or _scoped_env("VECTOR_BOT_AVATAR") or ""
         ).strip()
         raw_banner = (
-            extra.get("bot_banner") or os.getenv("VECTOR_BOT_BANNER") or ""
+            extra.get("bot_banner") or _scoped_env("VECTOR_BOT_BANNER") or ""
         ).strip()
         self.startup_timeout: int = int(
-            os.getenv("VECTOR_STARTUP_TIMEOUT")
+            _scoped_env("VECTOR_STARTUP_TIMEOUT")
             or extra.get("startup_timeout")
             or DEFAULT_STARTUP_TIMEOUT
         )
-        self._npub: Optional[str] = extra.get("npub") or (os.getenv("VECTOR_NPUB") or "").strip() or None
+        self._npub: Optional[str] = (
+            extra.get("npub") or _scoped_env_str("VECTOR_NPUB").strip() or None
+        )
         self.data_dir: Path = Path(extra.get("data_dir") or resolve_data_dir())
         self.bot_avatar: Optional[Path] = (
             Path(raw_avatar).expanduser() if raw_avatar else discover_bot_image(self.data_dir, "avatar")
@@ -1316,7 +1347,7 @@ class VectorAdapter(BasePlatformAdapter):
             self._release_platform_lock()
             return False
         if (
-            not (os.getenv("VECTOR_BRIDGE_BIN") or "").strip()
+            not _scoped_env_str("VECTOR_BRIDGE_BIN").strip()
             and bin_path == _prebuilt_bridge_bin()
             and not _prebuilt_version_matches()
         ):
@@ -2241,7 +2272,7 @@ class VectorAdapter(BasePlatformAdapter):
         """Slice 2: create-or-reuse a bot-owned Concord community (no public link)."""
         if not self._http_client:
             return
-        name = (os.getenv("VECTOR_COMMUNITY_NAME") or "").strip() or "Hermes"
+        name = _scoped_env_str("VECTOR_COMMUNITY_NAME").strip() or "Hermes"
         try:
             resp = await self._http_client.post(
                 f"{self.bridge_url}/communities",
@@ -3574,14 +3605,20 @@ class VectorAdapter(BasePlatformAdapter):
         bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
         self._bridge_log_fh = bridge_log_fh
 
-        env = {
-            **os.environ,
-            "VECTOR_DATA_DIR": str(self.data_dir),
-            "VECTOR_BRIDGE_PORT": str(self.bridge_port),
-            "VECTOR_BRIDGE_HOST": self.bridge_host,
-            "VECTOR_SIDECAR_TOKEN": self._sidecar_token or "",
-            "VECTOR_SIDECAR_WATCH_STDIN": "1",
-        }
+        env = dict(os.environ)
+        # The child has no secret scope. Under multiplex, os.environ is the
+        # default profile — strip those VECTOR_* values and restore this
+        # profile's before the instance overlays (port, data dir, token).
+        _rewrite_sidecar_profile_env(env)
+        env.update(
+            {
+                "VECTOR_DATA_DIR": str(self.data_dir),
+                "VECTOR_BRIDGE_PORT": str(self.bridge_port),
+                "VECTOR_BRIDGE_HOST": self.bridge_host,
+                "VECTOR_SIDECAR_TOKEN": self._sidecar_token or "",
+                "VECTOR_SIDECAR_WATCH_STDIN": "1",
+            }
+        )
         env.pop("VECTOR_BOT_NAME", None)
         env.pop("VECTOR_BOT_ABOUT", None)
         env.pop("VECTOR_BOT_AVATAR", None)
@@ -3753,7 +3790,7 @@ class VectorAdapter(BasePlatformAdapter):
 
 def check_requirements() -> bool:
     """Side-effect free: VECTOR_NPUB set and a matching vector-bridge present."""
-    npub = (os.getenv("VECTOR_NPUB") or "").strip()
+    npub = _scoped_env_str("VECTOR_NPUB").strip()
     if not npub:
         return False
     return resolve_bridge_bin().is_file()
@@ -3761,7 +3798,7 @@ def check_requirements() -> bool:
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    npub = os.getenv("VECTOR_NPUB") or extra.get("npub") or ""
+    npub = _scoped_env("VECTOR_NPUB") or extra.get("npub") or ""
     return bool(str(npub).strip())
 
 
@@ -3770,39 +3807,39 @@ def is_connected(config) -> bool:
 
 
 def _env_enablement():
-    """Seed PlatformConfig.extra from env vars before adapter construction."""
-    npub = (os.getenv("VECTOR_NPUB") or "").strip()
+    """Seed PlatformConfig.extra from the active profile's env before construction."""
+    npub = _scoped_env_str("VECTOR_NPUB").strip()
     if not npub:
         return None
     seed = {
         "npub": npub,
         "data_dir": str(resolve_data_dir()),
-        "bridge_port": os.getenv("VECTOR_BRIDGE_PORT") or str(DEFAULT_BRIDGE_PORT),
-        "bridge_host": os.getenv("VECTOR_BRIDGE_HOST") or DEFAULT_BRIDGE_HOST,
-        "startup_timeout": os.getenv("VECTOR_STARTUP_TIMEOUT") or str(DEFAULT_STARTUP_TIMEOUT),
+        "bridge_port": _scoped_env("VECTOR_BRIDGE_PORT") or str(DEFAULT_BRIDGE_PORT),
+        "bridge_host": _scoped_env("VECTOR_BRIDGE_HOST") or DEFAULT_BRIDGE_HOST,
+        "startup_timeout": _scoped_env("VECTOR_STARTUP_TIMEOUT") or str(DEFAULT_STARTUP_TIMEOUT),
     }
-    home = (os.getenv("VECTOR_HOME_CHANNEL") or "").strip()
+    home = _scoped_env_str("VECTOR_HOME_CHANNEL").strip()
     if home:
         seed["home_channel"] = {
             "chat_id": normalize_npub(home) or home,
             "name": "Home",
         }
-    group_users = (os.getenv("VECTOR_GROUP_ALLOWED_USERS") or "").strip()
+    group_users = _scoped_env_str("VECTOR_GROUP_ALLOWED_USERS").strip()
     if group_users:
         seed["group_allowed_users"] = group_users
     open_chats = ",".join(sorted(_group_allow_all_chats()))
     if open_chats:
         seed["group_allowed_chats"] = open_chats
-    bot_name = (os.getenv("VECTOR_BOT_NAME") or "").strip()
+    bot_name = _scoped_env_str("VECTOR_BOT_NAME").strip()
     if bot_name:
         seed["bot_name"] = bot_name
-    bot_about = (os.getenv("VECTOR_BOT_ABOUT") or "").strip()
+    bot_about = _scoped_env_str("VECTOR_BOT_ABOUT").strip()
     if bot_about:
         seed["bot_about"] = bot_about
-    avatar = (os.getenv("VECTOR_BOT_AVATAR") or "").strip()
+    avatar = _scoped_env_str("VECTOR_BOT_AVATAR").strip()
     if avatar:
         seed["bot_avatar"] = avatar
-    banner = (os.getenv("VECTOR_BOT_BANNER") or "").strip()
+    banner = _scoped_env_str("VECTOR_BOT_BANNER").strip()
     if banner:
         seed["bot_banner"] = banner
     return seed
@@ -3867,6 +3904,32 @@ def _parse_bridge_json(text: str) -> Optional[Dict[str, Any]]:
         ):
             return data
     return None
+
+
+def _rewrite_sidecar_profile_env(env: Dict[str, str]) -> None:
+    """Drop inherited ``VECTOR_*`` and restore the active profile's values.
+
+    No-op unless multiplexing is on and a secret scope is installed. The
+    default profile and single-profile gateways keep ``os.environ``, which
+    is already theirs. ``VECTOR_NSEC`` / ``VECTOR_MNEMONIC`` are never
+    copied — runtime identity is ``identity.nsec`` in the data dir.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        scope = current_secret_scope()
+        if not (is_multiplex_active() and scope is not None):
+            return
+    except Exception:
+        return
+    for key in [k for k in env if k.startswith("VECTOR_")]:
+        env.pop(key, None)
+    for key, val in scope.items():
+        if not key.startswith("VECTOR_") or key in ("VECTOR_NSEC", "VECTOR_MNEMONIC", "VECTOR_STUB"):
+            continue
+        text = str(val).strip() if val is not None else ""
+        if text:
+            env[key] = text
 
 
 def _overlay_sidecar_extra_env(env: Dict[str, str], extra: dict) -> None:
@@ -4268,6 +4331,12 @@ def _yaml_count(value: Any) -> Optional[str]:
 
 
 def _set_env_if_unset(key: str, value: Optional[str], *, skip: bool) -> None:
+    """Write ``os.environ`` only when the process does not already have ``key``.
+
+    The "already set" check stays on ``os.environ`` (explicit process env
+    wins). Multiplex secondaries pass ``skip=True`` so this never publishes
+    their YAML into the shared process env.
+    """
     if skip or value is None:
         return
     if (os.getenv(key) or "").strip():
@@ -4311,8 +4380,9 @@ def _profile_scoped_config_load() -> bool:
 def _apply_yaml_config(yaml_cfg: dict, vector_cfg: dict) -> Optional[dict]:
     """Translate config.yaml ``vector:`` keys into env + PlatformConfig.extra.
 
-    Env wins. Sidecar still reads VECTOR_* process env; this hook is the
-    YAML→env bridge (same pattern as Discord / Mattermost).
+    Env wins. Single-profile gateways bridge YAML into process env for the
+    sidecar. Multiplex secondaries skip that write; spawn restores their
+    scoped env into the child instead.
     """
     if not isinstance(vector_cfg, dict):
         vector_cfg = {}
@@ -4587,7 +4657,7 @@ def _ensure_bridge_binary(io) -> Optional[Path]:
         io.print_info(f"Using vector-bridge at {bin_path}")
         return bin_path
 
-    override = (os.getenv("VECTOR_BRIDGE_BIN") or "").strip()
+    override = _scoped_env_str("VECTOR_BRIDGE_BIN").strip()
     if override and Path(override) != _DEFAULT_BRIDGE_BIN:
         io.print_error(f"VECTOR_BRIDGE_BIN={override} does not exist.")
         io.print_info(
@@ -4716,11 +4786,11 @@ async def _standalone_send(
     """
     extra = getattr(pconfig, "extra", {}) or {}
     port = _coerce_port(
-        extra.get("bridge_port") or os.getenv("VECTOR_BRIDGE_PORT"),
+        extra.get("bridge_port") or _scoped_env("VECTOR_BRIDGE_PORT"),
         DEFAULT_BRIDGE_PORT,
     )
     host = _client_host(
-        str(extra.get("bridge_host") or os.getenv("VECTOR_BRIDGE_HOST") or DEFAULT_BRIDGE_HOST)
+        str(extra.get("bridge_host") or _scoped_env("VECTOR_BRIDGE_HOST") or DEFAULT_BRIDGE_HOST)
     )
 
     token = None

@@ -2591,6 +2591,79 @@ class TestConnectMissingBinary:
         assert adapter.fatal_error_code == "vector_bridge_spawn_failed"
 
 
+class TestMultiplexSecretScope:
+    """Secondary profiles must not see the default profile's process env."""
+
+    def test_scope_beats_os_environ(self, monkeypatch, tmp_path):
+        from agent.secret_scope import (
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+
+        monkeypatch.setenv("VECTOR_NPUB", "npub1defaultprofileidentity")
+        monkeypatch.setenv("VECTOR_BRIDGE_PORT", "8096")
+        monkeypatch.setenv("VECTOR_BRIDGE_HOST", "127.0.0.1")
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", "npub1defaultpeerxxxxxxxx")
+        monkeypatch.setenv("VECTOR_HOME_CHANNEL", "npub1defaulthome")
+        monkeypatch.setenv("VECTOR_INVITE_POLICY", "public")
+        monkeypatch.setenv("VECTOR_NSEC", "nsec1defaultshouldnotleak")
+        monkeypatch.delenv("VECTOR_BOT_NAME", raising=False)
+        set_multiplex_active(True)
+        token = set_secret_scope(
+            {
+                "VECTOR_NPUB": NPUB,
+                "VECTOR_BRIDGE_PORT": "8097",
+                "VECTOR_ALLOWED_USERS": PEER_NPUB,
+                "VECTOR_NSEC": "nsec1scopedshouldnotleak",
+            }
+        )
+        try:
+            seed = vector_adapter._env_enablement()
+            assert seed is not None
+            assert seed["npub"] == NPUB
+            assert seed["bridge_port"] == "8097"
+            assert "home_channel" not in seed
+            assert vector_adapter._allowed_npubs() == {PEER_NPUB}
+            assert vector_adapter._home_operator_npub() is None
+
+            adapter = _make_adapter(
+                monkeypatch, tmp_path, npub=NPUB, bridge_port=8097
+            )
+            # _make_adapter clears VECTOR_HOME_CHANNEL. Put the default
+            # profile's value back so the child must strip it, not inherit it.
+            monkeypatch.setenv("VECTOR_HOME_CHANNEL", "npub1defaulthome")
+            adapter.config.extra["invite_policy"] = "manual"
+            adapter._sidecar_token = "tok" + "ab" * 30
+            assert os.environ["VECTOR_NPUB"] == "npub1defaultprofileidentity"
+            captured: dict = {}
+
+            def fake_popen(*_args, **kwargs):
+                captured["kwargs"] = kwargs
+                return FakeBridgeProc()
+
+            monkeypatch.setattr(vector_adapter.subprocess, "Popen", fake_popen)
+            adapter._spawn_bridge()
+            env = captured["kwargs"]["env"]
+            assert env["VECTOR_NPUB"] == NPUB
+            assert env["VECTOR_BRIDGE_PORT"] == "8097"
+            assert env["VECTOR_ALLOWED_USERS"] == PEER_NPUB
+            assert env["VECTOR_DATA_DIR"] == str(adapter.data_dir)
+            assert env["VECTOR_SIDECAR_TOKEN"] == adapter._sidecar_token
+            assert env["VECTOR_INVITE_POLICY"] == "manual"
+            assert "VECTOR_HOME_CHANNEL" not in env
+            assert "VECTOR_NSEC" not in env
+            assert "VECTOR_MNEMONIC" not in env
+            assert "npub1defaultprofileidentity" not in env.values()
+            assert "nsec1defaultshouldnotleak" not in env.values()
+            assert "nsec1scopedshouldnotleak" not in env.values()
+            assert os.environ["VECTOR_NSEC"] == "nsec1defaultshouldnotleak"
+            adapter._close_bridge_log()
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+
 class TestMockedSidecarHttp:
     def test_send_and_typing_include_token_header(self, monkeypatch, tmp_path):
         token = "a" * 64

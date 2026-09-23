@@ -46,6 +46,8 @@ from .paths import (
     _mime_for_attachment,
     _sanitize_filename,
     _unique_path,
+    sandbox_breadcrumb_path,
+    sandbox_turn_path,
 )
 
 logger = logging.getLogger("hermes_plugins.vector_platform.adapter")
@@ -452,7 +454,7 @@ class InboundDispatcher:
             await self.adapter._file_superseded_replay(source, text, saved)
             return
 
-        media_urls = [str(path) for path, _att, _mime in saved]
+        media_urls = [sandbox_turn_path(path, mime=mime) for path, _att, mime in saved]
         media_types = [mime for _path, _att, mime in saved]
         msg_type = MessageType.TEXT
         if media_types:
@@ -593,7 +595,7 @@ class InboundDispatcher:
         pending = self.adapter._pending_inbox.setdefault(key, [])
         seen = {p for p, _m in pending}
         for path, _att, mime in saved:
-            path_key = str(path)
+            path_key = sandbox_turn_path(path, mime=mime)
             if path_key not in seen:
                 pending.append((path_key, mime))
                 seen.add(path_key)
@@ -609,7 +611,7 @@ class InboundDispatcher:
         media_types: List[str] = []
         msg_type = MessageType.TEXT
         if saved:
-            media_urls = [str(path) for path, _att, _mime in saved]
+            media_urls = [sandbox_turn_path(path, mime=mime) for path, _att, mime in saved]
             media_types = [mime for _path, _att, mime in saved]
         elif not is_file:
             pending = self.adapter._pending_inbox.pop(key, [])
@@ -913,7 +915,8 @@ class InboundDispatcher:
             lines.append(text.strip())
         for path, att, mime in saved:
             orig = att.get("name") or path.name
-            lines.append(f"- attachment {orig} ({mime}) `{path}`")
+            visible = sandbox_breadcrumb_path(path, mime=mime)
+            lines.append(f"- attachment {orig} ({mime}) `{visible}`")
         try:
             await asyncio.to_thread(
                 self.adapter._append_session_breadcrumb, source, "\n".join(lines)
@@ -934,7 +937,8 @@ class InboundDispatcher:
         ]
         for path, att, mime in saved:
             orig = att.get("name") or path.name
-            lines.append(f"- {orig} ({mime}) `{path}`")
+            visible = sandbox_breadcrumb_path(path, mime=mime)
+            lines.append(f"- {orig} ({mime}) `{visible}`")
         content = "\n".join(lines)
         try:
             await asyncio.to_thread(self.adapter._append_session_breadcrumb, source, content)

@@ -5794,6 +5794,74 @@ class TestInboundFiles:
         assert handled[0].message_type == vector_adapter.MessageType.PHOTO
         assert Path(handled[0].media_urls[0]).is_file()
 
+    def test_docker_terminal_stages_image_where_the_sandbox_can_read_it(
+        self, monkeypatch, tmp_path
+    ):
+        """Docker only bind-mounts Hermes staging dirs. Inbox paths are invisible there."""
+        monkeypatch.setenv("VECTOR_ALLOWED_USERS", PEER_NPUB)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _patch_files_root(monkeypatch, tmp_path / "files")
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        handled = []
+        crumbs = []
+
+        async def capture(event):
+            handled.append(event)
+
+        async def fake_download(att, dest, *, author_npub):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"\xff\xd8\xffjpeg")
+            return dest
+
+        async def fake_send(**kwargs):
+            return vector_adapter.SendResult(success=True, message_id="ack")
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        adapter._download_attachment = fake_download  # type: ignore[method-assign]
+        adapter.send = fake_send  # type: ignore[method-assign]
+        adapter._append_session_breadcrumb = (  # type: ignore[method-assign]
+            lambda source, content: crumbs.append(content)
+        )
+
+        att = {"id": "att-img", "name": "shot.jpg", "extension": "jpg", "size": 8}
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(
+                    PEER_NPUB, "", msg_id="docker-file", is_file=True, attachments=[att]
+                )
+            )
+        )
+        assert handled == []
+        assert crumbs and "/root/.hermes/images/vector/" in crumbs[0]
+        assert "shot.jpg" in crumbs[0]
+        staged = list((tmp_path / "images" / "vector").rglob("*.jpg"))
+        inbox = list((tmp_path / "files" / "inbox").rglob("*.jpg"))
+        assert len(staged) == 1 and len(inbox) == 1
+        assert staged[0].stat().st_ino == inbox[0].stat().st_ino
+
+        asyncio.run(
+            adapter._handle_message_event(
+                _message_event(PEER_NPUB, "what is that a photo of?", msg_id="docker-ask")
+            )
+        )
+        assert len(handled) == 1
+        assert handled[0].media_urls[0].startswith("/root/.hermes/images/vector/")
+        assert handled[0].media_urls[0].endswith(".jpg")
+
+    def test_docker_terminal_keeps_audio_on_a_host_path(self, monkeypatch, tmp_path):
+        """Speech-to-text opens the path on the host. The breadcrumb stays container-side."""
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        home = tmp_path / "home"
+        _patch_hermes_home(monkeypatch, home)
+        src = tmp_path / "clip.ogg"
+        src.write_bytes(b"ogg")
+        turn = vector_adapter.sandbox_turn_path(src, mime="audio/ogg")
+        crumb = vector_adapter.sandbox_breadcrumb_path(src, mime="audio/ogg")
+        assert Path(turn).is_file()
+        assert Path(turn).is_relative_to(home / "attachments" / "vector")
+        assert crumb.startswith("/root/.hermes/attachments/vector/")
+        assert crumb.endswith("clip.ogg")
+
     def test_file_only_unauthorized_pairing_off_not_saved(
         self, monkeypatch, tmp_path
     ):

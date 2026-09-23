@@ -160,6 +160,8 @@ _INTERNAL_EXPORTS = {
         '_mime_for_attachment',
         '_message_type_for_mime',
         '_inbound_media_max_bytes',
+        'sandbox_turn_path',
+        'sandbox_breadcrumb_path',
         '_runtime_record_path',
         '_write_runtime_record',
         '_read_runtime_record',

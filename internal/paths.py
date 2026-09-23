@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import filecmp
 import json
 import logging
 import mimetypes
@@ -158,6 +159,127 @@ def _inbound_media_max_bytes() -> int:
         return int(get_inbound_media_max_bytes())
     except Exception:
         return DEFAULT_INBOUND_MEDIA_MAX_BYTES
+
+# Backends whose files live outside the host namespace. Singularity/Apptainer
+# bind the home directory, so inbox paths already resolve there.
+_SANDBOX_TERMINAL_BACKENDS = frozenset(
+    {"docker", "modal", "ssh", "daytona", "vercel_sandbox"}
+)
+
+
+def _terminal_backend_name() -> str:
+    try:
+        from tools.terminal_scope import terminal_env
+
+        return (terminal_env("TERMINAL_ENV") or "local").strip().lower()
+    except Exception:
+        return (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+
+
+def _sandbox_media_mount_needed() -> bool:
+    """True when the agent cannot open a host path outside Hermes mount dirs."""
+    backend = _terminal_backend_name()
+    if backend in _SANDBOX_TERMINAL_BACKENDS:
+        return True
+    if backend in {"", "local", "singularity"}:
+        return False
+    try:
+        from agent.terminal_env_registry import provider_flag
+
+        return bool(provider_flag(backend, "cache_path_base", None))
+    except Exception:
+        return False
+
+
+def _sandbox_stage_root(mime: str) -> Path:
+    """Host dir Hermes bind-mounts into the sandbox and vision may read.
+
+    Images go under ``images/`` because that is on the vision host-read
+    allowlist and is not part of the 24-hour cache sweep. Other files go
+    under ``attachments/``, which the sandbox mounts for file tools.
+    Speech-to-text opens the host path, so audio must be a real file there.
+    """
+    from hermes_constants import get_hermes_dir
+
+    if (mime or "").lower().startswith("image/"):
+        root = get_hermes_dir("images", "images")
+    else:
+        root = get_hermes_dir("attachments", "attachments")
+    return root / "vector"
+
+
+def _stage_hardlink(src: Path, directory: Path) -> Optional[Path]:
+    """Hardlink ``src`` into ``directory``, copying if the link cannot be made."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    dest = directory / src.name
+    try:
+        if dest.exists():
+            src_stat = src.stat()
+            dest_stat = dest.stat()
+            same_file = (
+                dest_stat.st_ino == src_stat.st_ino and dest_stat.st_dev == src_stat.st_dev
+            )
+            if same_file or (
+                dest_stat.st_size == src_stat.st_size and filecmp.cmp(src, dest, shallow=False)
+            ):
+                return dest
+            dest = _unique_path(directory, src.name)
+    except OSError:
+        return None
+    try:
+        os.link(src, dest)
+        return dest
+    except OSError:
+        try:
+            shutil.copy2(src, dest)
+            return dest
+        except OSError:
+            return None
+
+
+def _to_agent_visible_path(host_path: Path) -> str:
+    try:
+        from tools.credential_files import to_agent_visible_cache_path
+
+        return to_agent_visible_cache_path(str(host_path))
+    except Exception:
+        logger.warning(
+            "Vector: could not map %s into the sandbox", host_path, exc_info=True
+        )
+        return str(host_path)
+
+
+def _staged_sandbox_paths(src: Path, *, mime: str) -> tuple[str, str]:
+    """Return ``(host_path, agent_visible_path)`` for an inbox file.
+
+    A local terminal reads the inbox path directly. A sandbox only sees
+    Hermes mount dirs, so stage a link there first.
+    """
+    host = str(src)
+    if not _sandbox_media_mount_needed():
+        return host, host
+    staged = _stage_hardlink(src, _sandbox_stage_root(mime))
+    if staged is None:
+        logger.warning("Vector: failed to stage %s for the sandbox", src)
+        return host, host
+    return str(staged), _to_agent_visible_path(staged)
+
+
+def sandbox_turn_path(src: Path, *, mime: str) -> str:
+    """Path for ``media_urls``. Audio stays on the host so STT can open it."""
+    host, visible = _staged_sandbox_paths(src, mime=mime)
+    if (mime or "").lower().startswith("audio/"):
+        return host
+    return visible
+
+
+def sandbox_breadcrumb_path(src: Path, *, mime: str) -> str:
+    """Path to quote in session breadcrumbs (the path the agent can open)."""
+    _host, visible = _staged_sandbox_paths(src, mime=mime)
+    return visible
 
 def _runtime_record_path() -> Path:
     try:

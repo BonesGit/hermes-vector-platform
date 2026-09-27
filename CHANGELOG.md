@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-09-26
+
+Includes a new sidecar (group-context API). Re-run setup after update so the
+prebuilt refreshes, or let setup download `v0.5.3` assets from the Release.
+
 ### Fixed
 
+- **Inbound attachments invisible inside Hermes sandboxes.** Docker (and
+  other backends that cannot read the host Vector inbox) now hardlink each
+  file into a Hermes mount dir (`images/vector` for images,
+  `attachments/vector` otherwise) so the agent and vision can open it.
 - **Multiplexed secondary profiles inherited the default bot.** Platform
   reads (`VECTOR_NPUB`, `VECTOR_BRIDGE_PORT`, allowlists, data dir, and the
   rest of `VECTOR_*`) used `os.getenv`, which under one-gateway-multi-profile
@@ -33,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sidecar still returns at most 50 messages). A line past the char budget is
   clipped. Does not start extra turns and does not catch up missed group
   messages.
+- **Plugin catalog image** `vector-hermes-agent-plugin.png`.
+
+### Changed
+
+- **Adapter split into an `internal/` package.** `register()` stays the Hermes
+  entry; sidecar, setup, and inbound live in focused modules.
+- README install notes oriented at the plugin catalog.
 
 ## [0.5.2] — 2026-09-05
 

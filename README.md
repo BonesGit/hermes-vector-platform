@@ -15,7 +15,7 @@ This is a **user-installed platform plugin**. After enable + setup, Hermes is a 
 
 Hermes plugin docs: [user guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins) · [platform adapters](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-platform-adapters)
 
-<img src="https://raw.githubusercontent.com/VectorPrivacy/Vector/0ca50a9e7aa4aa3879199994a63acd1c574b7708/assets/github_header_readme.png">
+<img src="https://raw.githubusercontent.com/BonesGit/hermes-vector-platform/refs/heads/master/vector-hermes-agent-plugin.png">
 
 ## Install
 

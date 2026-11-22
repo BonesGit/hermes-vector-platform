@@ -4581,6 +4581,22 @@ class TestApplyYamlConfig:
         assert seeded["bot_name"] == "FromYaml"
         assert os.environ["VECTOR_BOT_NAME"] == "FromEnv"
 
+    def test_compress_images_yaml_seeds_env(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_COMPRESS_IMAGES", raising=False)
+        seeded = vector_adapter._apply_yaml_config(
+            {},
+            {"compress_images": False},
+        )
+        assert seeded["compress_images"] == "off"
+        assert os.environ["VECTOR_COMPRESS_IMAGES"] == "off"
+        assert vector_adapter._compress_images_enabled() is False
+        monkeypatch.delenv("VECTOR_COMPRESS_IMAGES", raising=False)
+        on = vector_adapter._apply_yaml_config({}, {"compress_images": True})
+        assert on["compress_images"] == "on"
+        assert vector_adapter._compress_images_enabled() is True
+        bad = vector_adapter._apply_yaml_config({}, {"compress_images": "maybe"})
+        assert bad is None or "compress_images" not in (bad or {})
+
     def test_network_block_seeds_env(self, monkeypatch):
         keys = (
             "VECTOR_NETWORK",
@@ -6267,6 +6283,48 @@ class TestOutboundFiles:
         assert posts[0]["json"]["reply_to"] == "parent-1"
         assert posts[0]["json"]["compress"] is False
         assert posts[0]["json"]["expires_in"] == 120
+
+    def test_send_document_compress_follows_config_default(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._running = True
+        payload = tmp_path / "pic.png"
+        payload.write_bytes(b"png")
+        monkeypatch.setattr(
+            vector_adapter.VectorAdapter,
+            "validate_media_delivery_path",
+            staticmethod(lambda path, session_key="": str(path)),
+        )
+
+        class _Resp:
+            status_code = 200
+            content = b'{"id":"file1"}'
+
+            def json(self):
+                return {"id": "file1"}
+
+        posts = []
+
+        class _Client:
+            async def post(self, url, json=None, headers=None, timeout=None):
+                posts.append({"url": url, "json": json})
+                return _Resp()
+
+        adapter._http_client = _Client()
+        monkeypatch.delenv("VECTOR_COMPRESS_IMAGES", raising=False)
+        assert asyncio.run(adapter.send_document(PEER_NPUB, str(payload))).success
+        assert posts[-1]["json"]["compress"] is True
+
+        monkeypatch.setenv("VECTOR_COMPRESS_IMAGES", "off")
+        assert asyncio.run(adapter.send_document(PEER_NPUB, str(payload))).success
+        assert posts[-1]["json"]["compress"] is False
+
+        # Per-send metadata still overrides the global off.
+        assert asyncio.run(
+            adapter.send_document(
+                PEER_NPUB, str(payload), metadata={"compress": True}
+            )
+        ).success
+        assert posts[-1]["json"]["compress"] is True
 
     def test_send_document_to_channel_posts_channel_id(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)

@@ -125,10 +125,11 @@ Sidecar plumbing stays getenv overrides (not in `plugin.yaml`, not written by th
 
 ## `config.yaml` (`vector:`)
 
-Profile, communities, reactions, replay, pairing, network (Tor/I2P), and prebuilt
-sidecar fetch live here. Env still overrides if set for the older `VECTOR_*`
-keys. Setup writes non-default answers; omit a key to keep the code default. The
-wizard does not prompt `replay`, `network`, or `prebuilt` and will not clobber them.
+Profile, communities, reactions, image compression, replay, pairing, network
+(Tor/I2P), and prebuilt sidecar fetch live here. Env still overrides if set for
+the older `VECTOR_*` keys. Setup writes non-default answers; omit a key to keep
+the code default. The wizard does not prompt `replay`, `network`,
+`compress_images`, or `prebuilt` and will not clobber them.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -143,6 +144,7 @@ vector:
   # i2p_only: false                  # true = no I2P outproxy to clearnet
   unauthorized_dm_behavior: ignore   # omit (default pair) = pairing codes
   reactions: false                   # 👀/✅/❌ on the triggering DM; default off
+  compress_images: true              # fit/strip bot-sent pictures; false = send bytes unchanged
   missed_react: true                 # ❌ on DMs that arrived while the sidecar was down
   slash_commands: true               # Vector / picker (kind 10304); typed /approve still works
   replay:                            # how much backlog a reconnect is allowed to cost

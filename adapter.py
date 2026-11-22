@@ -134,6 +134,7 @@ _INTERNAL_EXPORTS = {
         '_env_flag',
         '_pairing_enabled',
         '_processing_reactions_enabled',
+        '_compress_images_enabled',
         '_create_community_enabled',
         '_community_download_all',
         '_group_context_enabled',
@@ -348,10 +349,18 @@ def _metadata_expires_in(metadata: Optional[Dict[str, Any]]) -> Optional[int]:
 
 
 def _metadata_compress(metadata: Optional[Dict[str, Any]]) -> Optional[bool]:
-    """Optional picture-compress override; ``None`` keeps the SDK default."""
+    """Optional per-send picture-compress override; ``None`` uses the config default."""
     if not isinstance(metadata, dict) or "compress" not in metadata:
         return None
     return bool(metadata.get("compress"))
+
+
+def _resolve_compress(metadata: Optional[Dict[str, Any]]) -> bool:
+    """Per-send ``metadata.compress`` wins; else ``vector.compress_images`` (default on)."""
+    override = _metadata_compress(metadata)
+    if override is not None:
+        return override
+    return _compress_images_enabled()
 
 
 # ---------------------------------------------------------------------------
@@ -1968,9 +1977,7 @@ class VectorAdapter(BasePlatformAdapter):
         expires_in = _metadata_expires_in(metadata)
         if expires_in is not None:
             payload["expires_in"] = expires_in
-        compress = _metadata_compress(metadata)
-        if compress is not None:
-            payload["compress"] = compress
+        payload["compress"] = _resolve_compress(metadata)
         try:
             resp = await self._http_client.post(
                 f"{self.bridge_url}/send-file",

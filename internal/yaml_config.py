@@ -300,6 +300,16 @@ def _apply_yaml_config(yaml_cfg: dict, vector_cfg: dict) -> Optional[dict]:
         if reactions is not None:
             seeded["reactions"] = reactions
             _set_env_if_unset("VECTOR_REACTIONS", reactions, skip=skip)
+    if "compress_images" in vector_cfg:
+        compress = _yaml_on_off(vector_cfg.get("compress_images"))
+        if compress is not None:
+            seeded["compress_images"] = compress
+            _set_env_if_unset("VECTOR_COMPRESS_IMAGES", compress, skip=skip)
+        else:
+            logger.warning(
+                "Vector: ignoring vector.compress_images=%r (want true/false)",
+                vector_cfg.get("compress_images"),
+            )
     if "missed_react" in vector_cfg:
         missed = _yaml_on_off(vector_cfg.get("missed_react"))
         if missed is not None:

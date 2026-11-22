@@ -9,43 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.0] — 2026-11-21
 
-Sidecar pin moved to crates.io `vector_sdk` `=0.14.0`. The lock resolves
-`vector-core` `0.13.1`, `nostr` `0.45.7`, `nostr-sdk` `0.45.6`, and
-`nostr-connect` `0.45.3`. Features `tor` and `i2p` are on. There is no
-`v0.6.0` prebuilt yet — rebuild with `cd bridge && cargo build --release
---locked`, then `hermes gateway restart`. Setup will not replace a binary
-that is already installed.
+Includes a new sidecar (`vector_sdk` 0.14, with Tor and I2P support). There
+is no `v0.6.0` prebuilt yet — rebuild with
+`cd bridge && cargo build --release --locked`, then `hermes gateway restart`.
+Setup will not replace a binary that is already installed.
+
+### Fixed
+
+- **Missed-DM catch-up could ❌ a DM that already went live.** After Ready,
+  catch-up skips peers whose cursor already covers the message (SDK recent
+  catch-up may have delivered it as a normal turn), so we do not react again.
+- **Channel history could be requested for a DM id.** History is empty unless
+  the id is a community channel this bot holds, so a known peer's hex is not
+  treated as channel history.
+
+### Added
+
+- **Optional Tor / I2P transport.** Set `vector.network` to `clearnet`
+  (default), `tor`, or `i2p`. The choice is sticky per bot account — change
+  the key and restart to switch. Optional `tor_bridges`, `i2p_sam_port`, and
+  `i2p_only`. See README for setup notes.
+- **Richer outbound sends.** Community posts can set `expires_in`. File
+  sends support captions, `reply_to`, expiry, and in-memory bytes (base64,
+  up to 16 MiB) instead of only a path.
+- **`vector.compress_images`** (default on). Global switch for bot-sent
+  picture compression; `VECTOR_COMPRESS_IMAGES` overrides. Per-send
+  `metadata.compress` still wins when set.
+- **Inbound edits and un-reacts.** Peer edits and withdrawn reactions are
+  forwarded into Hermes without starting a turn. Deletes now also carry who
+  deleted, whether it was a moderation action, and when.
 
 ### Changed
 
-- **SDK pin.** `vector_sdk` `=0.14.0` (publish SHA `fd474f2d`, on
-  VectorPrivacy/Vector). `vector-core` `0.13.1` (publish SHA `854c594`, not
-  on that repo) is what the lock uses: `0.13.0` exact-pinned yanked
-  `nostr-connect` `0.45.2`, and `0.13.1` depends on `^0.45.3`. Features
-  `tor` and `i2p` are on; `voice` / `whisper` / `xdc` stay off.
-- **Network transport.** `vector.network` (`clearnet` \| `tor` \| `i2p`) maps
-  to an explicit SDK builder call on every boot. Sticky per bot account;
-  switch by changing the key and restarting. Optional `tor_bridges`,
-  `i2p_sam_port`, `i2p_only`.
-- **Peer reactions** still become SSE `message_update` and
-  `reaction:added:<emoji>`. Inbound edits emit SSE `message_edit` (id,
-  chat_id, text, previous_text); reaction withdrawals emit
-  `reaction_removed`. Neither starts a turn. `message_delete` now also
-  carries `by`, `moderated`, and `at` (Python still ignores the extras).
-- **Pictures the bot sends** are compressed by the SDK (fit to 2560px,
-  metadata stripped) unless `/send-file` sets `compress: false`. A picture
-  that cannot be stripped is refused when compression is on.
-- **Richer sends.** `POST /send` accepts `expires_in` (community NIP-40
-  expiry) via `Channel::post`. `POST /send-file` accepts `reply_to`,
-  `caption`, `expires_in`, `compress`, and in-memory `bytes`+`filename`
-  (base64, up to 16 MiB). Python passes caption/reply on the file request
-  and reads `expires_in` / `compress` from send metadata.
-- **A DM from the last five minutes** is a live Hermes turn, including one
-  sent while the gateway was down. Older missed DMs are still ❌ and no
-  turn.
-- **`GET /channels/{id}/history`** returns an empty list unless that id is
-  a channel this bot holds, so a known DM's hex is not returned as channel
-  history.
+- **Sidecar builds against `vector_sdk` 0.14** (Tor and I2P features on;
+  voice / whisper / xdc stay off). Peer reactions still map to the existing
+  message-update path.
+- **Pictures the bot sends are compressed by default** (fit to 2560px,
+  metadata stripped). Turn off globally with `vector.compress_images: false`
+  (or `VECTOR_COMPRESS_IMAGES=off`). A per-send `metadata.compress` still
+  overrides. A picture that cannot be stripped is refused when compression
+  is on.
 
 ## [0.5.3] — 2026-09-26
 

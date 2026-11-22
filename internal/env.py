@@ -53,6 +53,17 @@ def _processing_reactions_enabled() -> bool:
     return _env_flag("VECTOR_REACTIONS") in ("1", "true", "yes", "on")
 
 
+def _compress_images_enabled() -> bool:
+    """VECTOR_COMPRESS_IMAGES default on. Picture sends fit/strip unless off."""
+    return _env_flag("VECTOR_COMPRESS_IMAGES", "on") not in (
+        "off",
+        "0",
+        "false",
+        "no",
+        "disabled",
+    )
+
+
 def _create_community_enabled() -> bool:
     return _env_flag("VECTOR_CREATE_COMMUNITY") in ("1", "true", "yes", "on")
 

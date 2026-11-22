@@ -790,6 +790,10 @@ pub(crate) async fn handle_bot_event(
                 vec![json!({ "channel_id": channel_id, "name": channel_name })],
             ));
         }
+        BotEvent::Typing { .. } => {
+            // Inbound typing is unused until a client wants an indicator.
+            // No SSE, no Hermes turn.
+        }
         _ => {}
     }
 }

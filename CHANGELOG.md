@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Sidecar pin moved to crates.io `vector_sdk` `=0.14.0`. The lock resolves
+`vector-core` `0.13.1`, `nostr` `0.45.7`, `nostr-sdk` `0.45.6`, and
+`nostr-connect` `0.45.3`. The published `v0.5.3` prebuilt is still the 0.9
+sidecar. Rebuild with `cd bridge && cargo build --release --locked`, then
+`hermes gateway restart`. Setup will not replace a binary that is already
+installed.
+
+### Changed
+
+- **SDK pin.** `vector_sdk` `=0.14.0` (publish SHA `fd474f2d`, on
+  VectorPrivacy/Vector). `vector-core` `0.13.1` (publish SHA `854c594`, not
+  on that repo) is what the lock uses: `0.13.0` exact-pinned yanked
+  `nostr-connect` `0.45.2`, and `0.13.1` depends on `^0.45.3`. No `voice`,
+  `whisper`, `xdc`, `i2p`, or `tor` feature.
+- **Peer reactions** still become SSE `message_update` and
+  `reaction:added:<emoji>`. Edits and reaction withdrawals do not start a
+  turn. `message_delete` is still id and chat id only.
+- **Pictures the bot sends** are compressed by the SDK (fit to 2560px,
+  metadata stripped). A picture that cannot be stripped is refused.
+- **A DM from the last five minutes** is a live Hermes turn, including one
+  sent while the gateway was down. Older missed DMs are still ❌ and no
+  turn.
+- **`GET /channels/{id}/history`** returns an empty list unless that id is
+  a channel this bot holds, so a known DM's hex is not returned as channel
+  history.
+
 ## [0.5.3] — 2026-09-26
 
 Includes a new sidecar (group-context API). Re-run setup after update so the

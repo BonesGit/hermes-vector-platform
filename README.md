@@ -151,7 +151,7 @@ vector:
   prebuilt:                          # GitHub Release sidecar; omit = download the matching tag
     download: true                   # false = cargo only (Linux / macOS download by default)
     # repo: BonesGit/hermes-vector-platform
-    # tag: v0.5.3                    # omit = v{plugin version}
+    # tag: v0.6.0                    # omit = v{plugin version}
   communities:
     create: false                    # true = bot-owned private home room after Ready
     name: Hermes                     # only used when create is true

@@ -7,12 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-21
+
 Sidecar pin moved to crates.io `vector_sdk` `=0.14.0`. The lock resolves
 `vector-core` `0.13.1`, `nostr` `0.45.7`, `nostr-sdk` `0.45.6`, and
-`nostr-connect` `0.45.3`. The published `v0.5.3` prebuilt is still the 0.9
-sidecar. Rebuild with `cd bridge && cargo build --release --locked`, then
-`hermes gateway restart`. Setup will not replace a binary that is already
-installed.
+`nostr-connect` `0.45.3`. Features `tor` and `i2p` are on. There is no
+`v0.6.0` prebuilt yet — rebuild with `cd bridge && cargo build --release
+--locked`, then `hermes gateway restart`. Setup will not replace a binary
+that is already installed.
 
 ### Changed
 

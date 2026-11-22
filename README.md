@@ -125,7 +125,10 @@ Sidecar plumbing stays getenv overrides (not in `plugin.yaml`, not written by th
 
 ## `config.yaml` (`vector:`)
 
-Profile, communities, reactions, replay, pairing, and prebuilt sidecar fetch live here. Env still overrides if set for the older `VECTOR_*` keys. Setup writes non-default answers; omit a key to keep the code default. The wizard does not prompt `replay` or `prebuilt` and will not clobber them.
+Profile, communities, reactions, replay, pairing, network (Tor/I2P), and prebuilt
+sidecar fetch live here. Env still overrides if set for the older `VECTOR_*`
+keys. Setup writes non-default answers; omit a key to keep the code default. The
+wizard does not prompt `replay`, `network`, or `prebuilt` and will not clobber them.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -134,6 +137,10 @@ vector:
     name: "Hermes"                   # public kind-0; omit = do not publish a name
     about: "Hermes on Vector"        # omit = do not publish about
     # avatar/banner: files at sdk/avatar.* / sdk/banner.* if present
+  network: clearnet                  # clearnet | tor | i2p (exactly one; sticky per bot account)
+  # tor_bridges: []                  # optional Tor bridge lines when network: tor
+  # i2p_sam_port: 7656               # optional; default SAM port when network: i2p
+  # i2p_only: false                  # true = no I2P outproxy to clearnet
   unauthorized_dm_behavior: ignore   # omit (default pair) = pairing codes
   reactions: false                   # 👀/✅/❌ on the triggering DM; default off
   missed_react: true                 # ❌ on DMs that arrived while the sidecar was down
@@ -161,6 +168,29 @@ vector:
 ```
 
 Display / tool-progress stays under `display.platforms.vector` (next section).
+
+## Network (clearnet / Tor / I2P)
+
+`vector.network` selects **one** transport for the bot account. The sidecar always
+calls the matching SDK builder (`.clearnet()`, `.tor()`, or `.i2p()`). Default is
+`clearnet`.
+
+That choice is **sticky** on the local bot profile (`VECTOR_DATA_DIR`): Vector
+stores Tor/I2P/clearnet with the npub and will not silently fall back. You can
+**switch** by changing `vector.network` and restarting the gateway — that is an
+explicit migrate. Leaving the key unset while the account already used Tor/I2P
+makes the sidecar refuse to boot.
+
+| Value | Requirements |
+| --- | --- |
+| `clearnet` | Default. Direct relays. |
+| `tor` | Sidecar built with the `tor` feature (source rebuild). Optional `tor_bridges` list. Bootstrap can take several seconds. |
+| `i2p` | Sidecar built with the `i2p` feature, plus a local I2P router with SAM (default `127.0.0.1:7656`). Optional `i2p_sam_port` / `i2p_only`. |
+
+Env overrides: `VECTOR_NETWORK`, `VECTOR_TOR_BRIDGES`, `VECTOR_I2P_SAM_PORT`,
+`VECTOR_I2P_ONLY`. Rebuild after enabling Tor/I2P in `bridge/Cargo.toml`
+(`cd bridge && cargo build --release --locked`); older clearnet-only prebuilts
+cannot switch networks.
 
 ## Display / tool progress
 

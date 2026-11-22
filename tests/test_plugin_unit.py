@@ -1867,13 +1867,70 @@ class TestInboundMapping:
             adapter._dispatch_sse_event(
                 {
                     "type": "message_delete",
-                    "data": {"id": "deadbeef", "chat_id": PEER_NPUB},
+                    "data": {
+                        "id": "deadbeef",
+                        "chat_id": PEER_NPUB,
+                        "by": PEER_NPUB,
+                        "moderated": False,
+                        "at": 1_700_000_000,
+                    },
                 }
             )
         )
         assert captured == []
         assert PEER_NPUB not in adapter._last_inbound_by_chat
         assert "deadbeef" in adapter._inbound_ids
+
+    def test_message_edit_records_without_a_turn(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._dispatch_sse_event(
+                {
+                    "type": "message_edit",
+                    "data": {
+                        "id": "msg-edit-1",
+                        "chat_id": PEER_NPUB,
+                        "text": "after",
+                        "previous_text": "before",
+                        "at": 2000,
+                    },
+                }
+            )
+        )
+        assert captured == []
+        assert adapter._last_inbound_by_chat[PEER_NPUB] == "msg-edit-1"
+
+    def test_reaction_removed_does_not_start_a_turn(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        adapter._remember_reaction_id("react-9")
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture  # type: ignore[method-assign]
+        asyncio.run(
+            adapter._dispatch_sse_event(
+                {
+                    "type": "reaction_removed",
+                    "data": {
+                        "id": "target-1",
+                        "chat_id": PEER_NPUB,
+                        "reaction_id": "react-9",
+                        "by": PEER_NPUB,
+                        "at": 99,
+                    },
+                }
+            )
+        )
+        assert captured == []
+        assert "react-9" not in adapter._seen_reaction_ids
 
     def test_operator_block_command_mutes_and_does_not_turn(
         self, monkeypatch, tmp_path

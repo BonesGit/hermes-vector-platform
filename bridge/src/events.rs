@@ -523,6 +523,110 @@ pub(crate) fn map_update(chat_id: &str, message: &Message) -> Option<MessageUpda
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageEditData {
+    pub id: String,
+    pub chat_id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub previous_text: String,
+    #[serde(default)]
+    pub at: u64,
+}
+
+impl MessageEditData {
+    fn sse_item(&self) -> SseItem {
+        SseItem::new(
+            Some(format!("edit:{}", self.id)),
+            json!({ "type": "message_edit", "data": self }).to_string(),
+        )
+    }
+}
+
+/// Content the message held before this edit. `edit_history` is
+/// `[base, …, previous, current]` after `apply_edit`, with `content`
+/// equal to the last entry.
+fn previous_edit_text(message: &Message) -> String {
+    let Some(history) = message.edit_history.as_ref() else {
+        return String::new();
+    };
+    if history.len() >= 2 {
+        return history[history.len() - 2].content.clone();
+    }
+    match history.first() {
+        Some(entry) if entry.content != message.content => entry.content.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Map an inbound edit. Same DM-only gate as reactions — Concord channel
+/// edits stay out of the SSE stream for now.
+pub(crate) fn map_edit(chat_id: &str, message: &Message, at: u64) -> Option<MessageEditData> {
+    if PublicKey::parse(chat_id.trim()).is_err() {
+        return None;
+    }
+    Some(MessageEditData {
+        id: message.id.clone(),
+        chat_id: chat_id.to_string(),
+        text: message.content.clone(),
+        previous_text: previous_edit_text(message),
+        at,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReactionRemovedData {
+    pub id: String,
+    pub chat_id: String,
+    pub reaction_id: String,
+    pub by: String,
+    #[serde(default)]
+    pub at: u64,
+    #[serde(default)]
+    pub npub: String,
+    #[serde(default)]
+    pub mine: bool,
+    #[serde(default)]
+    pub text: String,
+}
+
+impl ReactionRemovedData {
+    fn sse_item(&self) -> SseItem {
+        SseItem::new(
+            Some(format!("unreact:{}", self.reaction_id)),
+            json!({ "type": "reaction_removed", "data": self }).to_string(),
+        )
+    }
+}
+
+/// Map a DM reaction withdrawal. Non-DM chat ids are dropped — same gate
+/// as `map_update`, so a removal never arrives as `message_update`.
+pub(crate) fn map_reaction_removed(
+    chat_id: &str,
+    message: &Message,
+    reaction_id: &str,
+    by: &str,
+    at: u64,
+) -> Option<ReactionRemovedData> {
+    if PublicKey::parse(chat_id.trim()).is_err() {
+        return None;
+    }
+    if reaction_id.is_empty() {
+        return None;
+    }
+    Some(ReactionRemovedData {
+        id: message.id.clone(),
+        chat_id: chat_id.to_string(),
+        reaction_id: reaction_id.to_string(),
+        by: by.to_string(),
+        at,
+        npub: message.npub.clone().unwrap_or_else(|| chat_id.to_string()),
+        mine: message.mine,
+        text: message.content.clone(),
+    })
+}
+
 pub(crate) async fn handle_bot_event(
     state: &AppState,
     bot: &VectorBot,
@@ -597,16 +701,40 @@ pub(crate) async fn handle_bot_event(
                 state.events().publish(data.sse_item());
             }
         }
-        BotEvent::ReactionRemoved { .. } | BotEvent::Edit { .. } => {
-            // Withdrawals must not look like a new reaction. Edits are
-            // not a Hermes turn. Both are a later SSE type if we want them.
+        BotEvent::ReactionRemoved {
+            chat_id,
+            message,
+            reaction_id,
+            by,
+            at,
+        } => {
+            // Withdrawals must not look like a new reaction. SSE only;
+            // Python records and does not start a turn.
+            if let Some(data) = map_reaction_removed(&chat_id, &message, &reaction_id, &by, at) {
+                state.events().publish(data.sse_item());
+            }
+        }
+        BotEvent::Edit {
+            chat_id,
+            message,
+            at,
+        } => {
+            // Peer/bot edits are not a Hermes turn. SSE only so Python can
+            // record the new text.
+            if let Some(data) = map_edit(&chat_id, &message, at) {
+                state.events().publish(data.sse_item());
+            }
         }
         BotEvent::Delete {
             chat_id,
             message_id,
-            ..
+            by,
+            moderated,
+            at,
         } => {
-            state.events().publish(delete_item(&chat_id, &message_id));
+            state
+                .events()
+                .publish(delete_item(&chat_id, &message_id, by.as_deref(), moderated, at));
         }
         BotEvent::Invite { community_id } => {
             eprintln!(
@@ -681,7 +809,13 @@ fn community_joined_item(community_id: &str, name: &str, channels: Vec<Value>) -
     )
 }
 
-pub(crate) fn delete_item(chat_id: &str, message_id: &str) -> SseItem {
+pub(crate) fn delete_item(
+    chat_id: &str,
+    message_id: &str,
+    by: Option<&str>,
+    moderated: bool,
+    at: u64,
+) -> SseItem {
     SseItem::new(
         Some(format!("delete:{message_id}")),
         json!({
@@ -689,6 +823,9 @@ pub(crate) fn delete_item(chat_id: &str, message_id: &str) -> SseItem {
             "data": {
                 "id": message_id,
                 "chat_id": chat_id,
+                "by": by,
+                "moderated": moderated,
+                "at": at,
             }
         })
         .to_string(),
@@ -968,7 +1105,11 @@ mod tests {
 
     #[test]
     fn replay_keeps_items_without_meta() {
-        let planned = plan_replay(vec![delete_item("npub1peer", "gone")], NO_BUDGET, 60_000);
+        let planned = plan_replay(
+            vec![delete_item("npub1peer", "gone", None, false, 0)],
+            NO_BUDGET,
+            60_000,
+        );
         assert_eq!(planned.len(), 1);
         assert!(!is_superseded(&planned[0]), "deletes carry no turn");
     }
@@ -1028,12 +1169,24 @@ mod tests {
 
     #[test]
     fn delete_payload_has_chat_and_message_id() {
-        let item = delete_item("npub1peer", "deadbeef");
+        let item = delete_item("npub1peer", "deadbeef", Some("npub1mod"), true, 1_700_000_000);
         assert_eq!(item.id.as_deref(), Some("delete:deadbeef"));
         let payload: Value = serde_json::from_str(&item.payload).unwrap();
         assert_eq!(payload["type"], "message_delete");
         assert_eq!(payload["data"]["id"], "deadbeef");
         assert_eq!(payload["data"]["chat_id"], "npub1peer");
+        assert_eq!(payload["data"]["by"], "npub1mod");
+        assert_eq!(payload["data"]["moderated"], true);
+        assert_eq!(payload["data"]["at"], 1_700_000_000u64);
+    }
+
+    #[test]
+    fn delete_payload_allows_null_by() {
+        let item = delete_item("npub1peer", "deadbeef", None, false, 42);
+        let payload: Value = serde_json::from_str(&item.payload).unwrap();
+        assert!(payload["data"]["by"].is_null());
+        assert_eq!(payload["data"]["moderated"], false);
+        assert_eq!(payload["data"]["at"], 42u64);
     }
 
     #[test]
@@ -1175,6 +1328,78 @@ mod tests {
             emoji_url: None,
         });
         assert!(map_update("not-an-npub", &message).is_none());
+    }
+
+    #[test]
+    fn maps_dm_edit() {
+        use vector_sdk::EditEntry;
+        let peer = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+        let message = Message {
+            id: "msg-1".into(),
+            content: "after".into(),
+            edit_history: Some(vec![
+                EditEntry {
+                    content: "before".into(),
+                    edited_at: 1000,
+                },
+                EditEntry {
+                    content: "after".into(),
+                    edited_at: 2000,
+                },
+            ]),
+            ..Default::default()
+        };
+        let data = map_edit(peer, &message, 2000).expect("mapped");
+        assert_eq!(data.id, "msg-1");
+        assert_eq!(data.chat_id, peer);
+        assert_eq!(data.text, "after");
+        assert_eq!(data.previous_text, "before");
+        assert_eq!(data.at, 2000);
+        let payload: Value = serde_json::from_str(&data.sse_item().payload).unwrap();
+        assert_eq!(payload["type"], "message_edit");
+        assert_eq!(payload["data"]["text"], "after");
+        assert_eq!(payload["data"]["previous_text"], "before");
+    }
+
+    #[test]
+    fn skips_edit_for_community_channel_id() {
+        let message = Message {
+            id: "msg-1".into(),
+            content: "after".into(),
+            ..Default::default()
+        };
+        assert!(map_edit("not-an-npub", &message, 1).is_none());
+    }
+
+    #[test]
+    fn maps_dm_reaction_removed() {
+        let peer = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+        let message = Message {
+            id: "target-1".into(),
+            content: "hello".into(),
+            mine: true,
+            npub: Some(peer.into()),
+            ..Default::default()
+        };
+        let data = map_reaction_removed(peer, &message, "react-1", peer, 99).expect("mapped");
+        assert_eq!(data.reaction_id, "react-1");
+        assert_eq!(data.by, peer);
+        assert!(data.mine);
+        let payload: Value = serde_json::from_str(&data.sse_item().payload).unwrap();
+        assert_eq!(payload["type"], "reaction_removed");
+        assert_eq!(payload["data"]["reaction_id"], "react-1");
+        assert_eq!(payload["data"]["id"], "target-1");
+        assert_eq!(payload["data"]["by"], peer);
+    }
+
+    #[test]
+    fn skips_reaction_removed_without_id() {
+        let peer = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+        let message = Message {
+            id: "target-1".into(),
+            ..Default::default()
+        };
+        assert!(map_reaction_removed(peer, &message, "", peer, 1).is_none());
     }
 
     #[test]

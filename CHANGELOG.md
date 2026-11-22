@@ -22,8 +22,10 @@ installed.
   `nostr-connect` `0.45.2`, and `0.13.1` depends on `^0.45.3`. No `voice`,
   `whisper`, `xdc`, `i2p`, or `tor` feature.
 - **Peer reactions** still become SSE `message_update` and
-  `reaction:added:<emoji>`. Edits and reaction withdrawals do not start a
-  turn. `message_delete` is still id and chat id only.
+  `reaction:added:<emoji>`. Inbound edits emit SSE `message_edit` (id,
+  chat_id, text, previous_text); reaction withdrawals emit
+  `reaction_removed`. Neither starts a turn. `message_delete` now also
+  carries `by`, `moderated`, and `at` (Python still ignores the extras).
 - **Pictures the bot sends** are compressed by the SDK (fit to 2560px,
   metadata stripped). A picture that cannot be stripped is refused.
 - **A DM from the last five minutes** is a live Hermes turn, including one

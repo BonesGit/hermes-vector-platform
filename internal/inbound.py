@@ -193,6 +193,10 @@ class InboundDispatcher:
             await self.adapter._handle_message_event(data)
         elif event_type == "message_update":
             await self.adapter._handle_message_update(data)
+        elif event_type == "message_edit":
+            await self.adapter._handle_message_edit(data)
+        elif event_type == "reaction_removed":
+            await self.adapter._handle_reaction_removed(data)
         elif event_type == "message_delete":
             await self.adapter._handle_message_delete(data)
         elif event_type == "community_joined":
@@ -477,7 +481,11 @@ class InboundDispatcher:
         await self.adapter.handle_message(event)
 
     async def _handle_message_delete(self, msg_data: dict) -> None:
-        """Peer (or we) deleted a bubble. No Hermes turn — forget local pointers."""
+        """Peer (or we) deleted a bubble. No Hermes turn — forget local pointers.
+
+        Extra keys (``by``, ``moderated``, ``at``) are ignored until a tool
+        wants them.
+        """
         if (
             isinstance(msg_data, dict)
             and msg_data.get("type") == "message_delete"
@@ -507,6 +515,53 @@ class InboundDispatcher:
         logger.debug(
             "Vector: message deleted id=%s chat=%s",
             (msg_id or "")[:16],
+            _truncate_npub(chat_id) if chat_id else "",
+        )
+
+    async def _handle_message_edit(self, msg_data: dict) -> None:
+        """Peer (or we) edited a bubble. Record only — no Hermes turn."""
+        if (
+            isinstance(msg_data, dict)
+            and msg_data.get("type") == "message_edit"
+            and "data" in msg_data
+        ):
+            msg_data = msg_data["data"]
+        if not isinstance(msg_data, dict):
+            return
+        msg_id = str(msg_data.get("id") or "")
+        chat_id = str(msg_data.get("chat_id") or "")
+        text = str(msg_data.get("text") or "")
+        previous = str(msg_data.get("previous_text") or "")
+        if msg_id:
+            # Same id as the original rumor — keep last-inbound pointing at it.
+            self.adapter._record_last_inbound(chat_id, msg_id)
+        logger.debug(
+            "Vector: message edited id=%s chat=%s prev=%r new=%r",
+            (msg_id or "")[:16],
+            _truncate_npub(chat_id) if chat_id else "",
+            previous[:40],
+            text[:40],
+        )
+
+    async def _handle_reaction_removed(self, msg_data: dict) -> None:
+        """Peer withdrew a reaction. Record only — never ``reaction:added``."""
+        if (
+            isinstance(msg_data, dict)
+            and msg_data.get("type") == "reaction_removed"
+            and "data" in msg_data
+        ):
+            msg_data = msg_data["data"]
+        if not isinstance(msg_data, dict):
+            return
+        reaction_id = str(msg_data.get("reaction_id") or "")
+        chat_id = str(msg_data.get("chat_id") or "")
+        by = str(msg_data.get("by") or "")
+        if reaction_id:
+            self.adapter._seen_reaction_ids.pop(reaction_id, None)
+        logger.debug(
+            "Vector: reaction removed id=%s by=%s chat=%s",
+            (reaction_id or "")[:16],
+            _truncate_npub(by) if by else "",
             _truncate_npub(chat_id) if chat_id else "",
         )
 

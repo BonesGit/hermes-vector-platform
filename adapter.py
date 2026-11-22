@@ -1993,6 +1993,14 @@ class VectorAdapter(BasePlatformAdapter):
         return await self._inbound._handle_message_delete(*args, **kwargs)
 
 
+    async def _handle_message_edit(self, *args, **kwargs):
+        return await self._inbound._handle_message_edit(*args, **kwargs)
+
+
+    async def _handle_reaction_removed(self, *args, **kwargs):
+        return await self._inbound._handle_reaction_removed(*args, **kwargs)
+
+
     async def _handle_message_update(self, *args, **kwargs):
         return await self._inbound._handle_message_update(*args, **kwargs)
 

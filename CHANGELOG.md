@@ -19,8 +19,12 @@ installed.
 - **SDK pin.** `vector_sdk` `=0.14.0` (publish SHA `fd474f2d`, on
   VectorPrivacy/Vector). `vector-core` `0.13.1` (publish SHA `854c594`, not
   on that repo) is what the lock uses: `0.13.0` exact-pinned yanked
-  `nostr-connect` `0.45.2`, and `0.13.1` depends on `^0.45.3`. No `voice`,
-  `whisper`, `xdc`, `i2p`, or `tor` feature.
+  `nostr-connect` `0.45.2`, and `0.13.1` depends on `^0.45.3`. Features
+  `tor` and `i2p` are on; `voice` / `whisper` / `xdc` stay off.
+- **Network transport.** `vector.network` (`clearnet` \| `tor` \| `i2p`) maps
+  to an explicit SDK builder call on every boot. Sticky per bot account;
+  switch by changing the key and restarting. Optional `tor_bridges`,
+  `i2p_sam_port`, `i2p_only`.
 - **Peer reactions** still become SSE `message_update` and
   `reaction:added:<emoji>`. Inbound edits emit SSE `message_edit` (id,
   chat_id, text, previous_text); reaction withdrawals emit

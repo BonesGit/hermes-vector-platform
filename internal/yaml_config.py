@@ -258,6 +258,43 @@ def _apply_yaml_config(yaml_cfg: dict, vector_cfg: dict) -> Optional[dict]:
             seeded["bot_banner"] = banner
             _set_env_if_unset("VECTOR_BOT_BANNER", banner, skip=skip)
 
+    network = str(vector_cfg.get("network") or "").strip().lower()
+    if network:
+        if network not in ("clearnet", "tor", "i2p"):
+            logger.warning(
+                "Vector: ignoring vector.network=%r (want clearnet, tor, or i2p)",
+                vector_cfg.get("network"),
+            )
+        else:
+            seeded["network"] = network
+            _set_env_if_unset("VECTOR_NETWORK", network, skip=skip)
+            if network == "tor":
+                bridges = vector_cfg.get("tor_bridges")
+                if isinstance(bridges, list):
+                    joined = "\n".join(
+                        str(line).strip() for line in bridges if str(line).strip()
+                    )
+                else:
+                    joined = str(bridges or "").strip()
+                if joined:
+                    seeded["tor_bridges"] = joined
+                    _set_env_if_unset("VECTOR_TOR_BRIDGES", joined, skip=skip)
+            if network == "i2p":
+                sam = _yaml_count(vector_cfg.get("i2p_sam_port"))
+                if sam is not None and 1 <= int(sam) <= 65535:
+                    seeded["i2p_sam_port"] = sam
+                    _set_env_if_unset("VECTOR_I2P_SAM_PORT", sam, skip=skip)
+                elif vector_cfg.get("i2p_sam_port") is not None:
+                    logger.warning(
+                        "Vector: ignoring vector.i2p_sam_port=%r (want 1–65535)",
+                        vector_cfg.get("i2p_sam_port"),
+                    )
+                if "i2p_only" in vector_cfg:
+                    only = _yaml_on_off(vector_cfg.get("i2p_only"))
+                    if only is not None:
+                        seeded["i2p_only"] = only
+                        _set_env_if_unset("VECTOR_I2P_ONLY", only, skip=skip)
+
     if "reactions" in vector_cfg:
         reactions = _yaml_on_off(vector_cfg.get("reactions"))
         if reactions is not None:

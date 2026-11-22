@@ -109,6 +109,10 @@ def _rewrite_sidecar_profile_env(env: Dict[str, str]) -> None:
 def _overlay_sidecar_extra_env(env: Dict[str, str], extra: dict) -> None:
     """Copy YAML-seeded extra flags into sidecar env when unset."""
     mapping = (
+        ("VECTOR_NETWORK", "network"),
+        ("VECTOR_TOR_BRIDGES", "tor_bridges"),
+        ("VECTOR_I2P_SAM_PORT", "i2p_sam_port"),
+        ("VECTOR_I2P_ONLY", "i2p_only"),
         ("VECTOR_INVITE_POLICY", "invite_policy"),
         ("VECTOR_TRUSTED_INVITERS", "trusted_inviters"),
         ("VECTOR_SLASH_COMMANDS", "slash_commands"),

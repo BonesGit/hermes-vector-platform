@@ -4581,6 +4581,40 @@ class TestApplyYamlConfig:
         assert seeded["bot_name"] == "FromYaml"
         assert os.environ["VECTOR_BOT_NAME"] == "FromEnv"
 
+    def test_network_block_seeds_env(self, monkeypatch):
+        keys = (
+            "VECTOR_NETWORK",
+            "VECTOR_TOR_BRIDGES",
+            "VECTOR_I2P_SAM_PORT",
+            "VECTOR_I2P_ONLY",
+        )
+        for key in keys:
+            monkeypatch.delenv(key, raising=False)
+        seeded = vector_adapter._apply_yaml_config(
+            {},
+            {
+                "network": "tor",
+                "tor_bridges": ["1.2.3.4:443 fingerprint"],
+            },
+        )
+        assert seeded["network"] == "tor"
+        assert "1.2.3.4:443 fingerprint" in seeded["tor_bridges"]
+        assert os.environ["VECTOR_NETWORK"] == "tor"
+        for key in keys:
+            monkeypatch.delenv(key, raising=False)
+        seeded_i2p = vector_adapter._apply_yaml_config(
+            {},
+            {"network": "i2p", "i2p_sam_port": 7656, "i2p_only": True},
+        )
+        assert seeded_i2p["network"] == "i2p"
+        assert seeded_i2p["i2p_sam_port"] == "7656"
+        assert seeded_i2p["i2p_only"] == "on"
+        assert os.environ["VECTOR_NETWORK"] == "i2p"
+        for key in keys:
+            monkeypatch.delenv(key, raising=False)
+        bad = vector_adapter._apply_yaml_config({}, {"network": "both"})
+        assert bad is None or "network" not in (bad or {})
+
     def test_replay_block_seeds_env(self, monkeypatch):
         monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX", raising=False)
         monkeypatch.delenv("VECTOR_SSE_REPLAY_MAX_AGE_SECS", raising=False)

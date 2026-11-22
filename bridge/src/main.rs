@@ -22,7 +22,7 @@ use nostr::nips::nip06::FromMnemonic;
 use serde_json::json;
 use tokio::sync::watch;
 use vector_sdk::nostr::{FromBech32, Keys, PublicKey, SecretKey, ToBech32};
-use vector_sdk::{InvitePolicy, VectorBot};
+use vector_sdk::{I2pOptions, InvitePolicy, VectorBot, VectorBotBuilder};
 
 use crate::api::{router, stub_npub, AppState};
 
@@ -386,12 +386,19 @@ async fn wait_stop(mut rx: watch::Receiver<Stop>) -> Stop {
 
 fn spawn_vector_bot(state: AppState, data_dir: PathBuf, stop_tx: watch::Sender<Stop>) {
     tokio::spawn(async move {
-        match VectorBot::builder()
-            .data_dir(&data_dir)
-            .invite_policy(invite_policy_from_env())
-            .build()
-            .await
-        {
+        let builder = match apply_network_from_env(
+            VectorBot::builder()
+                .data_dir(&data_dir)
+                .invite_policy(invite_policy_from_env()),
+        ) {
+            Ok(b) => b,
+            Err(err) => {
+                eprintln!("[vector-bridge] network config: {err}");
+                request_stop(&stop_tx, Stop::LoginFailed);
+                return;
+            }
+        };
+        match builder.build().await {
             Ok(bot) => {
                 state.set_bot(bot.clone()).await;
                 // /health ready as soon as the bot identity is loaded. Do not
@@ -590,6 +597,82 @@ async fn wait_shutdown(watch_stdin: bool) {
     }
 }
 
+/// Transport for this bot account. Always set explicitly — an account that
+/// previously used Tor/I2P refuses a silent clearnet boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkKind {
+    Clearnet,
+    Tor,
+    I2p,
+}
+
+fn parse_network(raw: &str) -> Result<NetworkKind, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "clearnet" => Ok(NetworkKind::Clearnet),
+        "tor" => Ok(NetworkKind::Tor),
+        "i2p" => Ok(NetworkKind::I2p),
+        other => Err(format!(
+            "VECTOR_NETWORK={other:?} invalid; want clearnet, tor, or i2p"
+        )),
+    }
+}
+
+fn tor_bridges_from_env() -> Vec<String> {
+    let Ok(raw) = std::env::var("VECTOR_TOR_BRIDGES") else {
+        return Vec::new();
+    };
+    raw.split(|c| c == '\n' || c == ',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn apply_network_from_env(builder: VectorBotBuilder) -> Result<VectorBotBuilder, String> {
+    let kind = parse_network(&std::env::var("VECTOR_NETWORK").unwrap_or_default())?;
+    match kind {
+        NetworkKind::Clearnet => {
+            eprintln!("[vector-bridge] network=clearnet");
+            Ok(builder.clearnet())
+        }
+        NetworkKind::Tor => {
+            let bridges = tor_bridges_from_env();
+            if bridges.is_empty() {
+                eprintln!("[vector-bridge] network=tor");
+                Ok(builder.tor())
+            } else {
+                eprintln!(
+                    "[vector-bridge] network=tor ({} bridge line{})",
+                    bridges.len(),
+                    if bridges.len() == 1 { "" } else { "s" }
+                );
+                Ok(builder.tor_bridges(bridges))
+            }
+        }
+        NetworkKind::I2p => {
+            let mut opts = I2pOptions::default();
+            if let Ok(raw) = std::env::var("VECTOR_I2P_SAM_PORT") {
+                let port: u16 = raw
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("VECTOR_I2P_SAM_PORT={raw:?} invalid; want 1–65535"))?;
+                opts.sam_port = port;
+            }
+            if let Ok(raw) = std::env::var("VECTOR_I2P_ONLY") {
+                let v = raw.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+                    opts.i2p_only = true;
+                }
+            }
+            eprintln!(
+                "[vector-bridge] network=i2p (sam_port={} i2p_only={})",
+                opts.sam_port, opts.i2p_only
+            );
+            Ok(builder.i2p_with(opts))
+        }
+    }
+}
+
 /// Community invite policy from env. Never `.public()` — a public bot is a
 /// spam surface. Default is whitelist of `VECTOR_TRUSTED_INVITERS`, falling
 /// back to `VECTOR_ALLOWED_USERS`. Empty list or `VECTOR_INVITE_POLICY=manual`
@@ -776,5 +859,14 @@ mod invite_policy_tests {
     fn public_mode_is_refused() {
         let policy = invite_policy_from_parts("public", None, Some(NPUB.into()));
         assert!(whitelist(&policy).is_some());
+    }
+
+    #[test]
+    fn network_defaults_to_clearnet() {
+        assert_eq!(parse_network("").unwrap(), NetworkKind::Clearnet);
+        assert_eq!(parse_network("clearnet").unwrap(), NetworkKind::Clearnet);
+        assert_eq!(parse_network("TOR").unwrap(), NetworkKind::Tor);
+        assert_eq!(parse_network("i2p").unwrap(), NetworkKind::I2p);
+        assert!(parse_network("both").is_err());
     }
 }

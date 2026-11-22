@@ -41,6 +41,10 @@ impl SeenMark {
     }
 }
 
+fn should_skip_missed(mark: Option<&SeenMark>, msg: &Message) -> bool {
+    mark.is_some_and(|mark| !mark.precedes(msg))
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct SeenFile {
     #[serde(default)]
@@ -197,6 +201,13 @@ pub async fn ack_missed_while_down(bot: &VectorBot, data_dir: &Path) {
                 let missed = missed_inbound(&history, Some(&last), ready_at_ms);
                 let mut advanced = last;
                 for msg in missed {
+                    let already_live = {
+                        let _g = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                        should_skip_missed(load_seen(data_dir).chats.get(&npub), msg)
+                    };
+                    if already_live {
+                        continue;
+                    }
                     if let Err(err) = bot.dm(&npub).react(&msg.id, &emoji).await {
                         eprintln!(
                             "[vector-bridge] missed-react failed chat={} id={}: {err}",
@@ -277,6 +288,27 @@ mod tests {
         let n = newest_inbound(&msgs).unwrap();
         assert_eq!(n.id, "c");
         assert_eq!(n.at_ms, 20);
+    }
+
+    #[test]
+    fn skips_when_mark_is_this_message_or_newer() {
+        let msg = msg("b", 20, false);
+        let same = SeenMark {
+            at_ms: 20,
+            id: "b".into(),
+        };
+        let newer = SeenMark {
+            at_ms: 30,
+            id: "c".into(),
+        };
+        let older = SeenMark {
+            at_ms: 10,
+            id: "a".into(),
+        };
+        assert!(should_skip_missed(Some(&same), &msg));
+        assert!(should_skip_missed(Some(&newer), &msg));
+        assert!(!should_skip_missed(Some(&older), &msg));
+        assert!(!should_skip_missed(None, &msg));
     }
 
     #[test]

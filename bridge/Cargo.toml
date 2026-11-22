@@ -14,14 +14,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 # nip06: Keys::from_mnemonic (--mnemonic-file / create). Not re-exported by vector_sdk::nostr.
-nostr = { version = "=0.45.1", default-features = false, features = ["std", "nip06"] }
+# Caret so it unifies with vector_sdk 0.14's nostr-sdk. Do not use
+# Vector's git nostr fork.
+nostr = { version = "0.45.7", default-features = false, features = ["std", "nip06"] }
 # Generate a 12-word BIP-39 phrase on --setup create (NIP-06). Same crate nostr 0.45 uses.
 bip39 = { version = "=2.2.2", default-features = false, features = ["std", "rand"] }
-# crates.io crate name uses an underscore. Exact-pin 0.9.0: that publish's
-# .cargo_vcs_info.json SHA (b9aeb8d5) is an ancestor of VectorPrivacy/Vector
-# master. crates.io 0.10.0 was published from 7bf7d335, which is not on that
-# remote — do not take it.
-vector_sdk = "=0.9.0"
+# crates.io crate name uses an underscore. Exact-pin 0.14.0
+# (publish SHA fd474f2d308c2d1b09bec655631aa61f96a09386, on
+# VectorPrivacy/Vector). Lock resolves vector-core 0.13.1, whose
+# nostr-connect is ^0.45.3. 0.13.1's publish SHA 854c594 is not on that
+# repo; taken so the yanked nostr-connect 0.45.2 pin is gone.
+# No features: voice/whisper/xdc/i2p/tor stay off.
+vector_sdk = "=0.14.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

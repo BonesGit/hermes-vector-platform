@@ -120,8 +120,6 @@ async fn publish_interface_manifest() -> Result<(), String> {
     for id in vector_sdk::vector_core::db::community::list_community_ids().unwrap_or_default() {
         if let Ok(Some(c)) = vector_sdk::vector_core::db::community::load_community_v2(&id) {
             relays.extend(c.relays.clone());
-        } else if let Ok(Some(c)) = vector_sdk::vector_core::db::community::load_community(&id) {
-            relays.extend(c.relays.clone());
         }
     }
     relays.sort();

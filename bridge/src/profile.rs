@@ -268,7 +268,11 @@ pub(crate) async fn apply_own_profile(
 ) -> bool {
     let avatar = resolve_public_image_url(bot, avatar_path, data_dir, ImageSlot::Avatar).await;
     let banner = resolve_public_image_url(bot, banner_path, data_dir, ImageSlot::Banner).await;
-    if !bot.update_profile(name, &avatar, &banner, about).await {
+    if bot
+        .update_profile(name, &avatar, &banner, about)
+        .await
+        .is_err()
+    {
         eprintln!("[vector-bridge] update_profile failed");
         return false;
     }

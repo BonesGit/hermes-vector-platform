@@ -889,16 +889,17 @@ async fn block_user(
         if same_pubkey(&npub, &bot.npub()) {
             return Err(ApiError::bad_request("cannot block self"));
         }
-        let ok = if req.unblock {
+        let blocked = if req.unblock {
             bot.unblock(&npub).await
         } else {
             bot.block(&npub).await
         };
-        if !req.unblock && !ok {
+        // Unblock of an unknown npub used to be `false` and still 200.
+        // Err on unblock stays 200. Err on block is a real failure.
+        if !req.unblock && blocked.is_err() {
             eprintln!("[vector-bridge] block failed npub={npub}");
             return Err(ApiError::internal());
         }
-        // Unblock of an unknown npub is false from the SDK — still 200.
     }
     Ok(Json(
         json!({ "ok": true, "npub": npub, "blocked": !req.unblock }),
@@ -1114,6 +1115,9 @@ async fn channel_history(
     let before = history_before_cursor(&query)?;
     let channel_id = channel_id.to_ascii_lowercase();
     let messages = if let Some(bot) = state.bot().await {
+        if !bot_holds_channel(&bot, &channel_id).await {
+            return Ok(Json(json!({ "messages": [] })));
+        }
         let page = match &before {
             Some(cursor) => bot.channel(&channel_id).history_before(cursor, limit).await,
             None => bot.channel(&channel_id).history(limit).await,
@@ -1126,6 +1130,20 @@ async fn channel_history(
         state.stub_channel_history(&channel_id, limit, cursor)
     };
     Ok(Json(json!({ "messages": messages })))
+}
+
+async fn bot_holds_channel(bot: &VectorBot, channel_id: &str) -> bool {
+    for community in bot.communities().await {
+        if community
+            .channels()
+            .await
+            .iter()
+            .any(|ch| ch.id() == channel_id)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn test_ready(State(state): State<AppState>, _auth: Auth) -> Json<Value> {

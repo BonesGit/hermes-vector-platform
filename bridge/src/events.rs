@@ -504,8 +504,8 @@ impl MessageUpdateData {
     }
 }
 
-/// Map a DM `MessageUpdate` (reaction/edit snapshot). Non-DM chat ids (Concord
-/// channel ids) are dropped — v1 is DM-only.
+/// Map a DM reaction snapshot. Non-DM chat ids (Concord channel ids) are
+/// dropped — v1 is DM-only.
 pub(crate) fn map_update(chat_id: &str, message: &Message) -> Option<MessageUpdateData> {
     if PublicKey::parse(chat_id.trim()).is_err() {
         return None;
@@ -582,14 +582,29 @@ pub(crate) async fn handle_bot_event(
                 state.events().publish(item);
             }
         }
-        BotEvent::MessageUpdate { chat_id, message } => {
+        BotEvent::Reaction {
+            chat_id,
+            message,
+            reaction,
+            ..
+        } => {
+            // Python reads reactions[-1] as the one just added. The SDK
+            // snapshot order is not that contract, so the new reaction
+            // is the only row we forward.
+            let mut message = message;
+            message.reactions = vec![reaction];
             if let Some(data) = map_update(&chat_id, &message) {
                 state.events().publish(data.sse_item());
             }
         }
+        BotEvent::ReactionRemoved { .. } | BotEvent::Edit { .. } => {
+            // Withdrawals must not look like a new reaction. Edits are
+            // not a Hermes turn. Both are a later SSE type if we want them.
+        }
         BotEvent::Delete {
             chat_id,
             message_id,
+            ..
         } => {
             state.events().publish(delete_item(&chat_id, &message_id));
         }

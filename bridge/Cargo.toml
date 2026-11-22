@@ -26,6 +26,7 @@ bip39 = { version = "=2.2.2", default-features = false, features = ["std", "rand
 # repo; taken so the yanked nostr-connect 0.45.2 pin is gone.
 # No features: voice/whisper/xdc/i2p/tor stay off.
 vector_sdk = "=0.14.0"
+base64 = "0.22"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

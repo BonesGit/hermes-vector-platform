@@ -23,11 +23,13 @@ use tokio::sync::RwLock;
 use vector_sdk::nostr::{PublicKey, ToBech32};
 use vector_sdk::vector_core::db::community::delete_pending_invite;
 use vector_sdk::vector_core::deletion::delete_own_reaction;
-use vector_sdk::{Attachment, Cursor, Message, SlimProfile, VectorBot};
+use vector_sdk::{Attachment, Cursor, Message, PostOptions, SlimProfile, VectorBot};
 
 use crate::events::{self, EventHub, SseItem};
 
 pub const MAX_BODY: usize = 64 * 1024;
+/// `/send-file` may carry base64 file bytes; keep text routes at `MAX_BODY`.
+pub const MAX_FILE_BODY: usize = 16 * 1024 * 1024;
 pub const TOKEN_HEADER: &str = "x-hermes-sidecar-token";
 const STUB_NPUB: &str = "npub1stub";
 pub(crate) const HISTORY_LIMIT_MAX: usize = 50;
@@ -232,7 +234,10 @@ pub fn router(state: AppState) -> Router {
         .route("/communities/invite", post(invite_to_community))
         .route("/profile", post(profile).get(get_profile))
         .route("/react", post(react))
-        .route("/send-file", post(send_file))
+        .route(
+            "/send-file",
+            post(send_file).layer(DefaultBodyLimit::max(MAX_FILE_BODY)),
+        )
         .route("/download-attachment", post(download_attachment))
         .route("/block", post(block_user).get(list_blocked))
         .route("/delete", post(delete_message))
@@ -277,23 +282,44 @@ where
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let bytes = match axum::body::Bytes::from_request(req, state).await {
-            Ok(b) => b,
-            Err(rej) => {
-                let status = rej.into_response().status();
-                if status == StatusCode::PAYLOAD_TOO_LARGE {
-                    return Err(ApiError::payload_too_large());
-                }
-                return Err(ApiError::bad_request("failed to read body"));
-            }
-        };
-        if bytes.len() > MAX_BODY {
-            return Err(ApiError::payload_too_large());
-        }
-        serde_json::from_slice(&bytes)
-            .map(JsonBody)
-            .map_err(|_| ApiError::bad_request("invalid json"))
+        json_body(req, state, MAX_BODY).await.map(JsonBody)
     }
+}
+
+/// Like [`JsonBody`], but allows up to [`MAX_FILE_BODY`] for `/send-file`.
+pub struct FileJsonBody<T>(pub T);
+
+impl<T, S> FromRequest<S> for FileJsonBody<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        json_body(req, state, MAX_FILE_BODY).await.map(FileJsonBody)
+    }
+}
+
+async fn json_body<T, S>(req: Request, state: &S, max: usize) -> Result<T, ApiError>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    let bytes = match axum::body::Bytes::from_request(req, state).await {
+        Ok(b) => b,
+        Err(rej) => {
+            let status = rej.into_response().status();
+            if status == StatusCode::PAYLOAD_TOO_LARGE {
+                return Err(ApiError::payload_too_large());
+            }
+            return Err(ApiError::bad_request("failed to read body"));
+        }
+    };
+    if bytes.len() > max {
+        return Err(ApiError::payload_too_large());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ApiError::bad_request("invalid json"))
 }
 
 #[derive(Debug)]
@@ -436,6 +462,21 @@ struct SendRequest {
     body: String,
     #[serde(default)]
     reply_to: Option<String>,
+    /// Seconds until the message expires (NIP-40). Community channels only;
+    /// DMs refuse.
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+fn text_post_options(reply_to: Option<&str>, expires_in: Option<u64>) -> PostOptions {
+    let mut opts = PostOptions::default();
+    if let Some(id) = reply_to.map(str::trim).filter(|s| !s.is_empty()) {
+        opts = opts.reply_to(id);
+    }
+    if let Some(secs) = expires_in.filter(|s| *s > 0) {
+        opts = opts.expires_in(secs);
+    }
+    opts
 }
 
 async fn send(
@@ -446,15 +487,15 @@ async fn send(
     let to = parse_send_target(&req.to)?;
     state.require_ready().await?;
     if let Some(bot) = state.bot().await {
-        let channel = bot.channel(&to);
-        let result = match req.reply_to.as_deref() {
-            Some(id) if !id.is_empty() => channel.reply(id, &req.body).await,
-            _ => channel.send(&req.body).await,
-        };
-        let id = result.map_err(|err| {
-            eprintln!("[vector-bridge] send failed: {err}");
-            ApiError::internal()
-        })?;
+        let opts = text_post_options(req.reply_to.as_deref(), req.expires_in);
+        let id = bot
+            .channel(&to)
+            .post(&req.body, opts)
+            .await
+            .map_err(|err| {
+                eprintln!("[vector-bridge] send failed: {err}");
+                ApiError::internal()
+            })?;
         Ok(Json(json!({ "id": id })))
     } else {
         Ok(Json(json!({ "id": state.next_event_id() })))
@@ -777,31 +818,135 @@ async fn profile(
 #[derive(Deserialize)]
 struct SendFileRequest {
     to: String,
-    path: String,
+    /// Absolute path on disk. Mutually exclusive with `bytes`.
+    #[serde(default)]
+    path: Option<String>,
+    /// Base64 file bytes held in memory. Mutually exclusive with `path`.
+    #[serde(default)]
+    bytes: Option<String>,
+    /// Required when `bytes` is set; extension selects the type.
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
+    /// Community only; DMs refuse expiry.
+    #[serde(default)]
+    expires_in: Option<u64>,
+    /// Caption under the file (community) or as a reply to it (DM).
+    #[serde(default)]
+    caption: Option<String>,
+    /// Picture compression. Default true (SDK fits/strips). `false` sends
+    /// image bytes unchanged.
+    #[serde(default = "default_compress")]
+    compress: bool,
+}
+
+fn default_compress() -> bool {
+    true
+}
+
+fn file_post_options(req: &SendFileRequest) -> PostOptions {
+    let mut opts = PostOptions::default().compress(req.compress);
+    if let Some(id) = req
+        .reply_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        opts = opts.reply_to(id);
+    }
+    if let Some(secs) = req.expires_in.filter(|s| *s > 0) {
+        opts = opts.expires_in(secs);
+    }
+    if let Some(cap) = req
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        opts = opts.caption(cap);
+    }
+    opts
 }
 
 async fn send_file(
     State(state): State<AppState>,
     _auth: Auth,
-    JsonBody(req): JsonBody<SendFileRequest>,
+    FileJsonBody(req): FileJsonBody<SendFileRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let to = parse_send_target(&req.to)?;
     state.require_ready().await?;
-    let path = PathBuf::from(&req.path);
-    if !path.is_absolute() || !path.is_file() {
-        return Err(ApiError::bad_request(
-            "path must be an existing absolute file",
-        ));
+    let path = req.path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let bytes_b64 = req.bytes.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match (path, bytes_b64) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "provide path or bytes, not both",
+            ));
+        }
+        (None, None) => {
+            return Err(ApiError::bad_request("path or bytes is required"));
+        }
+        _ => {}
     }
+    let path_buf = if let Some(raw) = path {
+        let path = PathBuf::from(raw);
+        if !path.is_absolute() || !path.is_file() {
+            return Err(ApiError::bad_request(
+                "path must be an existing absolute file",
+            ));
+        }
+        Some(path)
+    } else {
+        None
+    };
+    let decoded_bytes = if let Some(raw) = bytes_b64 {
+        let filename = req
+            .filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::bad_request("filename is required with bytes"))?;
+        Some((decode_base64_file(raw)?, filename.to_string()))
+    } else {
+        None
+    };
+    let opts = file_post_options(&req);
     if let Some(bot) = state.bot().await {
-        let id = bot.channel(&to).send_file(&path).await.map_err(|err| {
-            eprintln!("[vector-bridge] send_file failed: {err}");
-            ApiError::internal()
-        })?;
+        let channel = bot.channel(&to);
+        let id = if let Some((bytes, filename)) = decoded_bytes {
+            channel
+                .send_bytes(bytes, &filename, opts)
+                .await
+                .map_err(|err| {
+                    eprintln!("[vector-bridge] send_file bytes failed: {err}");
+                    ApiError::internal()
+                })?
+        } else {
+            channel
+                .send_file_with(path_buf.as_ref().unwrap(), opts)
+                .await
+                .map_err(|err| {
+                    eprintln!("[vector-bridge] send_file failed: {err}");
+                    ApiError::internal()
+                })?
+        };
         Ok(Json(json!({ "id": id })))
     } else {
         Ok(Json(json!({ "id": state.next_event_id() })))
     }
+}
+
+fn decode_base64_file(raw: &str) -> Result<Vec<u8>, ApiError> {
+    use base64::Engine;
+    let trimmed = raw
+        .strip_prefix("data:")
+        .and_then(|s| s.split_once(',').map(|(_, b)| b))
+        .unwrap_or(raw);
+    base64::engine::general_purpose::STANDARD
+        .decode(trimmed.trim())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed.trim()))
+        .map_err(|_| ApiError::bad_request("bytes must be base64"))
 }
 
 #[derive(Deserialize)]

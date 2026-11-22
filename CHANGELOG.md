@@ -27,7 +27,13 @@ installed.
   `reaction_removed`. Neither starts a turn. `message_delete` now also
   carries `by`, `moderated`, and `at` (Python still ignores the extras).
 - **Pictures the bot sends** are compressed by the SDK (fit to 2560px,
-  metadata stripped). A picture that cannot be stripped is refused.
+  metadata stripped) unless `/send-file` sets `compress: false`. A picture
+  that cannot be stripped is refused when compression is on.
+- **Richer sends.** `POST /send` accepts `expires_in` (community NIP-40
+  expiry) via `Channel::post`. `POST /send-file` accepts `reply_to`,
+  `caption`, `expires_in`, `compress`, and in-memory `bytes`+`filename`
+  (base64, up to 16 MiB). Python passes caption/reply on the file request
+  and reads `expires_in` / `compress` from send metadata.
 - **A DM from the last five minutes** is a live Hermes turn, including one
   sent while the gateway was down. Older missed DMs are still ❌ and no
   turn.

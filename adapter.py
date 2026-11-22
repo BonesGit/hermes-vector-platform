@@ -333,6 +333,27 @@ def _ensure_hermes_connect_timeout_floor() -> None:
 # Sidecar clamps Channel::history / history_before to this page size.
 
 
+def _metadata_expires_in(metadata: Optional[Dict[str, Any]]) -> Optional[int]:
+    """Optional NIP-40 expiry seconds from send metadata (community only)."""
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("expires_in")
+    if raw is None or raw is False:
+        return None
+    try:
+        secs = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return secs if secs > 0 else None
+
+
+def _metadata_compress(metadata: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Optional picture-compress override; ``None`` keeps the SDK default."""
+    if not isinstance(metadata, dict) or "compress" not in metadata:
+        return None
+    return bool(metadata.get("compress"))
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -701,6 +722,9 @@ class VectorAdapter(BasePlatformAdapter):
         payload: Dict[str, Any] = {"to": chat_id, "body": content}
         if reply_to:
             payload["reply_to"] = reply_to
+        expires_in = _metadata_expires_in(metadata)
+        if expires_in is not None:
+            payload["expires_in"] = expires_in
 
         try:
             resp = await self._http_client.post(
@@ -1934,10 +1958,23 @@ class VectorAdapter(BasePlatformAdapter):
             logger.warning("Vector: refusing unsafe outbound path")
             return SendResult(success=False, error="unsafe media path", retryable=False)
         to = _send_target(chat_id)
+        payload: Dict[str, Any] = {"to": to, "path": safe}
+        if reply_to:
+            payload["reply_to"] = reply_to
+        if caption and str(caption).strip():
+            # Sidecar/SDK: community caption on the file; DM caption as a
+            # reply to the file. Do not POST /send separately.
+            payload["caption"] = str(caption).strip()
+        expires_in = _metadata_expires_in(metadata)
+        if expires_in is not None:
+            payload["expires_in"] = expires_in
+        compress = _metadata_compress(metadata)
+        if compress is not None:
+            payload["compress"] = compress
         try:
             resp = await self._http_client.post(
                 f"{self.bridge_url}/send-file",
-                json={"to": to, "path": safe},
+                json=payload,
                 headers=self._token_headers(),
                 timeout=SEND_FILE_TIMEOUT,
             )
@@ -1957,15 +1994,6 @@ class VectorAdapter(BasePlatformAdapter):
         file_id = None
         if isinstance(data, dict):
             file_id = data.get("id") or data.get("messageId")
-        if caption and str(caption).strip():
-            cap = await self.send(
-                chat_id=to,
-                content=str(caption).strip(),
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-            if not cap.success:
-                logger.warning("Vector: file sent but caption failed: %s", cap.error)
         self._record_sent_message(file_id)
         return SendResult(success=True, message_id=file_id, raw_response=data)
 

@@ -6217,12 +6217,22 @@ class TestOutboundFiles:
 
         adapter._http_client = _Client()
         result = asyncio.run(
-            adapter.send_document(PEER_NPUB, str(payload), caption="here")
+            adapter.send_document(
+                PEER_NPUB,
+                str(payload),
+                caption="here",
+                reply_to="parent-1",
+                metadata={"compress": False, "expires_in": 120},
+            )
         )
         assert result.success
-        assert any(p["url"].endswith("/send-file") for p in posts)
+        assert len(posts) == 1
+        assert posts[0]["url"].endswith("/send-file")
         assert posts[0]["json"]["path"] == str(payload)
-        assert any(p["url"].endswith("/send") for p in posts)
+        assert posts[0]["json"]["caption"] == "here"
+        assert posts[0]["json"]["reply_to"] == "parent-1"
+        assert posts[0]["json"]["compress"] is False
+        assert posts[0]["json"]["expires_in"] == 120
 
     def test_send_document_to_channel_posts_channel_id(self, monkeypatch, tmp_path):
         adapter = _make_adapter(monkeypatch, tmp_path)
@@ -6254,10 +6264,11 @@ class TestOutboundFiles:
             adapter.send_document(CHANNEL_ID, str(payload), caption="here")
         )
         assert result.success
-        file_post = next(p for p in posts if p["url"].endswith("/send-file"))
-        cap_post = next(p for p in posts if p["url"].endswith("/send"))
+        assert len(posts) == 1
+        file_post = posts[0]
+        assert file_post["url"].endswith("/send-file")
         assert file_post["json"]["to"] == CHANNEL_ID
-        assert cap_post["json"]["to"] == CHANNEL_ID
+        assert file_post["json"]["caption"] == "here"
         assert not file_post["json"]["to"].startswith("npub1")
 
 

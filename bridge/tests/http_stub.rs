@@ -744,6 +744,71 @@ fn send_file_stub_requires_absolute_file() {
 }
 
 #[test]
+fn send_file_stub_accepts_bytes_and_opts() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let (status, body) = post(
+        &server,
+        "/send-file",
+        Some(&server.token),
+        json!({
+            "to": VALID_NPUB,
+            "bytes": "aGVsbG8=",
+            "filename": "note.txt",
+            "caption": "hi",
+            "compress": false,
+            "reply_to": "parent",
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body["id"].as_str().unwrap().len() >= 8);
+
+    let (status, body) = post(
+        &server,
+        "/send-file",
+        Some(&server.token),
+        json!({"to": VALID_NPUB, "bytes": "aGVsbG8="}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let (status, body) = post(
+        &server,
+        "/send-file",
+        Some(&server.token),
+        json!({
+            "to": VALID_NPUB,
+            "path": tmp.path().to_string_lossy(),
+            "bytes": "aGVsbG8=",
+            "filename": "note.txt",
+        }),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "bad_request");
+}
+
+#[test]
+fn send_accepts_expires_in() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let channel = "a".repeat(64);
+    let (status, body) = post(
+        &server,
+        "/send",
+        Some(&server.token),
+        json!({
+            "to": channel,
+            "body": "temp notice",
+            "expires_in": 60,
+            "reply_to": "parent",
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"].as_str().expect("id").len(), 64);
+}
+
+#[test]
 fn download_attachment_stub_writes_dest() {
     let server = spawn_server(&[]);
     post(&server, "/__test/ready", Some(&server.token), json!({}));

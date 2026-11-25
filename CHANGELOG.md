@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-11-24
+
+Includes a new sidecar (Concord community admin routes). Re-run setup after
+update so the prebuilt refreshes, or let setup download `v0.6.1` assets from
+the Release.
+
 ### Added
 
 - **Community administration.** Operator tools can inspect and run a Concord

@@ -1,0 +1,17 @@
+---
+description: When tagging or publishing a GitHub Release, write proper release notes (not auto-generated stubs).
+alwaysApply: true
+---
+
+# GitHub releases
+
+When creating or updating a `v*` tag / GitHub Release for this repo:
+
+1. **Always set a real title and body** — do not leave the softprops / `generate_release_notes` stub (`**Full Changelog**: …` only).
+2. **Match prior release shape** (see `v0.5.3` / `v0.6.0` / `v0.6.1`):
+   - Title: `X.Y.Z — short summary`
+   - Intro line (new sidecar / Python-only / etc.) + setup refresh note when assets ship
+   - `## Added` / `## Fixed` / `## Changed` as needed (from `CHANGELOG.md`)
+   - `## Upgrade` with the usual `hermes plugins update` / `gateway setup` / `restart` block
+   - Link to `CHANGELOG.md` on the tag + compare URL
+3. Prefer `gh release edit` (or `gh release create` with `--notes`) right after the tag push. If `gh` auth is broken, say so and ask — do not invent one-shot workflows unless the user wants that.

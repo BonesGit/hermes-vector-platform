@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Community administration.** Operator tools can inspect and run a Concord
+  community the bot has been given the powers for: moderation, channels,
+  categories, roles, settings, invite links, and defensive recovery. Calls
+  are limited to the home Vector DM. Local CLI/TUI is off unless
+  `vector.communities.admin_cli` is on. Public invite links stay off unless
+  `vector.communities.allow_public_invites` is set. Dissolving a community
+  requires the caller to repeat that community id.
+
 ## [0.6.0] — 2026-11-21
 
 Includes a new sidecar (`vector_sdk` 0.14, with Tor and I2P support). There

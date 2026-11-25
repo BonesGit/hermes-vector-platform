@@ -41,6 +41,7 @@ hermes_vector_platform = "."
 [tool.setuptools.package-data]
 hermes_vector_platform = [
   "plugin.yaml",
+  "tools.py",
   "bridge/Cargo.toml",
   "bridge/Cargo.lock",
   "bridge/.gitignore",

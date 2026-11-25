@@ -71,6 +71,7 @@ fn spawn_server_stdin(extra: &[(&str, &str)], stdin: Stdio) -> Server {
         .env_remove("VECTOR_SIDECAR_WATCH_STDIN")
         .env_remove("VECTOR_STUB_READY_AFTER_MS")
         .env_remove("VECTOR_SSE_PING_MS")
+        .env_remove("VECTOR_ALLOW_PUBLIC_INVITES")
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -125,6 +126,29 @@ fn get(server: &Server, path: &str, token: Option<&str>) -> (u16, Value) {
         req = req.set("X-Hermes-Sidecar-Token", t);
     }
     status_json(req.call())
+}
+
+fn call(
+    server: &Server,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let mut req = agent()
+        .request(method, &server.url(path))
+        .set("Connection", "close");
+    if let Some(t) = token {
+        req = req.set("X-Hermes-Sidecar-Token", t);
+    }
+    let result = if let Some(body) = body {
+        req.send_json(body)
+    } else if method == "GET" || method == "DELETE" {
+        req.call()
+    } else {
+        req.send_json(json!({}))
+    };
+    status_json(result)
 }
 
 fn post(server: &Server, path: &str, token: Option<&str>, body: Value) -> (u16, Value) {
@@ -1547,4 +1571,132 @@ fn read_sse_until(
             Err(e) => panic!("{e}"),
         }
     }
+}
+
+#[test]
+fn admin_routes_require_auth_and_cover_stub_contract() {
+    let server = spawn_server(&[]);
+    post(&server, "/__test/ready", Some(&server.token), json!({}));
+    let cid = "aa".repeat(32);
+    let channel = "bb".repeat(32);
+    let role = "cc".repeat(32);
+    let category = "dd".repeat(32);
+    let message = "ee".repeat(32);
+    let other = "ff".repeat(32);
+
+    let (status, body) = call(&server, "GET", &format!("/communities/{cid}/capabilities"), None, None);
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = call(
+        &server,
+        "GET",
+        "/communities/nope/capabilities",
+        Some(&server.token),
+        None,
+    );
+    assert_eq!(status, 400, "{body}");
+
+    let cases = [
+        ("GET", format!("/communities/{cid}/capabilities"), None),
+        ("GET", format!("/communities/{cid}/roles"), None),
+        ("GET", format!("/communities/{cid}/members"), None),
+        ("POST", format!("/communities/{cid}/members/kick"), Some(json!({"npub": VALID_NPUB}))),
+        ("POST", format!("/communities/{cid}/members/ban"), Some(json!({"npub": VALID_NPUB}))),
+        ("POST", format!("/communities/{cid}/members/unban"), Some(json!({"npubs": [VALID_NPUB]}))),
+        ("POST", format!("/communities/{cid}/members/timeout"), Some(json!({"npub": VALID_NPUB, "seconds": 60}))),
+        ("DELETE", format!("/communities/{cid}/members/timeout"), Some(json!({"npub": VALID_NPUB}))),
+        ("POST", format!("/communities/{cid}/channels/{channel}/hide"), Some(json!({"message_id": message}))),
+        ("POST", format!("/communities/{cid}/leave"), None),
+        ("GET", format!("/communities/{cid}/channels"), None),
+        ("POST", format!("/communities/{cid}/channels"), Some(json!({"name": "random", "private": true}))),
+        ("PATCH", format!("/communities/{cid}/channels/{channel}"), Some(json!({"topic": "hi"}))),
+        ("POST", format!("/communities/{cid}/channels/{channel}/duplicate"), Some(json!({"name": "copy"}))),
+        ("DELETE", format!("/communities/{cid}/channels/{channel}"), None),
+        ("GET", format!("/communities/{cid}/categories"), None),
+        ("POST", format!("/communities/{cid}/categories"), Some(json!({"name": "Staff"}))),
+        ("PATCH", format!("/communities/{cid}/categories/{category}"), Some(json!({"name": "Mods"}))),
+        ("PUT", format!("/communities/{cid}/categories/{category}/overwrites"), Some(json!({"target": "everyone", "deny": ["send_messages"]}))),
+        ("DELETE", format!("/communities/{cid}/categories/{category}"), None),
+        ("GET", format!("/communities/{cid}/channels/{channel}/overwrites"), None),
+        ("PUT", format!("/communities/{cid}/channels/{channel}/overwrites"), Some(json!({"target": "everyone", "deny": ["send_messages"]}))),
+        ("DELETE", format!("/communities/{cid}/channels/{channel}/overwrites"), Some(json!({"target": "everyone"}))),
+        ("POST", format!("/communities/{cid}/channels/{channel}/sync"), Some(json!({"category_id": null}))),
+        ("GET", format!("/communities/{cid}/channels/{channel}/permissions/{VALID_NPUB}"), None),
+        ("GET", format!("/communities/{cid}/channels/{channel}/access"), None),
+        ("POST", format!("/communities/{cid}/channels/{channel}/access/grant"), Some(json!({"npub": VALID_NPUB}))),
+        ("POST", format!("/communities/{cid}/channels/{channel}/access/revoke"), Some(json!({"npub": VALID_NPUB}))),
+        ("PUT", format!("/communities/{cid}/system-channel"), Some(json!({"channel_id": channel}))),
+        ("PUT", format!("/communities/{cid}/landing-channel"), Some(json!({"channel_id": null}))),
+        ("POST", format!("/communities/{cid}/roles"), Some(json!({"name": "Mods", "permissions": ["kick"]}))),
+        ("PATCH", format!("/communities/{cid}/roles/{role}"), Some(json!({"name": "Moderators"}))),
+        ("PUT", format!("/communities/{cid}/roles/order"), Some(json!({"role_ids": [role]}))),
+        ("GET", format!("/communities/{cid}/roles/everyone"), None),
+        ("PUT", format!("/communities/{cid}/roles/everyone"), Some(json!({"permissions": ["send_messages"]}))),
+        ("POST", format!("/communities/{cid}/members/admin"), Some(json!({"npub": VALID_NPUB, "grant": true}))),
+        ("POST", format!("/communities/{cid}/members/roles"), Some(json!({"npub": VALID_NPUB, "op": "add", "role_id": role}))),
+        ("GET", format!("/communities/{cid}/members/{VALID_NPUB}/permissions"), None),
+        ("DELETE", format!("/communities/{cid}/roles/{role}"), None),
+        ("PATCH", format!("/communities/{cid}"), Some(json!({"name": "Renamed"}))),
+        ("PUT", format!("/communities/{cid}/icon"), Some(json!({"bytes_b64": "aGVsbG8="}))),
+        ("DELETE", format!("/communities/{cid}/icon"), None),
+        ("PUT", format!("/communities/{cid}/banner"), Some(json!({"bytes_b64": "aGVsbG8="}))),
+        ("DELETE", format!("/communities/{cid}/banner"), None),
+        ("GET", format!("/communities/{cid}/channels/{channel}/pins"), None),
+        ("POST", format!("/communities/{cid}/channels/{channel}/pins"), Some(json!({"message_id": message}))),
+        ("DELETE", format!("/communities/{cid}/channels/{channel}/pins"), Some(json!({"message_id": message}))),
+        ("GET", format!("/communities/{cid}/nicknames"), None),
+        ("PUT", format!("/communities/{cid}/nicknames"), Some(json!({"npub": VALID_NPUB, "nickname": "Ada"}))),
+        ("GET", format!("/communities/{cid}/audit-log"), None),
+        ("GET", format!("/communities/{cid}/relays"), None),
+        ("POST", format!("/communities/{cid}/relays/check"), Some(json!({"relays": ["wss://relay.example"]}))),
+        ("PUT", format!("/communities/{cid}/relays"), Some(json!({"relays": ["wss://relay.example"]}))),
+        ("PUT", format!("/communities/{cid}/voice-relays"), Some(json!({"relays": []}))),
+        ("GET", format!("/communities/{cid}/invites"), None),
+        ("DELETE", format!("/communities/{cid}/invites/abc123"), None),
+        ("DELETE", format!("/communities/{cid}/invites"), None),
+        ("GET", format!("/communities/{cid}/raid-report"), None),
+        ("POST", format!("/communities/{cid}/contain-raid"), Some(json!({"npubs": [VALID_NPUB], "window_start_secs": 1}))),
+        ("GET", format!("/communities/{cid}/epoch"), None),
+        ("POST", format!("/communities/{cid}/repair-roster"), None),
+        ("POST", format!("/communities/{cid}/rescue-stranded"), Some(json!({"npubs": [VALID_NPUB]}))),
+        ("POST", format!("/communities/{cid}/refound"), Some(json!({"retain": []}))),
+        ("GET", format!("/communities/{cid}/policies"), None),
+        ("POST", format!("/communities/{cid}/policies"), Some(json!({"action": "preview", "preset": "NoSpam"}))),
+        ("GET", format!("/communities/{cid}/verdicts"), None),
+        ("POST", format!("/communities/{cid}/dissolve"), Some(json!({"confirm_community_id": cid}))),
+    ];
+    for (method, path, body) in cases {
+        let (status, response) = call(&server, method, &path, Some(&server.token), body);
+        assert_eq!(status, 200, "{method} {path} {response}");
+        assert_eq!(response["stub"], true, "{method} {path}");
+    }
+
+    let (status, body) = call(
+        &server,
+        "POST",
+        &format!("/communities/{cid}/invites"),
+        Some(&server.token),
+        Some(json!({})),
+    );
+    assert_eq!(status, 403, "{body}");
+
+    let (status, body) = call(
+        &server,
+        "POST",
+        &format!("/communities/{cid}/dissolve"),
+        Some(&server.token),
+        Some(json!({"confirm_community_id": other})),
+    );
+    assert_eq!(status, 400, "{body}");
+
+    let open = spawn_server(&[("VECTOR_ALLOW_PUBLIC_INVITES", "on")]);
+    post(&open, "/__test/ready", Some(&open.token), json!({}));
+    let (status, body) = call(
+        &open,
+        "POST",
+        &format!("/communities/{cid}/invites"),
+        Some(&open.token),
+        Some(json!({"label": "site"})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["public_community"], true);
 }

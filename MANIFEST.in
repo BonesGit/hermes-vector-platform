@@ -4,6 +4,7 @@ include CHANGELOG.md
 include after-install.md
 include plugin.yaml
 include adapter.py
+include tools.py
 include __init__.py
 recursive-include internal *.py
 include pyproject.toml

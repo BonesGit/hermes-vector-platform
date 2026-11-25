@@ -1,5 +1,6 @@
 //! HTTP types, auth, errors, and JSON routes for the sidecar.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -232,6 +233,7 @@ pub fn router(state: AppState) -> Router {
         .route("/typing", post(typing))
         .route("/communities", get(list_communities).post(create_community))
         .route("/communities/invite", post(invite_to_community))
+        .merge(crate::admin::routes())
         .route("/profile", post(profile).get(get_profile))
         .route("/react", post(react))
         .route(
@@ -326,67 +328,103 @@ where
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
-    error: &'static str,
+    error: Cow<'static, str>,
+    needs: Option<u64>,
 }
 
 impl ApiError {
-    pub fn unauthorized() -> Self {
+    fn new(
+        status: StatusCode,
+        code: &'static str,
+        error: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
-            status: StatusCode::UNAUTHORIZED,
-            code: "unauthorized",
-            error: "unauthorized",
+            status,
+            code,
+            error: error.into(),
+            needs: None,
         }
     }
 
-    pub fn bad_request(error: &'static str) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code: "bad_request",
-            error,
-        }
+    pub fn unauthorized() -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized")
+    }
+
+    pub fn bad_request(error: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bad_request", error)
     }
 
     pub fn invalid_npub() -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code: "invalid_npub",
-            error: "invalid npub",
-        }
+        Self::new(StatusCode::BAD_REQUEST, "invalid_npub", "invalid npub")
+    }
+
+    pub fn forbidden(error: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden", error)
+    }
+
+    pub fn forbidden_needs(action: &str, needs: u64) -> Self {
+        let mut err = Self::forbidden(format!("{action} needs permission bits {needs:#x}"));
+        err.needs = Some(needs);
+        err
+    }
+
+    pub fn not_found(error: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", error)
+    }
+
+    pub fn conflict(error: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::CONFLICT, "conflict", error)
     }
 
     pub fn not_ready() -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "not_ready",
-            error: "sidecar is not ready",
-        }
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "sidecar is not ready",
+        )
+    }
+
+    pub fn unavailable(error: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "not_ready", error)
     }
 
     pub fn payload_too_large() -> Self {
-        Self {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            code: "payload_too_large",
-            error: "request body too large",
-        }
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "request body too large",
+        )
     }
 
     pub fn internal() -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal",
-            error: "internal error",
-        }
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "internal error",
+        )
+    }
+
+    pub fn sdk(error: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "sdk_error", error)
     }
 
     #[cfg(test)]
     pub(crate) fn code(&self) -> &'static str {
         self.code
     }
+
+    #[cfg(test)]
+    pub(crate) fn needs_bits(&self) -> Option<u64> {
+        self.needs
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({ "error": self.error, "code": self.code });
+        let mut body = json!({ "error": self.error.as_ref(), "code": self.code });
+        if let Some(needs) = self.needs {
+            body["needs"] = json!(needs);
+        }
         (self.status, Json(body)).into_response()
     }
 }
@@ -1305,7 +1343,7 @@ pub(crate) fn is_channel_id(raw: &str) -> bool {
 }
 
 /// Concord community id: same 64-hex shape as a channel id.
-fn parse_community_id(raw: &str) -> Result<String, ApiError> {
+pub(crate) fn parse_community_id(raw: &str) -> Result<String, ApiError> {
     let s = raw.trim();
     if s.is_empty() {
         return Err(ApiError::bad_request("community_id is required"));
@@ -1526,15 +1564,16 @@ async fn invite_to_community(
     let community_id = {
         let raw = req.community_id.trim();
         if !raw.is_empty() {
-            raw.to_string()
+            parse_community_id(raw)?
         } else {
-            load_home_community()
+            let stored = load_home_community()
                 .and_then(|v| {
                     v.get("community_id")
                         .and_then(|c| c.as_str())
                         .map(str::to_string)
                 })
-                .ok_or_else(|| ApiError::bad_request("community_id is required"))?
+                .ok_or_else(|| ApiError::bad_request("community_id is required"))?;
+            parse_community_id(&stored)?
         }
     };
     if let Some(bot) = state.bot().await {
@@ -1542,9 +1581,14 @@ async fn invite_to_community(
             .invite(&npub)
             .await
             .map_err(|err| {
-                eprintln!("[vector-bridge] invite failed: {err}");
-                ApiError::internal()
+                eprintln!(
+                    "[vector-bridge] admin action=invite community_id={community_id} npub={npub} error={err}"
+                );
+                crate::admin::map_sdk_error(err)
             })?;
+        eprintln!(
+            "[vector-bridge] admin action=invite community_id={community_id} npub={npub}"
+        );
     }
     Ok(Json(
         json!({ "ok": true, "community_id": community_id, "npub": npub }),

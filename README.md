@@ -162,6 +162,8 @@ vector:
     group_allowed_users: []          # npubs who may @mention without DM access
     open_channels: []                # 64-hex channel ids; any member may @mention / reply
     trusted_inviters: []             # empty = VECTOR_ALLOWED_USERS
+    admin_cli: false                 # true = local CLI/TUI may call community admin tools
+    allow_public_invites: false      # true = tools may mint a public invite link
   group_context:                     # inject recent channel lines on a mention turn
     enabled: false                   # true / VECTOR_GROUP_CONTEXT=1
     max_messages: 20                 # 0 = no client cap (sidecar still clamps at 50)
@@ -236,6 +238,8 @@ Concord communities are E2E encrypted group spaces with channels. A **fresh comm
 The Vector app does not display channel ids. When the bot joins (trusted invite, `vector.communities.create`, connect-time membership sync, or a home-DM `/join`) it logs the full 64-hex `channel_id` and DMs `VECTOR_HOME_CHANNEL` a copy-pasteable notice. Restart does not re-DM the same id (`sdk/notified-channels.json`). Parked (untrusted) invites stay **silent** — no home DM when they land. List, join, or decline them from the home DM with `/invites`, `/join <community_id>`, `/decline <community_id>` (not on the `/` picker).
 
 **Bot-owned home room:** set `vector.communities.create: true`. After Ready the sidecar creates or reuses a private community, persists `sdk/home-community.json` (restart will not create a second one), and direct-invites `VECTOR_ALLOWED_USERS`. No public invite URL, and the new channel is **not** written into `open_channels`. Direct-invited allowlisted members can already @mention; anyone else needs `group_allowed_users` or the channel id in `open_channels`.
+
+**Community admin:** Hermes tools (`vector_community_inspect`, `vector_community_moderate`, `vector_community_channels`, `vector_community_categories`, `vector_community_roles`, `vector_community_settings`, `vector_community_invites`, `vector_community_defense`) call the sidecar. Concord still decides whether the bot may act. Calls are allowed from the `VECTOR_HOME_CHANNEL` Vector DM, and from local CLI/TUI only when `vector.communities.admin_cli` is true (default false). Group chats and other platforms are refused. `vector.communities.allow_public_invites` stays false unless you explicitly want a public invite link. Dissolving a community requires the tool call to repeat that community id.
 
 Community **reactions** and missed-❌ catch-up stay DM-only. Missed Concord
 messages while the sidecar was down are **ignored** (no ❌, no Hermes turn).

@@ -2310,6 +2310,11 @@ async def _standalone_send(
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     _ensure_hermes_connect_timeout_floor()
+    try:
+        from .tools import register_tools
+    except ImportError:
+        from tools import register_tools
+    register_tools(ctx)
     ctx.register_redaction_patterns([r"nsec1[a-z0-9]{20,}"])
     ctx.register_platform(
         name="vector",

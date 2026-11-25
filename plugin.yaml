@@ -25,3 +25,12 @@ optional_env:
     description: "Operator npub for cron / join notices (channel ids)"
     prompt: "Home npub"
     password: false
+provides_tools:
+  - vector_community_inspect
+  - vector_community_moderate
+  - vector_community_channels
+  - vector_community_categories
+  - vector_community_roles
+  - vector_community_settings
+  - vector_community_invites
+  - vector_community_defense

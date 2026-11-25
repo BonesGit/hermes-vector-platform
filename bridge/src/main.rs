@@ -4,6 +4,7 @@
 //! Runtime binds HTTP first, then `VectorBot::build` + `on_event` in the background.
 //! `VECTOR_STUB=1` keeps the HTTP stub (no live relays) for tests.
 
+mod admin;
 mod api;
 mod commands;
 mod events;

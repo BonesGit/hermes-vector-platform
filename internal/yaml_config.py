@@ -455,6 +455,29 @@ def _apply_yaml_config(yaml_cfg: dict, vector_cfg: dict) -> Optional[dict]:
         if inviters:
             seeded["trusted_inviters"] = inviters
             _set_env_if_unset("VECTOR_TRUSTED_INVITERS", inviters, skip=skip)
+        if "admin_cli" in communities:
+            admin_cli = _yaml_on_off(communities.get("admin_cli"))
+            if admin_cli is not None:
+                seeded["admin_cli"] = admin_cli
+                _set_env_if_unset("VECTOR_ADMIN_CLI", admin_cli, skip=skip)
+            else:
+                logger.warning(
+                    "Vector: ignoring vector.communities.admin_cli=%r (want true/false)",
+                    communities.get("admin_cli"),
+                )
+        if "allow_public_invites" in communities:
+            public_invites = _yaml_on_off(communities.get("allow_public_invites"))
+            if public_invites is not None:
+                seeded["allow_public_invites"] = public_invites
+                _set_env_if_unset(
+                    "VECTOR_ALLOW_PUBLIC_INVITES", public_invites, skip=skip
+                )
+            else:
+                logger.warning(
+                    "Vector: ignoring vector.communities.allow_public_invites=%r "
+                    "(want true/false)",
+                    communities.get("allow_public_invites"),
+                )
 
     return seeded or None
 

@@ -163,6 +163,7 @@ class TestPackaging:
         assert 'hermes_vector_platform = "."' in text
         assert '"hermes_vector_platform.internal" = "internal"' in text
         assert '"plugin.yaml"' in text
+        assert '"tools.py"' in text
         assert '"bridge/src/*.rs"' in text
         assert '"bridge/Cargo.toml"' in text
         assert '"bridge/Cargo.lock"' in text
@@ -186,6 +187,7 @@ class TestPackaging:
             for name in names
         )
         shipped = {Path(name).name for name in names if name.endswith(".py")}
+        assert "tools.py" in shipped
         for src in sorted((PLUGIN_ROOT / "internal").glob("*.py")):
             assert src.name in shipped, src.name
 
@@ -6613,3 +6615,201 @@ class TestReactions:
         assert vector_adapter._processing_reactions_enabled() is True
         monkeypatch.setenv("VECTOR_REACTIONS", "false")
         assert vector_adapter._processing_reactions_enabled() is False
+
+
+def _community_tools():
+    import importlib
+
+    return importlib.import_module(f"{vector_adapter.__package__}.tools")
+
+
+class TestCommunityAdminTools:
+    def test_plugin_lists_admin_tools(self):
+        text = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+        tools = _community_tools()
+        for name in tools.TOOL_NAMES:
+            assert f"- {name}" in text
+
+    def test_yaml_admin_flags(self, monkeypatch):
+        monkeypatch.delenv("VECTOR_ADMIN_CLI", raising=False)
+        monkeypatch.delenv("VECTOR_ALLOW_PUBLIC_INVITES", raising=False)
+        seeded = vector_adapter._apply_yaml_config(
+            {},
+            {"communities": {"admin_cli": False, "allow_public_invites": True}},
+        )
+        assert seeded["admin_cli"] == "off"
+        assert seeded["allow_public_invites"] == "on"
+        assert os.environ["VECTOR_ADMIN_CLI"] == "off"
+        assert os.environ["VECTOR_ALLOW_PUBLIC_INVITES"] == "on"
+
+    def test_group_and_foreign_callers_are_refused(self, monkeypatch):
+        tools = _community_tools()
+        monkeypatch.setattr(
+            tools,
+            "_session_env",
+            lambda: {
+                "HERMES_SESSION_PLATFORM": "vector",
+                "HERMES_SESSION_CHAT_TYPE": "group",
+                "HERMES_SESSION_CHAT_ID": CHANNEL_ID,
+                "HERMES_SESSION_ACTOR_ID": NPUB,
+            },
+        )
+        assert "group" in (tools.admin_caller_error() or "")
+
+        monkeypatch.setattr(
+            tools,
+            "_session_env",
+            lambda: {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_CHAT_TYPE": "dm",
+                "HERMES_SESSION_CHAT_ID": "1",
+                "HERMES_SESSION_ACTOR_ID": "1",
+            },
+        )
+        assert "platform" in (tools.admin_caller_error() or "").lower()
+
+        monkeypatch.setattr(
+            tools,
+            "_session_env",
+            lambda: {
+                "HERMES_SESSION_PLATFORM": "vector",
+                "HERMES_SESSION_CHAT_TYPE": "dm",
+                "HERMES_SESSION_CHAT_ID": NPUB,
+                "HERMES_SESSION_ACTOR_ID": "",
+            },
+        )
+        assert "trusted sender" in (tools.admin_caller_error() or "")
+
+    def test_home_dm_allowed_and_other_dm_refused(self, monkeypatch):
+        tools = _community_tools()
+        deps = tools._imports()
+
+        def scoped(name, default=""):
+            if name == "VECTOR_HOME_CHANNEL":
+                return NPUB
+            return deps["scoped_env_str"](name, default)
+
+        monkeypatch.setattr(
+            tools, "_imports", lambda: {**deps, "scoped_env_str": scoped}
+        )
+        monkeypatch.setattr(
+            tools,
+            "_session_env",
+            lambda: {
+                "HERMES_SESSION_PLATFORM": "vector",
+                "HERMES_SESSION_CHAT_TYPE": "dm",
+                "HERMES_SESSION_CHAT_ID": NPUB,
+                "HERMES_SESSION_ACTOR_ID": NPUB,
+            },
+        )
+        assert tools.admin_caller_error() is None
+        monkeypatch.setattr(
+            tools,
+            "_session_env",
+            lambda: {
+                "HERMES_SESSION_PLATFORM": "vector",
+                "HERMES_SESSION_CHAT_TYPE": "dm",
+                "HERMES_SESSION_CHAT_ID": PEER_NPUB,
+                "HERMES_SESSION_ACTOR_ID": PEER_NPUB,
+            },
+        )
+        assert "VECTOR_HOME_CHANNEL" in (tools.admin_caller_error() or "")
+
+    def test_cli_toggle(self, monkeypatch):
+        tools = _community_tools()
+        monkeypatch.setattr(tools, "_session_env", lambda: {})
+        monkeypatch.delenv("VECTOR_ADMIN_CLI", raising=False)
+        assert "admin_cli" in (tools.admin_caller_error() or "")
+
+        def enabled(name, *, default=False):
+            if name == "VECTOR_ADMIN_CLI":
+                return True
+            return default
+
+        monkeypatch.setattr(tools, "_flag_on", enabled)
+        assert tools.admin_caller_error() is None
+
+    def test_kick_posts_npub_and_guards_hold(self, monkeypatch):
+        tools = _community_tools()
+        monkeypatch.setattr(tools, "_session_env", lambda: {})
+        monkeypatch.setattr(
+            tools,
+            "_flag_on",
+            lambda name, *, default=False: True if name == "VECTOR_ADMIN_CLI" else default,
+        )
+        seen = {}
+
+        async def fake(method, path, body=None):
+            seen["method"] = method
+            seen["path"] = path
+            seen["body"] = body
+            return {"ok": True, "npub": (body or {}).get("npub")}
+
+        monkeypatch.setattr(tools, "sidecar_json", fake)
+        community = "aa" * 32
+        result = json.loads(
+            asyncio.run(
+                tools.dispatch_admin_tool(
+                    "vector_community_moderate",
+                    {"action": "kick", "community_id": community, "npub": NPUB},
+                )
+            )
+        )
+        assert result["ok"] is True
+        assert seen["method"] == "POST"
+        assert seen["path"] == f"/communities/{community}/members/kick"
+        assert seen["body"]["npub"] == NPUB
+
+        blocked = json.loads(
+            asyncio.run(
+                tools.dispatch_admin_tool(
+                    "vector_community_invites",
+                    {"action": "create_link", "community_id": community},
+                )
+            )
+        )
+        assert blocked["ok"] is False
+        assert "allow_public_invites" in blocked["error"]
+
+        dissolved = json.loads(
+            asyncio.run(
+                tools.dispatch_admin_tool(
+                    "vector_community_defense",
+                    {
+                        "action": "dissolve",
+                        "community_id": community,
+                        "confirm_community_id": "bb" * 32,
+                    },
+                )
+            )
+        )
+        assert dissolved["ok"] is False
+        assert "confirm_community_id" in dissolved["error"]
+
+        preview = json.loads(
+            asyncio.run(
+                tools.dispatch_admin_tool(
+                    "vector_community_defense",
+                    {
+                        "action": "preview_policy",
+                        "community_id": community,
+                        "preset": "NoSpam",
+                    },
+                )
+            )
+        )
+        assert preview["ok"] is True
+        assert seen["method"] == "POST"
+        assert seen["path"].endswith("/policies")
+        assert seen["body"]["action"] == "preview"
+        assert seen["body"]["preset"] == "NoSpam"
+
+    def test_register_wires_admin_tools(self):
+        tools = _community_tools()
+        tools._REGISTERED = False
+        ctx = MagicMock()
+        tools.register_tools(ctx)
+        registered = {call.kwargs["name"] for call in ctx.register_tool.call_args_list}
+        assert registered == set(tools.TOOL_NAMES)
+        tools.register_tools(ctx)
+        assert ctx.register_tool.call_count == len(tools.TOOL_NAMES)

@@ -25,13 +25,13 @@ jobs:
         with:
           repository: NousResearch/hermes-agent
           path: hermes-agent
-      - uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.14"
       - name: Install Hermes + pytest
-        run: python3 -m pip install -e hermes-agent pytest
+        run: uv sync --project hermes-agent --frozen --group dev
       - name: Plugin unit tests
         env:
           HERMES_AGENT_ROOT: ${{ github.workspace }}/hermes-agent
           PYTHONPATH: ${{ github.workspace }}/hermes-agent
-        run: python3 -m pytest tests/test_plugin_unit.py -q
+        run: hermes-agent/.venv/bin/python -m pytest tests/test_plugin_unit.py -q

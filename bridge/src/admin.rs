@@ -4,7 +4,6 @@
 //! Core moderation (`kick`, `ban`, channel edits, `hide`, nicknames) arrives as
 //! `VectorError::Other`. [`map_sdk_error`] turns both into HTTP 403/404/409.
 
-use std::path::Path;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
@@ -476,39 +475,39 @@ fn optional_channel(body: &Value) -> Result<Option<String>, ApiError> {
     }
 }
 
-fn decode_image(body: &Value, read_path: bool) -> Result<Vec<u8>, ApiError> {
-    if let Some(b64) = body.get("bytes_b64").and_then(Value::as_str) {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .map_err(|_| ApiError::bad_request("bytes_b64 is not valid base64"))?;
-        if raw.is_empty() || raw.len() > MAX_IMAGE {
-            return Err(ApiError::bad_request(
-                "image must be between 1 byte and 4 MiB",
-            ));
-        }
-        return Ok(raw);
+fn is_supported_image(bytes: &[u8]) -> bool {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    const JPEG: &[u8] = &[0xff, 0xd8, 0xff];
+    bytes.starts_with(PNG)
+        || bytes.starts_with(JPEG)
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+}
+
+fn decode_image(body: &Value) -> Result<Vec<u8>, ApiError> {
+    if body.get("path").is_some_and(|v| !v.is_null()) {
+        return Err(ApiError::bad_request(
+            "path is not supported; send bytes_b64 instead",
+        ));
     }
-    if let Some(path) = body.get("path").and_then(Value::as_str).map(str::trim) {
-        if path.is_empty() || path.len() > 4096 {
-            return Err(ApiError::bad_request("path is invalid"));
-        }
-        if !read_path {
-            return Ok(Vec::new());
-        }
-        let file = Path::new(path);
-        if !file.is_file() {
-            return Err(ApiError::bad_request("path is not a file"));
-        }
-        let raw = std::fs::read(file)
-            .map_err(|_| ApiError::bad_request("could not read image path"))?;
-        if raw.is_empty() || raw.len() > MAX_IMAGE {
-            return Err(ApiError::bad_request(
-                "image must be between 1 byte and 4 MiB",
-            ));
-        }
-        return Ok(raw);
+    let Some(b64) = body.get("bytes_b64").and_then(Value::as_str) else {
+        return Err(ApiError::bad_request("bytes_b64 is required"));
+    };
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|_| ApiError::bad_request("bytes_b64 is not valid base64"))?;
+    if raw.is_empty() || raw.len() > MAX_IMAGE {
+        return Err(ApiError::bad_request(
+            "image must be between 1 byte and 4 MiB",
+        ));
     }
-    Err(ApiError::bad_request("bytes_b64 or path is required"))
+    if !is_supported_image(&raw) {
+        return Err(ApiError::bad_request(
+            "image must be PNG, JPEG, WebP, or GIF",
+        ));
+    }
+    Ok(raw)
 }
 
 fn public_invites_allowed() -> bool {
@@ -1676,11 +1675,10 @@ async fn set_image(
     banner: bool,
 ) -> Result<Json<Value>, ApiError> {
     let community_id = parse_community_id(&community_id)?;
+    let bytes = decode_image(&body)?;
     let Some(bot) = ready_bot(&state).await? else {
-        decode_image(&body, false)?;
         return Ok(stub(json!({"ok": true, "community_id": community_id, "banner": banner})));
     };
-    let bytes = decode_image(&body, true)?;
     let community = bot.community(&community_id);
     if banner {
         community.set_banner(&bytes).await.map_err(map_sdk_error)?;
@@ -2427,5 +2425,30 @@ mod tests {
             "the pins are sealed under a key this device doesn't hold yet".into(),
         ));
         assert_eq!(sealed.code(), "conflict");
+    }
+
+    #[test]
+    fn decode_image_rejects_path_and_non_images() {
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nrest");
+        let jpeg = base64::engine::general_purpose::STANDARD.encode([0xffu8, 0xd8, 0xff, 0xe0]);
+        let gif = base64::engine::general_purpose::STANDARD.encode(b"GIF89a\x01\x00");
+        let webp = base64::engine::general_purpose::STANDARD.encode(b"RIFF\x24\x00\x00\x00WEBP");
+
+        assert!(decode_image(&json!({"bytes_b64": png})).is_ok());
+        assert!(decode_image(&json!({"bytes_b64": jpeg})).is_ok());
+        assert!(decode_image(&json!({"bytes_b64": gif})).is_ok());
+        assert!(decode_image(&json!({"bytes_b64": webp})).is_ok());
+
+        // Path-based host file reads must be rejected even if bytes_b64 is also supplied.
+        assert!(decode_image(&json!({"path": "/etc/passwd"})).is_err());
+        assert!(decode_image(&json!({"path": "/etc/passwd", "bytes_b64": png})).is_err());
+
+        // Plaintext / secrets / arbitrary bytes must fail magic-byte validation.
+        let secret = base64::engine::general_purpose::STANDARD.encode(b"VECTOR_NSEC=nsec1secret");
+        assert!(decode_image(&json!({"bytes_b64": secret})).is_err());
+
+        // Missing or empty payloads fail.
+        assert!(decode_image(&json!({})).is_err());
+        assert!(decode_image(&json!({"bytes_b64": ""})).is_err());
     }
 }

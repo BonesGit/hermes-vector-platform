@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-11-26
+
+Includes a new sidecar (hardened icon/banner validation and updated TLS/URL
+dependencies). Re-run setup after update so the prebuilt refreshes, or let
+setup download `v0.6.2` assets from the Release.
+
+### Fixed
+
+- **Community admin caller check now reads Hermes session context correctly.**
+  `_session_env` previously called `gateway.session_context.get_session_env()`
+  with no arguments and swallowed the resulting `TypeError` as `{}`. It now
+  reads `HERMES_SESSION_PLATFORM`, `HERMES_SESSION_CHAT_TYPE`,
+  `HERMES_SESSION_CHAT_ID`, and `HERMES_SESSION_ACTOR_ID` by name and fails
+  closed if reading session context errors.
+- **Removed arbitrary host file read on community icon/banner updates.**
+  Dropped `path` from both the Python tool schema/dispatch and the Rust
+  sidecar (`PUT /communities/{id}/icon` and `/banner`). Only `bytes_b64` is
+  accepted, and the sidecar verifies PNG, JPEG, WebP, or GIF magic bytes.
+- **Moved community admin tools module out of the plugin root.** Renamed
+  `tools.py` to `internal/community_tools.py` so it cannot shadow Hermes'
+  top-level `tools` package when the plugin root is on `sys.path`.
+
+### Added
+
+- **Human approval gate for irreversible community admin actions.** Registers a
+  `pre_tool_call` hook (`provides_hooks: [pre_tool_call]`) that returns
+  `{"action": "approve", ...}` with a scoped `rule_key` for `dissolve`,
+  `refound`, `delete_policy`, `ban`, `leave`, `grant_admin`, `move_relays`,
+  and channel/category/role `delete`.
+- **Dynamic admin tool visibility (`check_fn`).** Admin tools now register a
+  non-cached `check_fn` so their schemas are only exposed when the sidecar is
+  live and the current session is authorized.
+
+### Changed
+
+- **Hardened admin route parameter validation.** Python dispatch now validates
+  64-hex IDs, `npub`, and invite tokens and URL-quotes path segments before
+  calling the sidecar.
+- **Updated Rust lockfile dependencies.** Bumped `rustls` (0.23.46),
+  `rustls-webpki` (0.103.17), `url` (2.5.9), and `webpki-roots` (1.0.12) to
+  resolve 7 of 10 RustSec advisories (`libsqlite3-sys`, `rsa`, and
+  `crypto-bigint` remain pinned upstream by `vector-core` / `arti-client`).
+
 ## [0.6.1] — 2026-11-24
 
 Includes a new sidecar (Concord community admin routes). Re-run setup after

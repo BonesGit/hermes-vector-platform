@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-PLUGIN_VERSION = "0.6.1"
+PLUGIN_VERSION = "0.6.2"
 
 DEFAULT_BRIDGE_PORT = 8096
 DEFAULT_BRIDGE_HOST = "127.0.0.1"

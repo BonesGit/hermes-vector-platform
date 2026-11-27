@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-vector-platform"
-version = "0.6.1"
+version = "0.6.2"
 description = "Vector (vectorapp.io) messaging platform plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,7 +41,6 @@ hermes_vector_platform = "."
 [tool.setuptools.package-data]
 hermes_vector_platform = [
   "plugin.yaml",
-  "tools.py",
   "bridge/Cargo.toml",
   "bridge/Cargo.lock",
   "bridge/.gitignore",

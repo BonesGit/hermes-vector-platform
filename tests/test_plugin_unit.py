@@ -163,7 +163,8 @@ class TestPackaging:
         assert 'hermes_vector_platform = "."' in text
         assert '"hermes_vector_platform.internal" = "internal"' in text
         assert '"plugin.yaml"' in text
-        assert '"tools.py"' in text
+        assert '"tools.py"' not in text
+        assert not (PLUGIN_ROOT / "tools.py").exists()
         assert '"bridge/src/*.rs"' in text
         assert '"bridge/Cargo.toml"' in text
         assert '"bridge/Cargo.lock"' in text
@@ -187,7 +188,8 @@ class TestPackaging:
             for name in names
         )
         shipped = {Path(name).name for name in names if name.endswith(".py")}
-        assert "tools.py" in shipped
+        assert "tools.py" not in shipped
+        assert "community_tools.py" in shipped
         for src in sorted((PLUGIN_ROOT / "internal").glob("*.py")):
             assert src.name in shipped, src.name
 
@@ -6620,15 +6622,17 @@ class TestReactions:
 def _community_tools():
     import importlib
 
-    return importlib.import_module(f"{vector_adapter.__package__}.tools")
+    return importlib.import_module(f"{vector_adapter.__package__}.internal.community_tools")
 
 
 class TestCommunityAdminTools:
-    def test_plugin_lists_admin_tools(self):
+    def test_plugin_lists_admin_tools_and_hook(self):
         text = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
         tools = _community_tools()
         for name in tools.TOOL_NAMES:
             assert f"- {name}" in text
+        assert "provides_hooks:" in text
+        assert "- pre_tool_call" in text
 
     def test_yaml_admin_flags(self, monkeypatch):
         monkeypatch.delenv("VECTOR_ADMIN_CLI", raising=False)
@@ -6679,6 +6683,82 @@ class TestCommunityAdminTools:
             },
         )
         assert "trusted sender" in (tools.admin_caller_error() or "")
+
+        monkeypatch.setattr(tools, "_session_env", lambda: None)
+        monkeypatch.setenv("VECTOR_ADMIN_CLI", "on")
+        assert "session context" in (tools.admin_caller_error() or "").lower()
+
+    def test_real_session_context_caller_checks(self, monkeypatch):
+        from gateway import session_context
+
+        tools = _community_tools()
+        deps = tools._imports()
+
+        def scoped(name, default=""):
+            if name == "VECTOR_HOME_CHANNEL":
+                return NPUB
+            if name == "VECTOR_ADMIN_CLI":
+                return os.environ.get("VECTOR_ADMIN_CLI", default)
+            return deps["scoped_env_str"](name, default)
+
+        monkeypatch.setattr(tools, "_imports", lambda: {**deps, "scoped_env_str": scoped})
+        monkeypatch.setenv("VECTOR_ADMIN_CLI", "on")
+
+        try:
+            # Real bound Vector group session must be refused even when admin_cli is on.
+            session_context.set_session_vars(
+                platform="vector",
+                chat_type="group",
+                chat_id=CHANNEL_ID,
+                user_id=NPUB,
+                actor_id=NPUB,
+            )
+            assert "group" in (tools.admin_caller_error() or "")
+
+            # Real bound foreign platform must be refused even when admin_cli is on.
+            session_context.set_session_vars(
+                platform="telegram",
+                chat_type="dm",
+                chat_id="42",
+                user_id="42",
+                actor_id="42",
+            )
+            assert "platform" in (tools.admin_caller_error() or "").lower()
+
+            # Real bound operator Vector DM is allowed even when admin_cli is off.
+            monkeypatch.setenv("VECTOR_ADMIN_CLI", "off")
+            session_context.set_session_vars(
+                platform="vector",
+                chat_type="dm",
+                chat_id=NPUB,
+                user_id=NPUB,
+                actor_id=NPUB,
+            )
+            assert tools.admin_caller_error() is None
+
+            # Real bound non-operator Vector DM is refused.
+            session_context.set_session_vars(
+                platform="vector",
+                chat_type="dm",
+                chat_id=PEER_NPUB,
+                user_id=PEER_NPUB,
+                actor_id=PEER_NPUB,
+            )
+            assert "VECTOR_HOME_CHANNEL" in (tools.admin_caller_error() or "")
+        finally:
+            session_context.reset_session_vars()
+
+    def test_session_context_read_error_fails_closed(self, monkeypatch):
+        from gateway import session_context
+
+        tools = _community_tools()
+        monkeypatch.setenv("VECTOR_ADMIN_CLI", "on")
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("session store unavailable")
+
+        monkeypatch.setattr(session_context, "get_session_env", boom)
+        assert "session context" in (tools.admin_caller_error() or "").lower()
 
     def test_home_dm_allowed_and_other_dm_refused(self, monkeypatch):
         tools = _community_tools()
@@ -6804,12 +6884,240 @@ class TestCommunityAdminTools:
         assert seen["body"]["action"] == "preview"
         assert seen["body"]["preset"] == "NoSpam"
 
-    def test_register_wires_admin_tools(self):
+    def test_icon_banner_drops_path_and_requires_bytes_b64(self, monkeypatch):
         tools = _community_tools()
-        tools._REGISTERED = False
+        schema = tools._schema(
+            "vector_community_settings",
+            "desc",
+            tools._ROUTES["vector_community_settings"],
+        )
+        assert "path" not in schema["parameters"]["properties"]
+
+        monkeypatch.setattr(tools, "_session_env", lambda: {})
+        monkeypatch.setattr(
+            tools,
+            "_flag_on",
+            lambda name, *, default=False: True if name == "VECTOR_ADMIN_CLI" else default,
+        )
+        called = False
+
+        async def fake(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            return {"ok": True}
+
+        monkeypatch.setattr(tools, "sidecar_json", fake)
+        community = "aa" * 32
+        for action in ("set_icon", "set_banner"):
+            rejected = json.loads(
+                asyncio.run(
+                    tools.dispatch_admin_tool(
+                        "vector_community_settings",
+                        {
+                            "action": action,
+                            "community_id": community,
+                            "path": "/home/user/.hermes/.env",
+                        },
+                    )
+                )
+            )
+            assert rejected["ok"] is False
+            assert "bytes_b64" in rejected["error"]
+            assert called is False
+
+            missing = json.loads(
+                asyncio.run(
+                    tools.dispatch_admin_tool(
+                        "vector_community_settings",
+                        {"action": action, "community_id": community},
+                    )
+                )
+            )
+            assert missing["ok"] is False
+            assert "bytes_b64" in missing["error"]
+            assert called is False
+
+    def test_path_params_validate_hex_npub_and_token(self, monkeypatch):
+        tools = _community_tools()
+        monkeypatch.setattr(tools, "_session_env", lambda: {})
+        monkeypatch.setattr(
+            tools,
+            "_flag_on",
+            lambda name, *, default=False: True if name == "VECTOR_ADMIN_CLI" else default,
+        )
+        seen = {}
+
+        async def fake(method, path, body=None):
+            seen["path"] = path
+            return {"ok": True}
+
+        monkeypatch.setattr(tools, "sidecar_json", fake)
+        community = "AA" * 32
+        ok = json.loads(
+            asyncio.run(
+                tools.dispatch_admin_tool(
+                    "vector_community_inspect",
+                    {"action": "roles", "community_id": community},
+                )
+            )
+        )
+        assert ok["ok"] is True
+        assert seen["path"] == f"/communities/{community.lower()}/roles"
+
+        bad_cid = json.loads(
+            asyncio.run(
+                tools.dispatch_admin_tool(
+                    "vector_community_inspect",
+                    {"action": "roles", "community_id": "../other"},
+                )
+            )
+        )
+        assert bad_cid["ok"] is False
+        assert "64 hex" in bad_cid["error"]
+
+        bad_npub = json.loads(
+            asyncio.run(
+                tools.dispatch_admin_tool(
+                    "vector_community_roles",
+                    {
+                        "action": "member_permissions",
+                        "community_id": "aa" * 32,
+                        "npub": "../bad",
+                    },
+                )
+            )
+        )
+        assert bad_npub["ok"] is False
+        assert "npub" in bad_npub["error"]
+
+        bad_token = json.loads(
+            asyncio.run(
+                tools.dispatch_admin_tool(
+                    "vector_community_invites",
+                    {
+                        "action": "revoke_link",
+                        "community_id": "aa" * 32,
+                        "token": "../../all",
+                    },
+                )
+            )
+        )
+        assert bad_token["ok"] is False
+        assert "token" in bad_token["error"]
+
+    def test_pre_tool_call_approval_gates_irreversible_actions(self):
+        tools = _community_tools()
+        community = "aa" * 32
+        required = [
+            ("vector_community_defense", "dissolve"),
+            ("vector_community_defense", "refound"),
+            ("vector_community_defense", "delete_policy"),
+            ("vector_community_moderate", "ban"),
+            ("vector_community_moderate", "leave"),
+            ("vector_community_roles", "grant_admin"),
+            ("vector_community_settings", "move_relays"),
+            ("vector_community_channels", "delete"),
+            ("vector_community_categories", "delete"),
+            ("vector_community_roles", "delete"),
+        ]
+        for tool_name, action in required:
+            directive = tools.pre_tool_call_approval(
+                tool_name=tool_name,
+                args={"action": action, "community_id": community, "npub": NPUB},
+            )
+            assert directive is not None, (tool_name, action)
+            assert directive["action"] == "approve"
+            assert community in directive["message"]
+            assert directive["rule_key"] == f"{tool_name}:{action}:{community}"
+
+        # Non-destructive actions and unrelated tools do not trigger approval.
+        assert (
+            tools.pre_tool_call_approval(
+                tool_name="vector_community_inspect",
+                args={"action": "list"},
+            )
+            is None
+        )
+        assert (
+            tools.pre_tool_call_approval(
+                tool_name="vector_community_moderate",
+                args={"action": "kick", "community_id": community, "npub": NPUB},
+            )
+            is None
+        )
+        assert (
+            tools.pre_tool_call_approval(
+                tool_name="read_file",
+                args={"path": "README.md"},
+            )
+            is None
+        )
+
+    def test_check_fn_requires_live_sidecar_and_allowed_caller(self, monkeypatch):
+        tools = _community_tools()
+        deps = tools._imports()
+
+        monkeypatch.setattr(tools, "_session_env", lambda: {})
+        monkeypatch.setattr(
+            tools,
+            "_flag_on",
+            lambda name, *, default=False: True if name == "VECTOR_ADMIN_CLI" else default,
+        )
+
+        # No runtime record -> hidden.
+        monkeypatch.setattr(tools, "_imports", lambda: {**deps, "read_runtime": lambda: None})
+        assert tools.check_admin_tools_available() is False
+
+        # Dead PID -> hidden.
+        monkeypatch.setattr(
+            tools,
+            "_imports",
+            lambda: {**deps, "read_runtime": lambda: {"token": "tok", "pid": 99999999}},
+        )
+        monkeypatch.setattr(tools, "_pid_alive", lambda _pid: False)
+        assert tools.check_admin_tools_available() is False
+
+        # Live PID + allowed caller -> visible.
+        monkeypatch.setattr(tools, "_pid_alive", lambda _pid: True)
+        assert tools.check_admin_tools_available() is True
+
+        # Live PID + group chat caller -> hidden.
+        monkeypatch.setattr(
+            tools,
+            "_session_env",
+            lambda: {
+                "HERMES_SESSION_PLATFORM": "vector",
+                "HERMES_SESSION_CHAT_TYPE": "group",
+                "HERMES_SESSION_CHAT_ID": CHANNEL_ID,
+                "HERMES_SESSION_ACTOR_ID": NPUB,
+            },
+        )
+        assert tools.check_admin_tools_available() is False
+
+        # Marked no-cache so Hermes does not cache session-scoped verdicts across sessions.
+        from tools.registry import _NO_CACHE_CHECK_FNS
+
+        assert tools.check_admin_tools_available in _NO_CACHE_CHECK_FNS
+
+    def test_register_wires_admin_tools_and_approval_hook(self):
+        tools = _community_tools()
         ctx = MagicMock()
         tools.register_tools(ctx)
         registered = {call.kwargs["name"] for call in ctx.register_tool.call_args_list}
         assert registered == set(tools.TOOL_NAMES)
+        for call in ctx.register_tool.call_args_list:
+            assert call.kwargs["check_fn"] is tools.check_admin_tools_available
+        ctx.register_hook.assert_called_once_with(
+            "pre_tool_call", tools.pre_tool_call_approval
+        )
+        # Idempotent on the same ctx.
         tools.register_tools(ctx)
         assert ctx.register_tool.call_count == len(tools.TOOL_NAMES)
+        assert ctx.register_hook.call_count == 1
+        # Fresh ctx (e.g. plugin reload) registers again.
+        ctx2 = MagicMock()
+        tools.register_tools(ctx2)
+        assert ctx2.register_tool.call_count == len(tools.TOOL_NAMES)
+        ctx2.register_hook.assert_called_once_with(
+            "pre_tool_call", tools.pre_tool_call_approval
+        )

@@ -1636,9 +1636,9 @@ fn admin_routes_require_auth_and_cover_stub_contract() {
         ("GET", format!("/communities/{cid}/members/{VALID_NPUB}/permissions"), None),
         ("DELETE", format!("/communities/{cid}/roles/{role}"), None),
         ("PATCH", format!("/communities/{cid}"), Some(json!({"name": "Renamed"}))),
-        ("PUT", format!("/communities/{cid}/icon"), Some(json!({"bytes_b64": "aGVsbG8="}))),
+        ("PUT", format!("/communities/{cid}/icon"), Some(json!({"bytes_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}))),
         ("DELETE", format!("/communities/{cid}/icon"), None),
-        ("PUT", format!("/communities/{cid}/banner"), Some(json!({"bytes_b64": "aGVsbG8="}))),
+        ("PUT", format!("/communities/{cid}/banner"), Some(json!({"bytes_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}))),
         ("DELETE", format!("/communities/{cid}/banner"), None),
         ("GET", format!("/communities/{cid}/channels/{channel}/pins"), None),
         ("POST", format!("/communities/{cid}/channels/{channel}/pins"), Some(json!({"message_id": message}))),
@@ -1685,6 +1685,24 @@ fn admin_routes_require_auth_and_cover_stub_contract() {
         &format!("/communities/{cid}/dissolve"),
         Some(&server.token),
         Some(json!({"confirm_community_id": other})),
+    );
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = call(
+        &server,
+        "PUT",
+        &format!("/communities/{cid}/icon"),
+        Some(&server.token),
+        Some(json!({"path": "/etc/passwd"})),
+    );
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = call(
+        &server,
+        "PUT",
+        &format!("/communities/{cid}/banner"),
+        Some(&server.token),
+        Some(json!({"bytes_b64": "aGVsbG8="})),
     );
     assert_eq!(status, 400, "{body}");
 

@@ -153,7 +153,7 @@ vector:
   prebuilt:                          # GitHub Release sidecar; omit = download the matching tag
     download: true                   # false = cargo only (Linux / macOS download by default)
     # repo: BonesGit/hermes-vector-platform
-    # tag: v0.6.1                    # omit = v{plugin version}
+    # tag: v0.6.2                    # omit = v{plugin version}
   communities:
     create: false                    # true = bot-owned private home room after Ready
     name: Hermes                     # only used when create is true
@@ -239,7 +239,7 @@ The Vector app does not display channel ids. When the bot joins (trusted invite,
 
 **Bot-owned home room:** set `vector.communities.create: true`. After Ready the sidecar creates or reuses a private community, persists `sdk/home-community.json` (restart will not create a second one), and direct-invites `VECTOR_ALLOWED_USERS`. No public invite URL, and the new channel is **not** written into `open_channels`. Direct-invited allowlisted members can already @mention; anyone else needs `group_allowed_users` or the channel id in `open_channels`.
 
-**Community admin:** Hermes tools (`vector_community_inspect`, `vector_community_moderate`, `vector_community_channels`, `vector_community_categories`, `vector_community_roles`, `vector_community_settings`, `vector_community_invites`, `vector_community_defense`) call the sidecar. Concord still decides whether the bot may act. Calls are allowed from the `VECTOR_HOME_CHANNEL` Vector DM, and from local CLI/TUI only when `vector.communities.admin_cli` is true (default false). Group chats and other platforms are refused. `vector.communities.allow_public_invites` stays false unless you explicitly want a public invite link. Dissolving a community requires the tool call to repeat that community id.
+**Community admin:** Hermes tools (`vector_community_inspect`, `vector_community_moderate`, `vector_community_channels`, `vector_community_categories`, `vector_community_roles`, `vector_community_settings`, `vector_community_invites`, `vector_community_defense`) call the sidecar. Concord still decides whether the bot may act. Tools are only exposed when the sidecar is running and the session is authorized: calls are allowed from the `VECTOR_HOME_CHANNEL` Vector DM, and from local CLI/TUI only when `vector.communities.admin_cli` is true (default false). Group chats and other platforms are refused. `vector.communities.allow_public_invites` stays false unless you explicitly want a public invite link. Irreversible and delete actions (`dissolve`, `refound`, `delete_policy`, `ban`, `leave`, `grant_admin`, `move_relays`, and channel/category/role `delete`) prompt for human approval via a `pre_tool_call` hook; dissolving a community also requires repeating `community_id`. Icon and banner uploads accept `bytes_b64` only (PNG, JPEG, WebP, or GIF, up to 4 MiB).
 
 Community **reactions** and missed-❌ catch-up stay DM-only. Missed Concord
 messages while the sidecar was down are **ignored** (no ❌, no Hermes turn).

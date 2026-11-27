@@ -1,8 +1,11 @@
 """Operator-only Concord community admin tools.
 
-Hermes loads ``provides_tools`` from every session, including groups. The
-handler refuses anyone who is not the ``VECTOR_HOME_CHANNEL`` Vector DM, or a
-local CLI/TUI session with ``vector.communities.admin_cli`` enabled.
+Tools are only exposed when ``check_admin_tools_available`` passes (live sidecar
+and authorized caller). ``dispatch_admin_tool`` re-checks ``admin_caller_error``
+on every invocation (fail-closed) and refuses anyone who is not the
+``VECTOR_HOME_CHANNEL`` Vector DM, or a local CLI/TUI session with
+``vector.communities.admin_cli`` enabled. Irreversible and delete actions also
+require human confirmation via Hermes' ``pre_tool_call`` approval hook.
 """
 
 from __future__ import annotations
@@ -10,10 +13,22 @@ from __future__ import annotations
 import json
 import os
 import re
+import weakref
 from typing import Any, Awaitable, Callable, Dict, Optional
+from urllib.parse import quote
 
 _PATH_KEYS = re.compile(r"\{([a-z_]+)\}")
-_REGISTERED = False
+_HEX_ID_RE = re.compile(r"^[0-9a-fA-F]{64}\Z")
+_INVITE_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{1,256}\Z")
+_HEX_PATH_KEYS = frozenset({"community_id", "channel_id", "category_id", "role_id"})
+_REGISTERED_CTXS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+_SESSION_ENV_KEYS = (
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_CHAT_TYPE",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_ACTOR_ID",
+)
 
 TOOL_NAMES = (
     "vector_community_inspect",
@@ -26,28 +41,43 @@ TOOL_NAMES = (
     "vector_community_defense",
 )
 
+# Irreversible or destructive (tool, action) pairs that must pass Hermes'
+# human-approval gate via the ``pre_tool_call`` hook.
+_APPROVAL_ACTIONS: Dict[tuple[str, str], str] = {
+    ("vector_community_defense", "dissolve"): "permanently dissolve Concord community",
+    ("vector_community_defense", "refound"): "refound Concord community",
+    ("vector_community_defense", "delete_policy"): "delete Concord moderation policy",
+    ("vector_community_moderate", "ban"): "ban member(s) from Concord community",
+    ("vector_community_moderate", "leave"): "leave Concord community",
+    ("vector_community_roles", "grant_admin"): "grant admin privileges in Concord community",
+    ("vector_community_settings", "move_relays"): "move Concord community relays",
+    ("vector_community_channels", "delete"): "delete Concord channel",
+    ("vector_community_categories", "delete"): "delete Concord category",
+    ("vector_community_roles", "delete"): "delete Concord role",
+}
+
 
 def _imports():
     if __package__:
-        from .internal.bech32 import normalize_npub
-        from .internal.bridge_bin import _client_host
-        from .internal.constants import (
+        from .bech32 import normalize_npub
+        from .bridge_bin import _client_host
+        from .constants import (
             DEFAULT_BRIDGE_HOST,
             DEFAULT_BRIDGE_PORT,
             SIDECAR_TOKEN_HEADER,
         )
-        from .internal.env import _scoped_env, _scoped_env_str
-        from .internal.paths import _read_runtime_record
+        from .env import _scoped_env, _scoped_env_str
+        from .paths import _read_runtime_record
     else:
-        from internal.bech32 import normalize_npub
-        from internal.bridge_bin import _client_host
-        from internal.constants import (
+        from bech32 import normalize_npub
+        from bridge_bin import _client_host
+        from constants import (
             DEFAULT_BRIDGE_HOST,
             DEFAULT_BRIDGE_PORT,
             SIDECAR_TOKEN_HEADER,
         )
-        from internal.env import _scoped_env, _scoped_env_str
-        from internal.paths import _read_runtime_record
+        from env import _scoped_env, _scoped_env_str
+        from paths import _read_runtime_record
     return {
         "normalize_npub": normalize_npub,
         "client_host": _client_host,
@@ -67,21 +97,27 @@ def _flag_on(name: str, *, default: bool) -> bool:
     return raw in ("on", "true", "1", "yes")
 
 
-def _session_env() -> Dict[str, Any]:
+def _session_env() -> Optional[Dict[str, str]]:
+    """Read session routing variables by name. Returns None on import/read error (fail-closed)."""
     try:
         from gateway.session_context import get_session_env
     except Exception:
-        return {}
-    try:
-        env = get_session_env()
-    except Exception:
-        return {}
-    return env if isinstance(env, dict) else {}
+        return None
+    env: Dict[str, str] = {}
+    for key in _SESSION_ENV_KEYS:
+        try:
+            value = get_session_env(key, "")
+        except Exception:
+            return None
+        env[key] = "" if value is None else str(value)
+    return env
 
 
 def admin_caller_error() -> Optional[str]:
     """None when this caller may run community admin tools."""
     env = _session_env()
+    if not isinstance(env, dict):
+        return "Community admin tools are refused: session context is unavailable."
     platform = str(env.get("HERMES_SESSION_PLATFORM") or "").strip().lower()
     chat_type = str(env.get("HERMES_SESSION_CHAT_TYPE") or "").strip().lower()
     chat_id = str(env.get("HERMES_SESSION_CHAT_ID") or "").strip()
@@ -91,6 +127,11 @@ def admin_caller_error() -> Optional[str]:
         return "Community admin tools are refused in group chats."
     if platform and platform != "vector":
         return "Community admin tools are refused on this platform."
+    if chat_type and chat_type != "dm":
+        return (
+            "Community admin tools are only available in the operator's "
+            "Vector DM or local CLI."
+        )
     if platform == "vector" or chat_type == "dm":
         if platform != "vector" or chat_type != "dm":
             return (
@@ -126,6 +167,35 @@ def _pid_alive(pid: Any) -> bool:
     except OSError:
         return False
     return True
+
+
+def _sidecar_running() -> bool:
+    """Fast local check: runtime record exists with a token and live PID."""
+    try:
+        record = _imports()["read_runtime"]()
+    except Exception:
+        return False
+    return bool(record and record.get("token") and _pid_alive(record.get("pid")))
+
+
+def check_admin_tools_available() -> bool:
+    """Expose admin tools only when the sidecar is running and this caller is allowed."""
+    if not _sidecar_running():
+        return False
+    return admin_caller_error() is None
+
+
+def _mark_check_fn_no_cache() -> None:
+    """Prevent Hermes from TTL-caching our session-dependent check_fn across sessions."""
+    try:
+        from tools.registry import no_cache_check_fn
+    except Exception:
+        return
+    if callable(no_cache_check_fn):
+        no_cache_check_fn(check_admin_tools_available)
+
+
+_mark_check_fn_no_cache()
 
 
 def _coerce_port(value: Any, default: int) -> int:
@@ -185,6 +255,23 @@ def _fail(message: str) -> str:
     return json.dumps({"ok": False, "error": message})
 
 
+def _validate_path_value(key: str, raw: str) -> str:
+    if key in _HEX_PATH_KEYS:
+        if not _HEX_ID_RE.match(raw):
+            raise ValueError(f"{key} must be 64 hex characters")
+        return quote(raw.lower(), safe="")
+    if key == "npub":
+        normalized = _imports()["normalize_npub"](raw)
+        if not normalized:
+            raise ValueError("npub is invalid")
+        return quote(normalized, safe="")
+    if key == "token":
+        if not _INVITE_TOKEN_RE.match(raw):
+            raise ValueError("token must be 1 to 256 ASCII alphanumeric characters")
+        return quote(raw, safe="")
+    return quote(raw, safe="")
+
+
 def _path_and_body(template: str, args: Dict[str, Any], send_body: bool):
     missing = []
 
@@ -194,7 +281,7 @@ def _path_and_body(template: str, args: Dict[str, Any], send_body: bool):
         if value is None or str(value).strip() == "":
             missing.append(key)
             return ""
-        return str(value).strip()
+        return _validate_path_value(key, str(value).strip())
 
     path = _PATH_KEYS.sub(repl, template)
     if missing:
@@ -311,6 +398,46 @@ _POLICY_ACTION = {
 }
 
 
+def pre_tool_call_approval(
+    *,
+    tool_name: str = "",
+    args: Optional[Dict[str, Any]] = None,
+    **_kwargs: Any,
+) -> Optional[Dict[str, str]]:
+    """Escalate irreversible and delete community-admin actions to Hermes human approval."""
+    if tool_name not in _ROUTES:
+        return None
+    payload = args if isinstance(args, dict) else {}
+    action = str(payload.get("action") or "").strip()
+    summary = _APPROVAL_ACTIONS.get((tool_name, action))
+    if not summary:
+        return None
+    community_id = str(payload.get("community_id") or "").strip().lower()
+    details: list[str] = []
+    if community_id:
+        details.append(f"community={community_id}")
+    for key in ("npub", "channel_id", "category_id", "role_id", "id"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            details.append(f"{key}={val.strip()}")
+    for list_key in ("npubs", "relays", "retain"):
+        vals = payload.get(list_key)
+        if isinstance(vals, list) and vals:
+            items = [str(v).strip() for v in vals[:5] if str(v).strip()]
+            if items:
+                preview = ", ".join(items)
+                if len(vals) > 5:
+                    preview += f" (+{len(vals) - 5} more)"
+                details.append(f"{list_key}=[{preview}]")
+    suffix = f" ({', '.join(details)})" if details else ""
+    rule_scope = community_id if _HEX_ID_RE.match(community_id) else "global"
+    return {
+        "action": "approve",
+        "message": f"Confirm {summary}{suffix}",
+        "rule_key": f"{tool_name}:{action}:{rule_scope}",
+    }
+
+
 def _prepare(tool: str, action: str, args: Dict[str, Any]) -> Dict[str, Any]:
     prepared = dict(args)
     if tool == "vector_community_roles":
@@ -324,6 +451,15 @@ def _prepare(tool: str, action: str, args: Dict[str, Any]) -> Dict[str, Any]:
             prepared["op"] = "remove"
         elif action == "set_roles":
             prepared["op"] = "set"
+    if tool == "vector_community_settings" and action in ("set_icon", "set_banner"):
+        if prepared.get("path") is not None:
+            raise ValueError(
+                "Local file path is not supported for icon or banner; pass bytes_b64 instead."
+            )
+        prepared.pop("path", None)
+        b64 = prepared.get("bytes_b64")
+        if not isinstance(b64, str) or not b64.strip():
+            raise ValueError("bytes_b64 is required for icon or banner.")
     if tool == "vector_community_defense" and action in _POLICY_ACTION:
         prepared["action"] = _POLICY_ACTION[action]
     if tool == "vector_community_invites" and action == "create_link":
@@ -410,8 +546,10 @@ def _schema(name: str, description: str, actions: Dict[str, tuple]) -> dict:
                 "allow": {"description": "Permission bits or names to allow."},
                 "deny": {"description": "Permission bits or names to deny."},
                 "relays": {"type": "array", "items": {"type": "string"}},
-                "bytes_b64": {"type": "string"},
-                "path": {"type": "string", "description": "Local image file for icon or banner."},
+                "bytes_b64": {
+                    "type": "string",
+                    "description": "Base64-encoded PNG, JPEG, WebP, or GIF image (up to 4 MiB) for icon or banner.",
+                },
                 "expires_at_ms": {"type": "integer"},
                 "label": {"type": "string"},
                 "token": {"type": "string"},
@@ -472,10 +610,13 @@ _DESCRIPTIONS = {
 
 
 def register_tools(ctx) -> None:
-    """Register community admin tools. Safe to call more than once."""
-    global _REGISTERED
-    if _REGISTERED:
-        return
+    """Register community admin tools and pre_tool_call approval hook. Idempotent per ctx."""
+    try:
+        if ctx in _REGISTERED_CTXS:
+            return
+    except TypeError:
+        pass
+    _mark_check_fn_no_cache()
     for name in TOOL_NAMES:
         routes = _ROUTES[name]
         description = _DESCRIPTIONS[name]
@@ -488,11 +629,17 @@ def register_tools(ctx) -> None:
             toolset="vector",
             schema=_schema(name, description, routes),
             handler=handler,
+            check_fn=check_admin_tools_available,
             description=description,
             emoji="🛡️",
             is_async=True,
         )
-    _REGISTERED = True
+    if hasattr(ctx, "register_hook"):
+        ctx.register_hook("pre_tool_call", pre_tool_call_approval)
+    try:
+        _REGISTERED_CTXS.add(ctx)
+    except TypeError:
+        pass
 
 
 # Keep the annotation import used if a type checker looks at the handler alias.

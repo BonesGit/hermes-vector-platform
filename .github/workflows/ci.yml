@@ -27,7 +27,7 @@ jobs:
           path: hermes-agent
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - name: Install Hermes + pytest
         run: python3 -m pip install -e hermes-agent pytest
       - name: Plugin unit tests

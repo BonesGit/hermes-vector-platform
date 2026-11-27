@@ -29,7 +29,9 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install Hermes + pytest
-        run: uv sync --project hermes-agent --frozen --group dev
+        run: |
+          uv sync --project hermes-agent --frozen --group dev
+          uv pip install --python hermes-agent/.venv/bin/python pyyaml
       - name: Plugin unit tests
         env:
           HERMES_AGENT_ROOT: ${{ github.workspace }}/hermes-agent
